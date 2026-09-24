@@ -764,8 +764,8 @@ extension Color {
     }
 }
 
-/// Good / warning / critical, kept separate from the per-account colors.
-func severity(_ pct: Int) -> Color { pct >= 85 ? .red : pct >= 60 ? .orange : .green }
+/// Good below 60 %, warning from 60 %, critical from 80 %; kept separate from the per-account colors.
+func severity(_ pct: Int) -> Color { pct >= 80 ? .red : pct >= 60 ? .orange : .green }
 
 /// Named account colors, offered in each row's Color menu; new accounts take the first unused one.
 let accountColors: [(name: String, hex: String)] = [
