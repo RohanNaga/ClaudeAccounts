@@ -28,6 +28,12 @@ drawn by `app/make-icon.swift`; delete `app/AppIcon.icns` to regenerate it.
   numbers at once without asking again.
 - Each row's `···` menu can **Rename** an account (an empty name restores the
   email) and pick its **Color**. The menu bar label uses the name.
+- The menu bar item is a gauge whose needle follows the in-use account. The
+  header's `···` menu sets what it shows (**Menu Bar Shows**: gauge only, gauge
+  and percentage, or gauge, name and percentage) and which limit it follows
+  (**Gauge Tracks**: 5-hour or weekly). Settings live in `data/settings.json`.
+  The item is drawn as one template image so the gauge and text share a centre
+  line exactly.
 - Access tokens last about 8 hours. When one is close to expiry the app runs
   `claude -p /usage --no-session-persistence` in that account's folder, and
   Claude Code renews the login itself. This spends no model usage.

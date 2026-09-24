@@ -214,6 +214,46 @@ enum AccountStore {
     }
 }
 
+// MARK: - Settings
+
+/// What the menu bar item shows next to its gauge.
+enum MenuBarDisplay: String, Codable, CaseIterable, Identifiable {
+    case gauge, gaugePercent, gaugeNamePercent
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .gauge: return "Gauge Only"
+        case .gaugePercent: return "Gauge and Percentage"
+        case .gaugeNamePercent: return "Gauge, Name and Percentage"
+        }
+    }
+}
+
+/// Which limit the gauge and percentage follow.
+enum UsageMetric: String, Codable, CaseIterable, Identifiable {
+    case fiveHour, weekly
+    var id: String { rawValue }
+    var title: String { self == .fiveHour ? "5-Hour Limit" : "Weekly Limit" }
+}
+
+/// Menu bar preferences, kept in data/settings.json so the app's folder stays its whole footprint.
+struct AppSettings: Codable, Equatable {
+    var display: MenuBarDisplay = .gaugeNamePercent
+    var metric: UsageMetric = .fiveHour
+
+    private static var url: URL { Paths.stateDir.appendingPathComponent("settings.json") }
+
+    static func load() -> AppSettings {
+        guard let data = try? Data(contentsOf: url) else { return AppSettings() }
+        return (try? JSONDecoder().decode(AppSettings.self, from: data)) ?? AppSettings()
+    }
+
+    func save() {
+        try? FileManager.default.createDirectory(at: Paths.stateDir, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(self).write(to: Self.url, options: .atomic)
+    }
+}
+
 // MARK: - Usage
 
 struct UsageWindow: Equatable, Codable {
@@ -328,6 +368,7 @@ final class Store: ObservableObject {
     /// The account the sign-in window re-authenticates; nil means it adds a new one.
     @Published var signInTarget: AccountRecord?
     @Published var openAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var settings = AppSettings.load() { didSet { settings.save() } }
 
     /// When the usage service lets each rate-limited account be asked again.
     @Published var retryAt: [String: Date] = [:]
@@ -497,18 +538,22 @@ final class Store: ObservableObject {
         }
     }
 
-    var menuBarTitle: String { menuBarSummary(self) }
-}
+    /// The in-use account's reading for the limit the menu bar follows.
+    var inUseWindow: UsageWindow? {
+        guard let current = accounts.first(where: isInUse),
+              case .ok(_, let fh, let wk, _) = states[current.id] else { return nil }
+        return settings.metric == .fiveHour ? fh : wk
+    }
 
-/// Condense every account into the few characters the menu bar has room for.
-///
-/// Policy: show the account the desktop app is using and its 5-hour usage, since that
-/// is the limit you hit first. Show only the icon until something has loaded.
-@MainActor
-func menuBarSummary(_ store: Store) -> String {
-    guard let current = store.accounts.first(where: store.isInUse),
-          case .ok(_, let fh?, _, _) = store.states[current.id] else { return "" }
-    return "\(current.shortName) \(fh.pct)%"
+    /// Gauge position, 0...1; a third before any reading so the glyph still looks like a gauge.
+    var menuBarFraction: Double { inUseWindow.map { Double($0.pct) / 100 } ?? 1.0 / 3 }
+
+    /// Text beside the gauge, per the Menu Bar Shows setting; empty means gauge only.
+    var menuBarTitle: String {
+        guard let window = inUseWindow, settings.display != .gauge,
+              let current = accounts.first(where: isInUse) else { return "" }
+        return settings.display == .gaugePercent ? "\(window.pct)%" : "\(current.shortName) \(window.pct)%"
+    }
 }
 
 // MARK: - Adding an account
@@ -895,6 +940,14 @@ struct MenuContent: View {
                 RefreshButton(store: store)
                 Menu {
                     Button("Add Account…") { openSignIn(nil) }
+                    Divider()
+                    Picker("Menu Bar Shows", selection: $store.settings.display) {
+                        ForEach(MenuBarDisplay.allCases) { Text($0.title).tag($0) }
+                    }
+                    Picker("Gauge Tracks", selection: $store.settings.metric) {
+                        ForEach(UsageMetric.allCases) { Text($0.title).tag($0) }
+                    }
+                    Divider()
                     Toggle("Open at Login", isOn: Binding(get: { store.openAtLogin }, set: { _ in store.toggleOpenAtLogin() }))
                     Divider()
                     Button("Quit Claude Accounts") { NSApp.terminate(nil) }.keyboardShortcut("q")
@@ -1040,6 +1093,88 @@ struct SignInView: View {
     }
 }
 
+/// The whole menu bar item drawn as one template image, so alignment is exact by construction:
+/// the text's visual middle (half its cap height above the baseline) sits at the image's middle,
+/// and each glyph is centred on that same line by its drawn shape rather than its box. macOS
+/// tints template images for light and dark menu bars and centres the image in the bar.
+func menuBarImage(title: String, fraction: Double, warning: Bool) -> NSImage {
+    let base = NSFont.menuBarFont(ofSize: 0)
+    // Fixed-width digits, so the percentage doesn't shift the item as it changes.
+    let font = NSFont.monospacedDigitSystemFont(ofSize: base.pointSize, weight: .regular)
+    let text = NSAttributedString(string: title, attributes: [.font: font, .foregroundColor: NSColor.black])
+    let height: CGFloat = 22, glyphWidth: CGFloat = 16, gap: CGFloat = 4
+    let textWidth = title.isEmpty ? 0 : ceil(text.size().width)
+    let width = glyphWidth + (title.isEmpty ? 0 : gap + textWidth)
+    let middle = height / 2
+
+    let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
+        if warning { drawWarning(centeredAt: NSPoint(x: glyphWidth / 2, y: middle)) }
+        else { drawGauge(fraction, centeredAt: NSPoint(x: glyphWidth / 2, y: middle)) }
+        if !title.isEmpty {
+            // Baseline chosen so the midpoint of the capitals and digits lands on `middle`.
+            text.draw(at: NSPoint(x: glyphWidth + gap, y: middle - font.capHeight / 2 + font.descender))
+        }
+        return true
+    }
+    image.isTemplate = true
+    image.accessibilityDescription = title.isEmpty ? "Claude Accounts" : title
+    return image
+}
+
+/// A speedometer: a 270° arc filled to `fraction`, a needle at the same angle, and a hub.
+/// Centred on its ink: the open-bottomed arc reaches `radius` above its centre but only
+/// radius·sin45° below it, and the stroke's half-width pads both ends equally.
+private func drawGauge(_ fraction: Double, centeredAt mid: NSPoint) {
+    let value = CGFloat(min(max(fraction, 0), 1))
+    let radius: CGFloat = 6, stroke: CGFloat = 1.7, sweep: CGFloat = 270, start: CGFloat = 225
+    let center = NSPoint(x: mid.x, y: mid.y - (radius - radius * sin(.pi / 4)) / 2)
+    let angle = start - sweep * value
+
+    func arc(to end: CGFloat) -> NSBezierPath {
+        let path = NSBezierPath()
+        path.appendArc(withCenter: center, radius: radius, startAngle: start, endAngle: end, clockwise: true)
+        path.lineWidth = stroke
+        path.lineCapStyle = .round
+        return path
+    }
+    // Template images keep only alpha, so the unused part of the arc is a fainter shade.
+    NSColor.black.withAlphaComponent(0.35).setStroke()
+    arc(to: start - sweep).stroke()
+    NSColor.black.setStroke()
+    if value > 0.01 { arc(to: angle).stroke() }
+
+    let rad = angle * .pi / 180
+    let needle = NSBezierPath()
+    needle.move(to: center)
+    needle.line(to: NSPoint(x: center.x + cos(rad) * radius * 0.62, y: center.y + sin(rad) * radius * 0.62))
+    needle.lineWidth = 1.6
+    needle.lineCapStyle = .round
+    needle.stroke()
+    NSColor.black.setFill()
+    NSBezierPath(ovalIn: NSRect(x: center.x - 1.5, y: center.y - 1.5, width: 3, height: 3)).fill()
+}
+
+/// A rounded warning triangle with the exclamation mark cut out, centred on its ink.
+private func drawWarning(centeredAt mid: NSPoint) {
+    let w: CGFloat = 14, h: CGFloat = 12.5
+    let bottom = mid.y - h / 2
+    let triangle = NSBezierPath()
+    triangle.move(to: NSPoint(x: mid.x, y: bottom + h))
+    triangle.line(to: NSPoint(x: mid.x + w / 2, y: bottom))
+    triangle.line(to: NSPoint(x: mid.x - w / 2, y: bottom))
+    triangle.close()
+    triangle.lineJoinStyle = .round
+    triangle.lineWidth = 2
+    NSColor.black.set()
+    triangle.fill()
+    triangle.stroke()
+    // Punch the mark out of the fill so the menu bar shows through it.
+    NSGraphicsContext.current?.compositingOperation = .clear
+    NSBezierPath(roundedRect: NSRect(x: mid.x - 0.9, y: bottom + 4.4, width: 1.8, height: 5), xRadius: 0.9, yRadius: 0.9).fill()
+    NSBezierPath(ovalIn: NSRect(x: mid.x - 1, y: bottom + 1.6, width: 2, height: 2)).fill()
+    NSGraphicsContext.current?.compositingOperation = .sourceOver
+}
+
 @main
 struct ClaudeAccountsApp: App {
     @StateObject private var store = Store()
@@ -1048,14 +1183,8 @@ struct ClaudeAccountsApp: App {
         MenuBarExtra {
             MenuContent(store: store)
         } label: {
-            // A system Label, not a hand-built HStack, so the icon sits on the text's baseline
-            // the way built-in menu bar items do.
-            let icon = store.needsAttention ? "exclamationmark.triangle.fill" : "gauge.with.dots.needle.33percent"
-            if store.menuBarTitle.isEmpty {
-                Label("Claude Accounts", systemImage: icon).labelStyle(.iconOnly)
-            } else {
-                Label(store.menuBarTitle, systemImage: icon).labelStyle(.titleAndIcon).monospacedDigit()
-            }
+            Image(nsImage: menuBarImage(title: store.menuBarTitle, fraction: store.menuBarFraction,
+                                        warning: store.needsAttention))
         }
         .menuBarExtraStyle(.window)
 
