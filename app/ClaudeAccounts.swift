@@ -338,6 +338,8 @@ final class Store: ObservableObject {
     /// The Claude app's own usage reader reuses a good reading for 60 s; asking faster than
     /// that earns a 429 with a multi-minute Retry-After, so no account is asked more often.
     static let minPollInterval: TimeInterval = 60
+    /// A click on Refresh may re-read sooner, at the 20 s spacing the Claude app uses for retries.
+    static let manualPollInterval: TimeInterval = 20
 
     /// True when any account needs a sign-in; the menu bar icon turns into a warning.
     var needsAttention: Bool { states.values.contains { $0.needsSignIn } }
@@ -359,7 +361,7 @@ final class Store: ObservableObject {
     /// Read usage for every account that is due: not asked in the last `minPollInterval`,
     /// and not inside a rate-limit wait. `forcing` skips the spacing for one account
     /// (a fresh sign-in) but still honours a rate-limit wait.
-    func refresh(forcing forcedId: String? = nil) {
+    func refresh(forcing forcedId: String? = nil, manual: Bool = false) {
         guard !loading else { return }
         accounts = AccountStore.load()
         inUseUuid = AccountStore.desktopAccountUuid()
@@ -368,7 +370,7 @@ final class Store: ObservableObject {
             if let until = retryAt[acct.id], until > now { return false }
             if acct.id == forcedId { return true }
             guard let last = polledAt[acct.id] else { return true }
-            return now.timeIntervalSince(last) >= Self.minPollInterval
+            return now.timeIntervalSince(last) >= (manual ? Self.manualPollInterval : Self.minPollInterval)
         }
         guard !due.isEmpty else { return }
         loading = true
@@ -890,14 +892,7 @@ struct MenuContent: View {
             HStack(spacing: 4) {
                 Text("Claude Accounts").font(.headline)
                 Spacer()
-                if store.loading {
-                    ProgressView().controlSize(.mini).frame(width: 22)
-                } else {
-                    Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.borderless).keyboardShortcut("r")
-                        .help((store.lastUpdated.map { "Updated \($0.formatted(date: .omitted, time: .shortened)). " } ?? "")
-                              + "Each account updates about once a minute. Refresh (⌘R)")
-                }
+                RefreshButton(store: store)
                 Menu {
                     Button("Add Account…") { openSignIn(nil) }
                     Toggle("Open at Login", isOn: Binding(get: { store.openAtLogin }, set: { _ in store.toggleOpenAtLogin() }))
@@ -936,6 +931,28 @@ struct MenuContent: View {
         store.signInTarget = acct
         openWindow(id: "sign-in")
         NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+/// The header's refresh control. It spins while a read runs, and for a moment on every click,
+/// so a click always shows it registered even when every account was read seconds ago.
+struct RefreshButton: View {
+    @ObservedObject var store: Store
+    @State private var clickSpin = false
+
+    var body: some View {
+        Button {
+            clickSpin = true
+            store.refresh(manual: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { clickSpin = false }
+        } label: {
+            Image(systemName: "arrow.clockwise")
+                .symbolEffect(.rotate, options: .speed(1.5), isActive: store.loading || clickSpin)
+        }
+        .buttonStyle(.borderless)
+        .keyboardShortcut("r")
+        .help((store.lastUpdated.map { "Updated \($0.formatted(date: .omitted, time: .shortened)). " } ?? "")
+              + "Each account updates about once a minute. Refresh (⌘R)")
     }
 }
 

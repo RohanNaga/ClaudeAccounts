@@ -16,7 +16,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # Keep swiftc's module cache inside this folder instead of ~/Library/Caches.
 export CLANG_MODULE_CACHE_PATH="$ROOT/.build-cache"
-swiftc -O -parse-as-library -target arm64-apple-macos14 \
+swiftc -O -parse-as-library -target arm64-apple-macos15 \
   -module-cache-path "$ROOT/.build-cache" -o "$BIN" "$ROOT/app/ClaudeAccounts.swift"
 
 # The icon is drawn by app/make-icon.swift; regenerate it by deleting app/AppIcon.icns.
@@ -46,7 +46,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.2</string>
   <key>CFBundleVersion</key><string>2</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>15.0</string>
   <!-- Menu bar only: no Dock icon, no app switcher entry. -->
   <key>LSUIElement</key><true/>
 </dict>
