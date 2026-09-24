@@ -11,16 +11,23 @@ open "Claude Accounts.app"
 ```
 
 It needs the Xcode Command Line Tools (`swiftc`) and Claude Code installed at
-`~/.local/bin/claude`. The build writes only into this folder.
+`~/.local/bin/claude`. The build writes only into this folder. The icon is
+drawn by `app/make-icon.swift`; delete `app/AppIcon.icns` to regenerate it.
 
 ## How it works
 
 - **Add Account…** runs `claude auth login` against a private config folder,
   `data/logins/<id>`, opens the sign-in page, and takes the code you paste. The
   account is labeled with its email.
-- Every 5 minutes the app reads each account's usage from
-  `api.anthropic.com/api/oauth/usage`, the same endpoint the Claude app's tray
-  menu uses.
+- About once a minute the app reads each account's usage from
+  `api.anthropic.com/api/oauth/usage`, the same endpoint and pace as the Claude
+  app's own usage reader, which reuses a good reading for 60 s. Asking faster
+  earns HTTP 429 with a multi-minute `Retry-After`; when that happens the row
+  keeps its last numbers, notes when it will retry, and waits exactly that long.
+  Readings and waits are saved in `data/usage-cache.json`, so a relaunch shows
+  numbers at once without asking again.
+- Each row's `···` menu can **Rename** an account (an empty name restores the
+  email) and pick its **Color**. The menu bar label uses the name.
 - Access tokens last about 8 hours. When one is close to expiry the app runs
   `claude -p /usage --no-session-persistence` in that account's folder, and
   Claude Code renews the login itself. This spends no model usage.

@@ -216,7 +216,7 @@ enum AccountStore {
 
 // MARK: - Usage
 
-struct UsageWindow: Equatable {
+struct UsageWindow: Equatable, Codable {
     let pct: Int
     let resetsAt: Date?
 
@@ -254,6 +254,8 @@ enum AccountState: Equatable {
     case ok(plan: String?, fiveHour: UsageWindow?, weekly: UsageWindow?, loginExpiresAt: Date?)
     case needsLogin(String)
     case error(String)
+    /// The usage service asked us to wait; nothing has been read for this account yet.
+    case rateLimited(until: Date)
 
     /// Signed out, or within a day of the login's fixed deadline.
     var needsSignIn: Bool {
@@ -296,6 +298,10 @@ enum Usage {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if code == 401 { return .needsLogin("Login was rejected.") }
+            if code == 429 {
+                let wait = ((resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init) ?? 300
+                return .rateLimited(until: Date().addingTimeInterval(wait))
+            }
             guard code == 200, let body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return .error("Usage service answered HTTP \(code).")
             }
@@ -323,40 +329,113 @@ final class Store: ObservableObject {
     @Published var signInTarget: AccountRecord?
     @Published var openAtLogin = SMAppService.mainApp.status == .enabled
 
+    /// When the usage service lets each rate-limited account be asked again.
+    @Published var retryAt: [String: Date] = [:]
+
     private var timer: Timer?
+    private var polledAt: [String: Date] = [:]
+
+    /// The Claude app's own usage reader reuses a good reading for 60 s; asking faster than
+    /// that earns a 429 with a multi-minute Retry-After, so no account is asked more often.
+    static let minPollInterval: TimeInterval = 60
 
     /// True when any account needs a sign-in; the menu bar icon turns into a warning.
     var needsAttention: Bool { states.values.contains { $0.needsSignIn } }
 
     init() {
+        loadCache()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+        // Tick often so each account is read as soon as it is due; the interval above sets the pace.
+        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }
 
     func isInUse(_ acct: AccountRecord) -> Bool { acct.accountUuid != nil && acct.accountUuid == inUseUuid }
 
-    /// Refresh unless a poll ran in the last minute; opening the menu calls this.
-    func refreshIfStale() {
-        if let last = lastUpdated, Date().timeIntervalSince(last) < 60 { return }
-        refresh()
-    }
+    /// Opening the menu calls this; accounts that aren't due yet keep their cached reading.
+    func refreshIfStale() { refresh() }
 
-    func refresh() {
+    /// Read usage for every account that is due: not asked in the last `minPollInterval`,
+    /// and not inside a rate-limit wait. `forcing` skips the spacing for one account
+    /// (a fresh sign-in) but still honours a rate-limit wait.
+    func refresh(forcing forcedId: String? = nil) {
         guard !loading else { return }
-        loading = true
         accounts = AccountStore.load()
         inUseUuid = AccountStore.desktopAccountUuid()
-        let snapshot = accounts
+        let now = Date()
+        let due = accounts.filter { acct in
+            if let until = retryAt[acct.id], until > now { return false }
+            if acct.id == forcedId { return true }
+            guard let last = polledAt[acct.id] else { return true }
+            return now.timeIntervalSince(last) >= Self.minPollInterval
+        }
+        guard !due.isEmpty else { return }
+        loading = true
         Task {
             await withTaskGroup(of: (String, AccountState).self) { group in
-                for acct in snapshot { group.addTask { (acct.id, await Usage.state(for: acct)) } }
-                for await (id, state) in group { self.states[id] = state }
+                for acct in due { group.addTask { (acct.id, await Usage.state(for: acct)) } }
+                for await (id, state) in group { self.record(state, for: id) }
             }
             self.lastUpdated = Date()
             self.loading = false
+            self.saveCache()
         }
+    }
+
+    /// A rate-limit answer keeps the last good reading on screen instead of blanking the row.
+    private func record(_ state: AccountState, for id: String) {
+        polledAt[id] = Date()
+        if case .rateLimited(let until) = state {
+            retryAt[id] = until
+            if states[id] == nil || states[id] == .loading { states[id] = state }
+            return
+        }
+        retryAt[id] = nil
+        states[id] = state
+    }
+
+    // MARK: Cache
+
+    /// The last good reading per account, so a relaunch shows numbers without asking again.
+    private struct CacheEntry: Codable {
+        var polledAt: Date
+        var retryAt: Date?
+        var plan: String?
+        var fiveHour: UsageWindow?
+        var weekly: UsageWindow?
+        var loginExpiresAt: Date?
+    }
+
+    private var cacheURL: URL { Paths.stateDir.appendingPathComponent("usage-cache.json") }
+
+    private func loadCache() {
+        guard let data = try? Data(contentsOf: cacheURL),
+              let entries = try? JSONDecoder().decode([String: CacheEntry].self, from: data) else { return }
+        for (id, e) in entries {
+            polledAt[id] = e.polledAt
+            if let r = e.retryAt, r > Date() { retryAt[id] = r }
+            if e.fiveHour != nil || e.weekly != nil || e.plan != nil {
+                states[id] = .ok(plan: e.plan, fiveHour: e.fiveHour, weekly: e.weekly, loginExpiresAt: e.loginExpiresAt)
+            } else if let r = retryAt[id] {
+                states[id] = .rateLimited(until: r)
+            }
+        }
+        lastUpdated = entries.values.map(\.polledAt).max()
+    }
+
+    private func saveCache() {
+        var entries: [String: CacheEntry] = [:]
+        for (id, polled) in polledAt {
+            // A rate-limit wait is saved even without a reading, so a relaunch doesn't ask again early.
+            if case .ok(let plan, let fh, let wk, let exp) = states[id] {
+                entries[id] = CacheEntry(polledAt: polled, retryAt: retryAt[id], plan: plan, fiveHour: fh, weekly: wk, loginExpiresAt: exp)
+            } else if let wait = retryAt[id] {
+                entries[id] = CacheEntry(polledAt: polled, retryAt: wait)
+            }
+        }
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        try? data.write(to: cacheURL, options: .atomic)
     }
 
     /// Show a short status line that clears itself.
@@ -380,6 +459,20 @@ final class Store: ObservableObject {
             SMAppService.openSystemSettingsLoginItems()
         }
         openAtLogin = service.status == .enabled
+    }
+
+    /// Save a new label or color for one account; the row keeps its place in the list.
+    func update(_ acct: AccountRecord, name: String? = nil, color: String? = nil) {
+        var all = AccountStore.load()
+        guard let i = all.firstIndex(where: { $0.id == acct.id }) else { return }
+        if let name { all[i].name = name }
+        if let color { all[i].color = color }
+        do {
+            try AccountStore.save(all)
+            accounts = all
+        } catch {
+            flash("Could not save: \(error.localizedDescription)")
+        }
     }
 
     /// Sign the account's private login out, forget it, and delete its folder.
@@ -627,7 +720,12 @@ extension Color {
 /// Good / warning / critical, kept separate from the per-account colors.
 func severity(_ pct: Int) -> Color { pct >= 85 ? .red : pct >= 60 ? .orange : .green }
 
-let presetColors = ["#3567CF", "#B96E22", "#B3405F", "#2C8A5E", "#6B5BD2"]
+/// Named account colors, offered in each row's Color menu; new accounts take the first unused one.
+let accountColors: [(name: String, hex: String)] = [
+    ("Blue", "#3567CF"), ("Orange", "#B96E22"), ("Pink", "#B3405F"), ("Green", "#2C8A5E"),
+    ("Purple", "#6B5BD2"), ("Teal", "#1F8A9A"), ("Red", "#C8412F"), ("Gray", "#7A8088"),
+]
+let presetColors = accountColors.map(\.hex)
 
 struct Meter: View {
     let label: String
@@ -662,9 +760,22 @@ struct AccountRow: View {
     let account: AccountRecord
     let state: AccountState?
     let inUse: Bool
+    let retryAt: Date?
     let onSignIn: () -> Void
+    let onRename: (String) -> Void
+    let onRecolor: (String) -> Void
     let onRemove: () -> Void
     @State private var confirmingRemove = false
+    @State private var renaming = false
+    @State private var draftName = ""
+    @FocusState private var nameFocused: Bool
+
+    /// An empty name puts the email back as the label.
+    private func commitRename() {
+        let trimmed = draftName.trimmingCharacters(in: .whitespaces)
+        onRename(trimmed.isEmpty ? (account.email ?? account.name) : trimmed)
+        renaming = false
+    }
 
     /// "Login expires in 5 h" inside the warning window, nil otherwise.
     private var expiryWarning: String? {
@@ -677,20 +788,52 @@ struct AccountRow: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Circle().fill(Color(hex: account.color)).frame(width: 9, height: 9)
-                Text(account.name).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
-                if case .ok(let plan?, _, _, _) = state {
-                    Text(plan.capitalized).font(.caption).foregroundStyle(.secondary)
+                if renaming {
+                    TextField("Name", text: $draftName)
+                        .textFieldStyle(.roundedBorder).controlSize(.small)
+                        .focused($nameFocused)
+                        .onSubmit(commitRename)
+                        .onExitCommand { renaming = false }
+                } else {
+                    Text(account.name).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
+                        .help(account.email ?? account.name)
+                    if case .ok(let plan?, _, _, _) = state {
+                        Text(plan.capitalized).font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
-                if inUse {
-                    Text("In use").font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                // One fixed box for both, so "In use" and Switch share a center line and right edge.
+                Group {
+                    if inUse {
+                        Text("In use").font(.caption.weight(.semibold))
+                            .padding(.horizontal, 8).frame(height: 20)
+                            .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                    } else {
+                        // The switch ships once the session hand-off has passed its one-session test.
+                        Button("Switch") {}.controlSize(.small).disabled(true)
+                            .help("Switching arrives next, after the session hand-off test")
+                    }
                 }
+                .frame(width: 62, height: 22, alignment: .trailing)
                 Menu {
-                    if let org = account.orgName { Text(org) }
+                    if let email = account.email { Text(email) }
+                    Divider()
+                    Button("Rename…") {
+                        draftName = account.name
+                        renaming = true
+                        nameFocused = true
+                    }
+                    Menu("Color") {
+                        ForEach(accountColors, id: \.hex) { color in
+                            Button { onRecolor(color.hex) } label: {
+                                if color.hex == account.color { Label(color.name, systemImage: "checkmark") }
+                                else { Text(color.name) }
+                            }
+                        }
+                    }
+                    Divider()
                     Button("Sign in again…", action: onSignIn)
-                    Button("Remove \(account.name)…") { confirmingRemove = true }
+                    Button("Remove…") { confirmingRemove = true }
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             }
@@ -699,6 +842,13 @@ struct AccountRow: View {
                 Meter(label: "5-hour", window: fh)
                 Meter(label: "Weekly", window: wk)
                 if let warning = expiryWarning { signInPrompt(warning) }
+                if let until = retryAt, until > Date() {
+                    Text("Rate-limited by the usage service · retrying at \(until.formatted(date: .omitted, time: .shortened))")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            case .rateLimited(let until):
+                Text("Waiting for the usage service · retrying at \(until.formatted(date: .omitted, time: .shortened))")
+                    .font(.caption).foregroundStyle(.secondary)
             case .needsLogin(let why):
                 signInPrompt(why)
             case .error(let why):
@@ -736,15 +886,25 @@ struct MenuContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .firstTextBaseline) {
+            // Usage is the point of the menu; the rare setup actions live behind the header's ···.
+            HStack(spacing: 4) {
                 Text("Claude Accounts").font(.headline)
                 Spacer()
                 if store.loading {
-                    ProgressView().controlSize(.mini)
-                } else if let t = store.lastUpdated {
-                    Text("Updated \(t.formatted(date: .omitted, time: .shortened))")
-                        .font(.caption).foregroundStyle(.tertiary)
+                    ProgressView().controlSize(.mini).frame(width: 22)
+                } else {
+                    Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(.borderless).keyboardShortcut("r")
+                        .help((store.lastUpdated.map { "Updated \($0.formatted(date: .omitted, time: .shortened)). " } ?? "")
+                              + "Each account updates about once a minute. Refresh (⌘R)")
                 }
+                Menu {
+                    Button("Add Account…") { openSignIn(nil) }
+                    Toggle("Open at Login", isOn: Binding(get: { store.openAtLogin }, set: { _ in store.toggleOpenAtLogin() }))
+                    Divider()
+                    Button("Quit Claude Accounts") { NSApp.terminate(nil) }.keyboardShortcut("q")
+                } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             }
             .padding(.horizontal, 10).padding(.top, 6).padding(.bottom, 4)
 
@@ -759,18 +919,12 @@ struct MenuContent: View {
             }
             ForEach(store.accounts) { acct in
                 AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct),
+                           retryAt: store.retryAt[acct.id],
                            onSignIn: { openSignIn(acct) },
+                           onRename: { store.update(acct, name: $0) },
+                           onRecolor: { store.update(acct, color: $0) },
                            onRemove: { store.remove(acct) })
             }
-
-            Divider().padding(.horizontal, 4).padding(.vertical, 5)
-            MenuRow(icon: "plus", title: "Add Account…") { openSignIn(nil) }
-            MenuRow(icon: "arrow.clockwise", title: "Refresh", shortcut: "⌘R") { store.refresh() }
-                .keyboardShortcut("r")
-            MenuRow(icon: store.openAtLogin ? "checkmark" : "", title: "Open at Login") { store.toggleOpenAtLogin() }
-            Divider().padding(.horizontal, 4).padding(.vertical, 5)
-            MenuRow(icon: "power", title: "Quit Claude Accounts", shortcut: "⌘Q") { NSApp.terminate(nil) }
-                .keyboardShortcut("q")
         }
         .padding(6)
         .frame(width: 330)
@@ -782,37 +936,6 @@ struct MenuContent: View {
         store.signInTarget = acct
         openWindow(id: "sign-in")
         NSApp.activate(ignoringOtherApps: true)
-    }
-}
-
-/// A full-width row drawn like a native menu item: icon, title, optional shortcut, and the
-/// accent-colored highlight on hover.
-struct MenuRow: View {
-    let icon: String
-    let title: String
-    var shortcut: String? = nil
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: icon.isEmpty ? "circle" : icon)
-                    .opacity(icon.isEmpty ? 0 : 1)
-                    .frame(width: 16)
-                Text(title)
-                Spacer()
-                if let shortcut {
-                    Text(shortcut).foregroundStyle(hovering ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.tertiary))
-                }
-            }
-            .foregroundStyle(hovering ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
-            .padding(.horizontal, 8).padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 5).fill(hovering ? Color.accentColor : .clear))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
     }
 }
 
@@ -887,7 +1010,7 @@ struct SignInView: View {
                 Spacer()
                 Button("Done") { close() }.keyboardShortcut(.defaultAction)
             }
-            .onAppear { store.refresh() }
+            .onAppear { store.refresh(forcing: target?.id) }
         case .failed(let why):
             Label(why, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
