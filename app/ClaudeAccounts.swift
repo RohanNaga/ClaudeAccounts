@@ -1048,9 +1048,13 @@ struct ClaudeAccountsApp: App {
         MenuBarExtra {
             MenuContent(store: store)
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: store.needsAttention ? "exclamationmark.triangle.fill" : "gauge.with.dots.needle.33percent")
-                if !store.menuBarTitle.isEmpty { Text(store.menuBarTitle).monospacedDigit() }
+            // A system Label, not a hand-built HStack, so the icon sits on the text's baseline
+            // the way built-in menu bar items do.
+            let icon = store.needsAttention ? "exclamationmark.triangle.fill" : "gauge.with.dots.needle.33percent"
+            if store.menuBarTitle.isEmpty {
+                Label("Claude Accounts", systemImage: icon).labelStyle(.iconOnly)
+            } else {
+                Label(store.menuBarTitle, systemImage: icon).labelStyle(.titleAndIcon).monospacedDigit()
             }
         }
         .menuBarExtraStyle(.window)
