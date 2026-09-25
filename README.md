@@ -53,10 +53,45 @@ Moving the folder breaks the logins, because they are tied to its path; add the
 accounts again after a move. **Open at Login** registers the app in System
 Settings > Login Items.
 
+## Switching the Claude app's account
+
+**Switch** on a row signs the Claude desktop app in as that account and brings
+your open Code sessions along:
+
+1. It asks Claude to quit the way ⌘Q does and waits until Claude's process is
+   gone. If a chat is mid-reply Claude asks first; answering "don't quit" ends
+   the switch with nothing changed.
+2. It backs up Claude's `Cookies` and `config.json` and writes a journal to
+   `data/switch-journal.json` before changing anything.
+3. It saves the current account's login (its claude.ai cookie rows and three
+   settings keys) to `data/slots/<id>`, but only if Claude's log and settings
+   agree on who that account is.
+4. It loads the target account's saved login.
+5. It moves each open session's record (not archived, not a scheduled run) from
+   `claude-code-sessions/<account>/<org>` to the target's folder. The session
+   id, transcript, worktree and lease stay the same. If the target already has a
+   copy, the newer one wins and the older one goes to the backup's `quarantine`.
+6. It reopens Claude. The switch counts only when Claude's log reports the
+   target account and organization. A sign-out, another account, or no answer
+   within a minute undoes every step from the journal.
+
+The account shown as **In use** is the one Claude's own log reports
+(`[LocalSessionManager] Initialization succeeded — accountId=…, orgId=…`).
+**Set Up** on an account with no saved login saves the current one and reopens
+Claude at its sign-in page, so signing in as another account never signs the
+current one out. `ClaudeAccounts --status` prints what a switch would act on;
+`ClaudeAccounts --switch <name>` runs a switch from a terminal outside Claude.
+
+Each switch leaves `data/backups/<time>/` with the files from before it and
+`switch.json` listing what moved. The last ten are kept.
+
 ## Limits
 
 - A `claude setup-token` token can't read usage, because it lacks the
   `user:profile` scope. That's why the app uses full logins.
-- The app reads the Claude desktop app's settings to find the account in use
-  and never writes to them. Switching the desktop app's account is still done in
-  the Claude app itself.
+- Switching depends on Claude's cookie schema (version 24), its session-record
+  layout, and one log line. If an update changes them, a switch fails closed:
+  it is refused or undone rather than half-applied.
+- Archived sessions and scheduled-task runs stay with the account they belong to.
+- A chat that was running in bypass-permissions mode may come back in a safer
+  mode after the restart; Claude re-launches it without the bypass flag.

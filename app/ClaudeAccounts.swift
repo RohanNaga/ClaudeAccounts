@@ -4,8 +4,8 @@
 // app bundle, so the project folder is the whole footprint. Each account gets its
 // own private Claude Code login in data/logins/<id>, used only to read usage; its
 // token sits in the login keychain, and removing the account deletes it. The app
-// reads the Claude desktop app's settings to show which account it is using, and
-// never writes to them.
+// reads Claude's log to show which account the Claude desktop app is using, and
+// writes to Claude's files only when you click Switch or Set Up, with Claude quit.
 
 import AppKit
 import ServiceManagement
@@ -20,7 +20,6 @@ enum Paths {
     static let stateDir = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("data")
     static let accountsFile = stateDir.appendingPathComponent("accounts.json")
     static let loginsDir = stateDir.appendingPathComponent("logins")
-    static let desktopConfig = home.appendingPathComponent("Library/Application Support/Claude/config.json")
 }
 
 enum API {
@@ -205,13 +204,6 @@ enum AccountStore {
         try enc.encode(File(accounts: accounts)).write(to: Paths.accountsFile, options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Paths.accountsFile.path)
     }
-
-    /// Account the Claude desktop app is signed in to (read-only).
-    static func desktopAccountUuid() -> String? {
-        guard let data = try? Data(contentsOf: Paths.desktopConfig),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return obj["lastKnownAccountUuid"] as? String
-    }
 }
 
 // MARK: - Settings
@@ -260,19 +252,28 @@ struct UsageWindow: Equatable, Codable {
     let pct: Int
     let resetsAt: Date?
 
-    /// "resets in 2 h 05 m" within a day, otherwise "resets Mon 09:00".
+    /// Relative and absolute together: "in 2 h 05 m · 13:10" today, "in 2 days · Sep 27, 13:00"
+    /// further out, and "No reset pending" for a window that hasn't started.
     var resetText: String {
-        guard let date = resetsAt else { return "" }
+        guard let date = resetsAt else { return "No reset pending" }
         let secs = date.timeIntervalSinceNow
-        if secs <= 0 { return "resetting now" }
+        if secs <= 0 { return "Resetting now" }
+        let f = DateFormatter()
+        let relative: String
         if secs < 24 * 3600 {
             let h = Int(secs) / 3600, m = (Int(secs) % 3600) / 60
-            return h > 0 ? "resets in \(h) h \(String(format: "%02d", m)) m" : "resets in \(m) m"
+            relative = h > 0 ? "in \(h) h \(String(format: "%02d", m)) m" : "in \(max(m, 1)) min"
+            f.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm" : "EEE HH:mm"
+        } else {
+            let days = Int((secs / 86400).rounded())
+            relative = "in \(days) day\(days == 1 ? "" : "s")"
+            f.dateFormat = "MMM d, HH:mm"
         }
-        let f = DateFormatter()
-        f.dateFormat = "EEE HH:mm"
-        return "resets \(f.string(from: date))"
+        return "\(relative) · \(f.string(from: date))"
     }
+
+    /// A reset this close means the account frees up soon, which is when switching to it pays off.
+    var resetsSoon: Bool { resetsAt.map { $0.timeIntervalSinceNow > 0 && $0.timeIntervalSinceNow <= 15 * 60 } ?? false }
 
     init?(_ raw: Any?) {
         guard let dict = raw as? [String: Any], let util = dict["utilization"] as? Double else { return nil }
@@ -355,13 +356,595 @@ enum Usage {
     }
 }
 
+// MARK: - Switching the Claude app's account
+
+/// The account Claude is signed in to and the organization whose Code sessions it shows.
+struct Identity: Equatable, Codable, Sendable {
+    let account: String
+    let org: String
+}
+
+/// The Claude desktop app's files that make up "which account is signed in". Switching
+/// swaps exactly these while Claude is closed, and moves open Code sessions' owner
+/// records to the target account's folder so the same sessions appear after the switch.
+enum ClaudeApp {
+    static let bundleId = "com.anthropic.claudefordesktop"
+    static let dataDir = Paths.home.appendingPathComponent("Library/Application Support/Claude")
+    static let cookies = dataDir.appendingPathComponent("Cookies")
+    static let cookiesJournal = dataDir.appendingPathComponent("Cookies-journal")
+    static let config = dataDir.appendingPathComponent("config.json")
+    static let sessions = dataDir.appendingPathComponent("claude-code-sessions")
+    static let logDir = Paths.home.appendingPathComponent("Library/Logs/Claude")
+    static let log = logDir.appendingPathComponent("main.log")
+
+    static var executable: String {
+        let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId)?.path ?? "/Applications/Claude.app"
+        return bundle + "/Contents/MacOS/Claude"
+    }
+
+    /// Claude's main process ids, read from `ps`. Asked from a command-line process, LaunchServices
+    /// once reported a live Claude as not running, and a switch went on to write under it.
+    static func pids() -> [pid_t] {
+        let exe = executable
+        return runProcessBlocking("/bin/ps", ["-axo", "pid=,comm="], env: nil, cwd: nil, timeout: 10).out
+            .split(separator: "\n").compactMap { line in
+                let fields = line.trimmingCharacters(in: .whitespaces)
+                guard let gap = fields.firstIndex(of: " "),
+                      fields[gap...].trimmingCharacters(in: .whitespaces) == exe else { return nil }
+                return pid_t(fields[..<gap])
+            }
+    }
+
+    enum QuitResult { case quit, declined, failed }
+
+    /// Quit the way ⌘Q does, then wait until the process is gone, so Claude has flushed its
+    /// cookies and settings. With a chat mid-reply Claude first asks whether to quit; the
+    /// wait leaves time to answer, and a "no" ends the switch before anything is written.
+    static func quit(timeout: TimeInterval = 90, progress: @Sendable (String) -> Void = { _ in }) async -> QuitResult {
+        let running = pids()
+        guard !running.isEmpty else { return .quit }
+        let mark = logMark()
+        for pid in running {
+            if let app = NSRunningApplication(processIdentifier: pid) { app.terminate() }
+            else { _ = await runProcess("/usr/bin/osascript", ["-e", "tell application id \"\(bundleId)\" to quit"]) }
+        }
+        var asked = false
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if pids().isEmpty { return .quit }
+            if !asked, logText(since: mark).contains("vetoed by before-quit interceptor") {
+                asked = true
+                progress("Claude is asking whether to quit while a chat runs…")
+            }
+        }
+        return asked ? .declined : .failed
+    }
+
+    static func launch() async {
+        _ = await runProcess("/usr/bin/open", ["-b", bundleId])
+    }
+
+    /// The account in Claude's settings, which Claude rewrites whenever its account changes.
+    static func savedAccount() -> String? {
+        guard let data = try? Data(contentsOf: config),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj["lastKnownAccountUuid"] as? String
+    }
+
+    // MARK: Log
+
+    /// A place in Claude's log that survives rotation, which renames main.log to main1.log.
+    struct LogMark: Equatable { let inode: UInt64; let offset: UInt64 }
+
+    static func logMark(_ url: URL = log) -> LogMark {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return LogMark(inode: (attrs?[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0,
+                       offset: (attrs?[.size] as? NSNumber)?.uint64Value ?? 0)
+    }
+
+    /// Whole lines from `offset` on, and the offset just past the last one read.
+    static func readLines(_ url: URL, from offset: UInt64) -> (text: String, end: UInt64) {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return ("", offset) }
+        defer { try? handle.close() }
+        try? handle.seek(toOffset: offset)
+        let data = handle.readDataToEndOfFile()
+        guard let last = data.lastIndex(of: UInt8(ascii: "\n")) else { return ("", offset) }
+        let whole = data[data.startIndex...last]
+        return (String(decoding: whole, as: UTF8.self), offset + UInt64(whole.count))
+    }
+
+    /// Everything Claude logged after `mark`, following main.log across a rotation.
+    static func logText(since mark: LogMark) -> String {
+        if logMark().inode == mark.inode { return readLines(log, from: mark.offset).text }
+        let rotated = (1...4).map { logDir.appendingPathComponent("main\($0).log") }
+            .first { logMark($0).inode == mark.inode }
+        return (rotated.map { readLines($0, from: mark.offset).text } ?? "") + readLines(log, from: 0).text
+    }
+
+    /// Who Claude says it is after reading `text`, starting from `start`. The Code tab's session
+    /// manager logs the account and organization whose sessions it loads at every launch and
+    /// every account change; a sign-out or a restart clears it until the next such line.
+    static func identity(after text: String, from start: Identity?) -> Identity? {
+        var current = start
+        for line in text.split(separator: "\n") {
+            if line.contains("[LocalSessionManager] Initialization succeeded"),
+               let account = field(line, "accountId="), let org = field(line, "orgId=") {
+                current = Identity(account: account, org: org)
+            } else if line.contains("Starting app {") || signsOut(line) {
+                current = nil
+            }
+        }
+        return current
+    }
+
+    static func signsOut<S: StringProtocol>(_ line: S) -> Bool {
+        line.contains("Navigated to /logout") || line.contains("loggedOut: false → true")
+    }
+
+    private static func field<S: StringProtocol>(_ line: S, _ key: String) -> String? {
+        guard let r = line.range(of: key) else { return nil }
+        let value = line[r.upperBound...].prefix { $0.isHexDigit || $0 == "-" }
+        return value.count == 36 ? String(value) : nil
+    }
+
+    /// Who Claude is signed in as now, or was when it last quit, from its own log.
+    static func currentIdentity() -> Identity? {
+        let older = readLines(logDir.appendingPathComponent("main1.log"), from: 0).text
+        return identity(after: readLines(log, from: 0).text, from: identity(after: older, from: nil))
+    }
+
+    // MARK: Sessions
+
+    static func folder(_ id: Identity) -> URL {
+        sessions.appendingPathComponent(id.account).appendingPathComponent(id.org)
+    }
+
+    /// Records of the sessions shown in the sidebar: not archived, not a scheduled-task run.
+    static func openSessionRecords(in orgFolder: URL) -> [URL] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: orgFolder, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { url in
+            guard url.lastPathComponent.hasPrefix("local_"), url.pathExtension == "json",
+                  let obj = record(url) else { return false }
+            return (obj["isArchived"] as? Bool) != true && obj["scheduledTaskId"] == nil
+        }
+    }
+
+    static func record(_ url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    static func lastActivity(_ url: URL) -> Double { (record(url)?["lastActivityAt"] as? Double) ?? 0 }
+}
+
+/// Follows Claude's log, reading only what is new, so the menu shows the account Claude reports.
+final class IdentityWatcher {
+    private var mark: ClaudeApp.LogMark?
+    private(set) var identity: Identity?
+
+    func poll() -> Identity? {
+        let now = ClaudeApp.logMark()
+        if let mark, mark.inode == now.inode, mark.offset <= now.offset {
+            let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: mark.offset)
+            identity = ClaudeApp.identity(after: text, from: identity)
+            self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
+        } else {
+            identity = ClaudeApp.currentIdentity()
+            self.mark = ClaudeApp.LogMark(inode: now.inode, offset: ClaudeApp.readLines(ClaudeApp.log, from: 0).end)
+        }
+        return identity
+    }
+}
+
+/// One account's saved Claude app login: its claude.ai cookie rows (still encrypted with
+/// Claude's own key, never decrypted here) and the Code tab's token cache from config.json.
+enum LoginSlot {
+    static let hosts = "('.claude.ai','claude.ai')"
+    static let configKeys = ["oauth:tokenCache", "oauth:tokenCacheV2", "lastKnownAccountUuid"]
+    static let cookieSchemaVersion = "24"
+
+    static func dir(_ acct: AccountRecord) -> URL { Paths.stateDir.appendingPathComponent("slots/\(acct.id)") }
+    static func exists(_ acct: AccountRecord) -> Bool {
+        FileManager.default.fileExists(atPath: dir(acct).appendingPathComponent("cookies.db").path)
+            && identity(acct) != nil
+    }
+
+    /// `orgFolder` is the organization whose sessions Claude showed when this login was saved.
+    struct Meta: Codable { var account: String?; var orgFolder: String?; var config: [String: String] }
+
+    static func meta(_ acct: AccountRecord) -> Meta? {
+        guard let data = try? Data(contentsOf: dir(acct).appendingPathComponent("slot.json")) else { return nil }
+        return try? JSONDecoder().decode(Meta.self, from: data)
+    }
+
+    /// Where the account's sessions go: set only when the saved login is the account's own.
+    static func identity(_ acct: AccountRecord) -> Identity? {
+        guard let uuid = acct.accountUuid, let meta = meta(acct), let org = meta.orgFolder,
+              meta.config["lastKnownAccountUuid"] == uuid, (meta.account ?? uuid) == uuid else { return nil }
+        return Identity(account: uuid, org: org)
+    }
+
+    static func sqlite(_ db: URL, _ sql: String) async -> ProcResult {
+        await runProcess("/usr/bin/sqlite3", ["-bail", db.path, sql])
+    }
+
+    static func quoted(_ url: URL) -> String { "'" + url.path.replacingOccurrences(of: "'", with: "''") + "'" }
+
+    static func cookieVersion(_ db: URL) async -> String {
+        await sqlite(db, "select value from meta where key='version';").out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Save the login Claude just quit with. `identity` is who Claude said it was, and the
+    /// settings must agree, so a login is never saved under the wrong account.
+    static func capture(_ acct: AccountRecord, as identity: Identity) async throws {
+        guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed }
+        guard ClaudeApp.savedAccount() == identity.account else { throw SwitchError.inconsistent }
+        let fm = FileManager.default
+        let slot = dir(acct)
+        try fm.createDirectory(at: slot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let source = slot.appendingPathComponent("source.db")
+        for f in [source, slot.appendingPathComponent("source.db-journal")] { try? fm.removeItem(at: f) }
+        try fm.copyItem(at: ClaudeApp.cookies, to: source)
+        if fm.fileExists(atPath: ClaudeApp.cookiesJournal.path) {
+            try fm.copyItem(at: ClaudeApp.cookiesJournal, to: slot.appendingPathComponent("source.db-journal"))
+        }
+        defer { for f in [source, slot.appendingPathComponent("source.db-journal")] { try? fm.removeItem(at: f) } }
+        guard await sqlite(source, "pragma quick_check;").out.trimmingCharacters(in: .whitespacesAndNewlines) == "ok" else {
+            throw SwitchError.sqlite("Claude's cookie database failed its integrity check")
+        }
+        guard await cookieVersion(source) == cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
+
+        let fresh = slot.appendingPathComponent("cookies.new.db")
+        try? fm.removeItem(at: fresh)
+        let res = await sqlite(fresh, "ATTACH \(quoted(source)) AS c; CREATE TABLE cookies AS SELECT * FROM c.cookies WHERE host_key IN \(hosts);")
+        guard res.status == 0 else { throw SwitchError.sqlite(res.err) }
+        let count = await sqlite(fresh, "select count(*) from cookies where name='sessionKey';").out
+        guard count.trimmingCharacters(in: .whitespacesAndNewlines) == "1" else { throw SwitchError.notSignedIn }
+
+        let config = try JSONSerialization.jsonObject(with: Data(contentsOf: ClaudeApp.config)) as? [String: Any] ?? [:]
+        var keys: [String: String] = [:]
+        for k in configKeys { if let v = config[k] as? String { keys[k] = v } }
+        let meta = try JSONEncoder().encode(Meta(account: identity.account, orgFolder: identity.org, config: keys))
+        _ = try fm.replaceItemAt(slot.appendingPathComponent("cookies.db"), withItemAt: fresh)
+        try meta.write(to: slot.appendingPathComponent("slot.json"), options: .atomic)
+        for f in ["cookies.db", "slot.json"] { try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: slot.appendingPathComponent(f).path) }
+    }
+
+    /// Put a saved login into Claude's files, or with nil clear them so Claude opens at its
+    /// sign-in page. Claude must be closed.
+    static func load(_ acct: AccountRecord?) async throws {
+        guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed }
+        var values: [String: String] = [:]
+        var insert = ""
+        if let acct {
+            guard identity(acct) != nil, let meta = meta(acct) else { throw SwitchError.noSlot(acct.name) }
+            values = meta.config
+            insert = "ATTACH \(quoted(dir(acct).appendingPathComponent("cookies.db"))) AS s; "
+        }
+        guard await cookieVersion(ClaudeApp.cookies) == cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
+        let sql = insert + "BEGIN; DELETE FROM main.cookies WHERE host_key IN \(hosts); "
+            + (acct == nil ? "" : "INSERT INTO main.cookies SELECT * FROM s.cookies; ") + "COMMIT;"
+        let res = await sqlite(ClaudeApp.cookies, sql)
+        guard res.status == 0 else { throw SwitchError.sqlite(res.err) }
+
+        var config = try JSONSerialization.jsonObject(with: Data(contentsOf: ClaudeApp.config)) as? [String: Any] ?? [:]
+        for k in configKeys { config[k] = values[k] }
+        let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted])
+        try data.write(to: ClaudeApp.config, options: .atomic)
+    }
+}
+
+enum SwitchError: LocalizedError {
+    case noSlot(String), notSignedIn, cookieSchemaChanged, sqlite(String), quitFailed, inconsistent
+    var errorDescription: String? {
+        switch self {
+        case .noSlot(let name): return "\(name) isn't set up in Claude yet; use Set Up on its row first."
+        case .notSignedIn: return "Claude isn't signed in, so there was no login to save."
+        case .cookieSchemaChanged: return "Claude's cookie format changed in an update; switching is paused until this app is updated."
+        case .sqlite(let err): return "Could not update Claude's cookies: \(err.prefix(160))"
+        case .quitFailed: return "Claude is running again, so nothing more was changed."
+        case .inconsistent: return "Claude's settings name a different account than its log. Open and quit Claude once, then try again."
+        }
+    }
+}
+
+/// The result of one switch, for the menu or for `--switch` on the command line.
+struct SwitchOutcome: Codable {
+    var ok: Bool
+    var message: String
+    var moved = 0
+    var confirmed = false
+    var backup: String? = nil
+}
+
+/// One switch at a time across the menu and `--switch`, which are separate processes.
+struct SwitchLock {
+    let fd: Int32
+
+    static func acquire() -> SwitchLock? {
+        try? FileManager.default.createDirectory(at: Paths.stateDir, withIntermediateDirectories: true)
+        let fd = open(Paths.stateDir.appendingPathComponent(".switch.lock").path, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else { return nil }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); return nil }
+        return SwitchLock(fd: fd)
+    }
+
+    func release() { flock(fd, LOCK_UN); close(fd) }
+}
+
+/// Written before a switch changes anything and removed once Claude confirms the result, so
+/// an interrupted switch can always be undone: the backup plus every file move made so far.
+struct SwitchJournal: Codable {
+    struct Move: Codable { var from: String; var to: String }
+    var backup: String
+    var from: Identity?
+    var to: Identity?
+    var moves: [Move] = []
+
+    static let url = Paths.stateDir.appendingPathComponent("switch-journal.json")
+    static func load() -> SwitchJournal? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(SwitchJournal.self, from: data)
+    }
+    func save() throws {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try enc.encode(self).write(to: Self.url, options: .atomic)
+    }
+    static func clear() { try? FileManager.default.removeItem(at: url) }
+}
+
+/// Switching, free of any UI so the menu's button and `ClaudeAccounts --switch` run one code path.
+enum SwitchEngine {
+    typealias Progress = @Sendable (String) -> Void
+
+    /// Quit Claude, save the current account's login, load the target's, move the open Code
+    /// sessions into the target's folder, reopen Claude, and keep the result only once Claude
+    /// reports the target account; anything else is undone.
+    static func run(to target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
+        await locked { await switchLocked(to: target, accounts: accounts, progress: progress) }
+    }
+
+    /// Quit Claude, save the current account's login, and reopen Claude at its sign-in page, so
+    /// another account can sign in without signing the current one out.
+    static func setUp(_ target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
+        await locked { await setUpLocked(target, accounts: accounts, progress: progress) }
+    }
+
+    private static func locked(_ body: () async -> SwitchOutcome) async -> SwitchOutcome {
+        guard let lock = SwitchLock.acquire() else { return SwitchOutcome(ok: false, message: "Another switch is already running.") }
+        defer { lock.release() }
+        if let journal = SwitchJournal.load() {
+            let undone = await rollback(journal, progress: { _ in })
+            return SwitchOutcome(ok: false, message: undone ? "The last switch was interrupted, so it was undone. Try again."
+                                                           : "The last switch was interrupted, and undoing it needs Claude to quit.")
+        }
+        return await body()
+    }
+
+    private static func switchLocked(to target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
+        guard let want = LoginSlot.identity(target) else {
+            return SwitchOutcome(ok: false, message: SwitchError.noSlot(target.name).localizedDescription)
+        }
+        let before = ClaudeApp.currentIdentity()
+        if before?.account == want.account {
+            if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
+            return SwitchOutcome(ok: true, message: "Already using \(target.name).", confirmed: true)
+        }
+
+        let current: (acct: AccountRecord, id: Identity)?
+        switch await prepare(accounts: accounts, progress: progress) {
+        case .failure(let e): return e.outcome
+        case .success(let c): current = c
+        }
+        guard var journal = startJournal(from: current?.id, to: want) else {
+            await ClaudeApp.launch()
+            return SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed.")
+        }
+        do {
+            if let current {
+                progress("Saving \(current.acct.name)…")
+                try await LoginSlot.capture(current.acct, as: current.id)
+            }
+            progress("Loading \(target.name)…")
+            try await LoginSlot.load(target)
+            if let current { try moveSessions(from: current.id, to: want, journal: &journal) }
+        } catch {
+            _ = await rollback(journal, progress: progress)
+            return SwitchOutcome(ok: false, message: "Switch failed and was undone: \(error.localizedDescription)")
+        }
+
+        progress("Opening Claude as \(target.name)…")
+        let mark = ClaudeApp.logMark()
+        await ClaudeApp.launch()
+        let moved = journal.moves.filter { !$0.to.contains("/quarantine/") }.count
+        switch await confirm(want, since: mark) {
+        case .confirmed:
+            // Keep the record of what moved beside the backup it belongs to.
+            try? FileManager.default.moveItem(at: SwitchJournal.url,
+                                              to: URL(fileURLWithPath: journal.backup).appendingPathComponent("switch.json"))
+            pruneBackups()
+            let sessions = "\(moved) open session\(moved == 1 ? "" : "s")"
+            return SwitchOutcome(ok: true, message: "Switched to \(target.name), with \(sessions).",
+                                 moved: moved, confirmed: true, backup: journal.backup)
+        case .signedOut:
+            let undone = await rollback(journal, progress: progress)
+            return SwitchOutcome(ok: false, message: "\(target.name)'s saved login has expired, so "
+                                 + (undone ? "the switch was undone. Use Set Up on its row to sign in again."
+                                           : "Claude opened signed out. Quit Claude and click Switch to undo."))
+        case .other(let seen):
+            let who = accounts.first { $0.accountUuid == seen?.account }?.name ?? (seen == nil ? "no account" : "another account")
+            let undone = await rollback(journal, progress: progress)
+            return SwitchOutcome(ok: false, message: "Claude opened as \(who) instead of \(target.name), so "
+                                 + (undone ? "the switch was undone." : "the switch needs undoing: quit Claude and click Switch."))
+        }
+    }
+
+    private static func setUpLocked(_ target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
+        let current: (acct: AccountRecord, id: Identity)?
+        switch await prepare(accounts: accounts, progress: progress) {
+        case .failure(let e): return e.outcome
+        case .success(let c): current = c
+        }
+        guard let journal = startJournal(from: current?.id, to: nil) else {
+            await ClaudeApp.launch()
+            return SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed.")
+        }
+        do {
+            if let current {
+                progress("Saving \(current.acct.name)…")
+                try await LoginSlot.capture(current.acct, as: current.id)
+            }
+            try await LoginSlot.load(nil)
+        } catch {
+            _ = await rollback(journal, progress: progress)
+            return SwitchOutcome(ok: false, message: "Set up failed and was undone: \(error.localizedDescription)")
+        }
+        // The sign-in itself happens in Claude; the next switch away from it saves the login.
+        SwitchJournal.clear()
+        await ClaudeApp.launch()
+        return SwitchOutcome(ok: true, message: "Sign in to Claude as \(target.email ?? target.name). Your open sessions stay with "
+                             + (current?.acct.name ?? "the previous account") + "; Switch brings them over.")
+    }
+
+    /// Resolve who Claude is, quit it, and check again once it has gone. Nothing is written here.
+    private static func prepare(accounts: [AccountRecord], progress: @escaping Progress)
+        async -> Result<(acct: AccountRecord, id: Identity)?, OutcomeError> {
+        let before = ClaudeApp.currentIdentity()
+        if let before, !accounts.contains(where: { $0.accountUuid == before.account }) {
+            return .failure(OutcomeError("Claude is signed in to an account this app doesn't know. Add it first."))
+        }
+        progress("Quitting Claude…")
+        switch await ClaudeApp.quit(progress: progress) {
+        case .quit: break
+        case .declined: return .failure(OutcomeError("Claude stayed open because a chat is still running. Nothing was changed."))
+        case .failed: return .failure(OutcomeError("Claude didn't quit, so nothing was changed."))
+        }
+        // Read again after the quit: this is the state Claude's files were flushed in.
+        guard let id = ClaudeApp.currentIdentity() else { return .success(nil) }
+        guard id == before, ClaudeApp.savedAccount() == id.account,
+              let acct = accounts.first(where: { $0.accountUuid == id.account }) else {
+            await ClaudeApp.launch()
+            return .failure(OutcomeError(SwitchError.inconsistent.localizedDescription))
+        }
+        return .success((acct, id))
+    }
+
+    struct OutcomeError: Error {
+        let outcome: SwitchOutcome
+        init(_ message: String) { outcome = SwitchOutcome(ok: false, message: message) }
+    }
+
+    /// Back up Claude's files and record the intent before the first write.
+    private static func startJournal(from: Identity?, to: Identity?) -> SwitchJournal? {
+        let fm = FileManager.default
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let backup = Paths.stateDir.appendingPathComponent("backups/\(stamp)")
+        do {
+            try fm.createDirectory(at: backup, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try fm.copyItem(at: ClaudeApp.cookies, to: backup.appendingPathComponent("Cookies"))
+            if fm.fileExists(atPath: ClaudeApp.cookiesJournal.path) {
+                try fm.copyItem(at: ClaudeApp.cookiesJournal, to: backup.appendingPathComponent("Cookies-journal"))
+            }
+            try fm.copyItem(at: ClaudeApp.config, to: backup.appendingPathComponent("config.json"))
+            let journal = SwitchJournal(backup: backup.path, from: from, to: to)
+            try journal.save()
+            return journal
+        } catch {
+            return nil
+        }
+    }
+
+    /// Move each open session's record, keeping its id, so its transcript and worktree lease
+    /// still match. If the target already holds a copy (from an earlier interrupted switch),
+    /// the newer copy wins and the older is set aside in the backup, never deleted.
+    private static func moveSessions(from: Identity, to: Identity, journal: inout SwitchJournal) throws {
+        let fm = FileManager.default
+        let dst = ClaudeApp.folder(to)
+        let quarantine = URL(fileURLWithPath: journal.backup).appendingPathComponent("quarantine")
+        try fm.createDirectory(at: dst, withIntermediateDirectories: true)
+        func move(_ a: URL, _ b: URL) throws {
+            guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed }
+            try fm.moveItem(at: a, to: b)
+            journal.moves.append(.init(from: a.path, to: b.path))
+            try journal.save()
+        }
+        for record in ClaudeApp.openSessionRecords(in: ClaudeApp.folder(from)) {
+            let dest = dst.appendingPathComponent(record.lastPathComponent)
+            if fm.fileExists(atPath: dest.path) {
+                try fm.createDirectory(at: quarantine, withIntermediateDirectories: true)
+                let aside = quarantine.appendingPathComponent(record.lastPathComponent)
+                if ClaudeApp.lastActivity(dest) > ClaudeApp.lastActivity(record) { try move(record, aside); continue }
+                try move(dest, aside)
+            }
+            try move(record, dest)
+        }
+    }
+
+    enum Verdict { case confirmed, signedOut, other(Identity?) }
+
+    /// Watch the reopened Claude until it reports `want` and holds it for a few seconds.
+    private static func confirm(_ want: Identity, since mark: ClaudeApp.LogMark) async -> Verdict {
+        let deadline = Date().addingTimeInterval(60)
+        var seen: Identity?
+        var seenSince = Date()
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            let text = ClaudeApp.logText(since: mark)
+            guard let start = text.range(of: "Starting app {") else { continue }
+            let run = text[start.upperBound...]
+            if run.split(separator: "\n").contains(where: ClaudeApp.signsOut) { return .signedOut }
+            let now = ClaudeApp.identity(after: String(run), from: nil)
+            if now != seen { seen = now; seenSince = Date() }
+            let held = Date().timeIntervalSince(seenSince)
+            if now == want, held >= 4 { return .confirmed }
+            if now != nil, now != want, held >= 10 { return .other(now) }
+        }
+        return .other(seen)
+    }
+
+    /// Put Claude's files back as they were before the switch and reopen it. Returns false,
+    /// keeping the journal for a later try, if Claude can't be quit first.
+    static func rollback(_ journal: SwitchJournal, progress: @escaping Progress) async -> Bool {
+        progress("Undoing the switch…")
+        guard await ClaudeApp.quit(progress: progress) == .quit else { return false }
+        let fm = FileManager.default
+        for m in journal.moves.reversed() where fm.fileExists(atPath: m.to) && !fm.fileExists(atPath: m.from) {
+            try? fm.moveItem(atPath: m.to, toPath: m.from)
+        }
+        let backup = URL(fileURLWithPath: journal.backup)
+        try? fm.removeItem(at: ClaudeApp.cookiesJournal)
+        for (name, live) in [("Cookies", ClaudeApp.cookies), ("Cookies-journal", ClaudeApp.cookiesJournal), ("config.json", ClaudeApp.config)] {
+            let saved = backup.appendingPathComponent(name)
+            guard fm.fileExists(atPath: saved.path) else { continue }
+            let staged = ClaudeApp.dataDir.appendingPathComponent(".\(name).restore")
+            try? fm.removeItem(at: staged)
+            guard (try? fm.copyItem(at: saved, to: staged)) != nil else { continue }
+            if fm.fileExists(atPath: live.path) { _ = try? fm.replaceItemAt(live, withItemAt: staged) }
+            else { try? fm.moveItem(at: staged, to: live) }
+        }
+        SwitchJournal.clear()
+        await ClaudeApp.launch()
+        return true
+    }
+
+    /// Keep the ten most recent backups.
+    static func pruneBackups() {
+        let dir = Paths.stateDir.appendingPathComponent("backups")
+        let all = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
+        for name in all.dropLast(10) { try? FileManager.default.removeItem(at: dir.appendingPathComponent(name)) }
+    }
+}
+
 // MARK: - Store
 
 @MainActor
 final class Store: ObservableObject {
     @Published var accounts: [AccountRecord] = AccountStore.load()
     @Published var states: [String: AccountState] = [:]
-    @Published var inUseUuid: String? = AccountStore.desktopAccountUuid()
+    /// Who Claude reports it is signed in as, from its own log.
+    @Published var inUse: Identity?
     @Published var lastUpdated: Date?
     @Published var loading = false
     @Published var message: String?
@@ -369,11 +952,14 @@ final class Store: ObservableObject {
     @Published var signInTarget: AccountRecord?
     @Published var openAtLogin = SMAppService.mainApp.status == .enabled
     @Published var settings = AppSettings.load() { didSet { settings.save() } }
+    /// Progress text while a switch runs; nil when idle.
+    @Published var switching: String?
 
     /// When the usage service lets each rate-limited account be asked again.
     @Published var retryAt: [String: Date] = [:]
 
     private var timer: Timer?
+    private let identityWatcher = IdentityWatcher()
     private var polledAt: [String: Date] = [:]
 
     /// The Claude app's own usage reader reuses a good reading for 60 s; asking faster than
@@ -394,7 +980,7 @@ final class Store: ObservableObject {
         }
     }
 
-    func isInUse(_ acct: AccountRecord) -> Bool { acct.accountUuid != nil && acct.accountUuid == inUseUuid }
+    func isInUse(_ acct: AccountRecord) -> Bool { acct.accountUuid != nil && acct.accountUuid == inUse?.account }
 
     /// Opening the menu calls this; accounts that aren't due yet keep their cached reading.
     func refreshIfStale() { refresh() }
@@ -405,13 +991,17 @@ final class Store: ObservableObject {
     func refresh(forcing forcedId: String? = nil, manual: Bool = false) {
         guard !loading else { return }
         accounts = AccountStore.load()
-        inUseUuid = AccountStore.desktopAccountUuid()
+        inUse = identityWatcher.poll()
         let now = Date()
         let due = accounts.filter { acct in
             if let until = retryAt[acct.id], until > now { return false }
             if acct.id == forcedId { return true }
             guard let last = polledAt[acct.id] else { return true }
-            return now.timeIntervalSince(last) >= (manual ? Self.manualPollInterval : Self.minPollInterval)
+            if manual { return now.timeIntervalSince(last) >= Self.manualPollInterval }
+            // Claude reads the account it is signed in to once a minute too, and the two readers
+            // share that account's rate limit, so ours backs off to every other minute there.
+            let pace = isInUse(acct) ? Self.minPollInterval * 2 : Self.minPollInterval
+            return now.timeIntervalSince(last) >= pace
         }
         guard !due.isEmpty else { return }
         loading = true
@@ -482,9 +1072,9 @@ final class Store: ObservableObject {
     }
 
     /// Show a short status line that clears itself.
-    func flash(_ text: String) {
+    func flash(_ text: String, for seconds: Double = 5) {
         message = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
             if self?.message == text { self?.message = nil }
         }
     }
@@ -518,6 +1108,27 @@ final class Store: ObservableObject {
         }
     }
 
+    // MARK: Switching
+
+    /// One click: quit Claude, save the current account's login, load the target's, move the
+    /// open Code sessions into the target's folder, and reopen Claude as the target.
+    func switchTo(_ target: AccountRecord) { runSwitch { await SwitchEngine.run(to: target, accounts: $0, progress: $1) } }
+
+    /// Reopen Claude at its sign-in page for an account that has no saved Claude login yet.
+    func setUp(_ target: AccountRecord) { runSwitch { await SwitchEngine.setUp(target, accounts: $0, progress: $1) } }
+
+    private func runSwitch(_ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress) async -> SwitchOutcome) {
+        guard switching == nil else { return }
+        switching = "Starting…"
+        let all = accounts
+        Task {
+            let outcome = await body(all) { step in Task { @MainActor in self.switching = step } }
+            self.switching = nil
+            self.flash(outcome.message, for: 10)
+            self.inUse = self.identityWatcher.poll()
+        }
+    }
+
     /// Sign the account's private login out, forget it, and delete its folder.
     func remove(_ acct: AccountRecord) {
         Task {
@@ -526,6 +1137,7 @@ final class Store: ObservableObject {
                 await Keychain.delete(service: acct.keychainService)
             }
             try? FileManager.default.removeItem(at: acct.configURL)
+            try? FileManager.default.removeItem(at: LoginSlot.dir(acct))
             let remaining = AccountStore.load().filter { $0.id != acct.id }
             do {
                 try AccountStore.save(remaining)
@@ -795,8 +1407,10 @@ struct Meter: View {
                 }
             }
             .frame(height: 5)
-            if let w = window, !w.resetText.isEmpty {
-                Text(w.resetText).font(.caption2).foregroundStyle(.tertiary)
+            if let w = window {
+                Text(w.resetText).font(.caption2)
+                    .foregroundStyle(w.resetsSoon ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                    .fontWeight(w.resetsSoon ? .semibold : .regular)
             }
         }
         .font(.caption)
@@ -807,6 +1421,10 @@ struct AccountRow: View {
     let account: AccountRecord
     let state: AccountState?
     let inUse: Bool
+    let canSwitch: Bool
+    let switchBusy: Bool
+    let onSwitch: () -> Void
+    let onSetUp: () -> Void
     let retryAt: Date?
     let onSignIn: () -> Void
     let onRename: (String) -> Void
@@ -855,10 +1473,12 @@ struct AccountRow: View {
                         Text("In use").font(.caption.weight(.semibold))
                             .padding(.horizontal, 8).frame(height: 20)
                             .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                    } else if canSwitch {
+                        Button("Switch", action: onSwitch).controlSize(.small).disabled(switchBusy)
+                            .help("Quit Claude, sign it in as this account, and bring your open sessions along")
                     } else {
-                        // The switch ships once the session hand-off has passed its one-session test.
-                        Button("Switch") {}.controlSize(.small).disabled(true)
-                            .help("Switching arrives next, after the session hand-off test")
+                        Button("Set Up", action: onSetUp).controlSize(.small).disabled(switchBusy)
+                            .help("Quit Claude, save the account it's using, and reopen it at the sign-in page for this account")
                     }
                 }
                 .frame(width: 62, height: 22, alignment: .trailing)
@@ -956,6 +1576,10 @@ struct MenuContent: View {
             }
             .padding(.horizontal, 10).padding(.top, 6).padding(.bottom, 4)
 
+            if let step = store.switching {
+                HStack(spacing: 6) { ProgressView().controlSize(.mini); Text(step).font(.caption) }
+                    .padding(.horizontal, 10).padding(.bottom, 4)
+            }
             if let msg = store.message {
                 Text(msg).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 10).padding(.bottom, 4)
             }
@@ -967,6 +1591,8 @@ struct MenuContent: View {
             }
             ForEach(store.accounts) { acct in
                 AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct),
+                           canSwitch: LoginSlot.exists(acct), switchBusy: store.switching != nil,
+                           onSwitch: { store.switchTo(acct) }, onSetUp: { store.setUp(acct) },
                            retryAt: store.retryAt[acct.id],
                            onSignIn: { openSignIn(acct) },
                            onRename: { store.update(acct, name: $0) },
@@ -1175,7 +1801,64 @@ private func drawWarning(centeredAt mid: NSPoint) {
     NSGraphicsContext.current?.compositingOperation = .sourceOver
 }
 
+/// `ClaudeAccounts --switch <account>` runs the menu's switch without the menu, prints the
+/// outcome as JSON, and saves it to data/last-switch.json. The account can be named by id,
+/// label, email, or the email's first part. Run it from outside Claude: quitting Claude ends
+/// every process Claude started.
 @main
+enum Entry {
+    static func main() {
+        let args = CommandLine.arguments
+        if args.contains("--status") { printStatus() }
+        guard let i = args.firstIndex(of: "--switch"), i + 1 < args.count else {
+            ClaudeAccountsApp.main()
+            return
+        }
+        signal(SIGHUP, SIG_IGN)
+        let key = args[i + 1].lowercased()
+        let accounts = AccountStore.load()
+        let matches = accounts.filter {
+            [$0.id, $0.name, $0.email ?? "", $0.shortName, String(($0.email ?? "").prefix { $0 != "@" })]
+                .map { $0.lowercased() }.contains(key)
+        }
+        guard matches.count == 1, let target = matches.first else {
+            finish(SwitchOutcome(ok: false, message: matches.isEmpty ? "No account is named \(key)." : "\(key) names more than one account."))
+        }
+        final class Box: @unchecked Sendable { var outcome = SwitchOutcome(ok: false, message: "did not run") }
+        let box = Box(), done = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.outcome = await SwitchEngine.run(to: target, accounts: accounts) { step in
+                FileHandle.standardError.write(Data("… \(step)\n".utf8))
+            }
+            done.signal()
+        }
+        done.wait()
+        finish(box.outcome)
+    }
+
+    /// `--status`: what a switch would act on, read-only.
+    private static func printStatus() -> Never {
+        let id = ClaudeApp.currentIdentity()
+        let accounts = AccountStore.load()
+        func name(_ uuid: String?) -> String { accounts.first { $0.accountUuid == uuid }?.name ?? (uuid ?? "none") }
+        print("Claude processes: \(ClaudeApp.pids())")
+        print("Claude reports:   \(id.map { "\(name($0.account)) (org \($0.org.prefix(8)))" } ?? "signed out")")
+        print("Claude settings:  \(name(ClaudeApp.savedAccount()))")
+        print("Interrupted switch: \(SwitchJournal.load() == nil ? "none" : "yes")")
+        for acct in accounts {
+            print("Saved login \(acct.name): \(LoginSlot.identity(acct).map { "org \($0.org.prefix(8))" } ?? "none")")
+        }
+        exit(0)
+    }
+
+    private static func finish(_ outcome: SwitchOutcome) -> Never {
+        let data = (try? JSONEncoder().encode(outcome)) ?? Data("{}".utf8)
+        try? data.write(to: Paths.stateDir.appendingPathComponent("last-switch.json"), options: .atomic)
+        print(String(decoding: data, as: UTF8.self))
+        exit(outcome.ok ? 0 : 1)
+    }
+}
+
 struct ClaudeAccountsApp: App {
     @StateObject private var store = Store()
 
