@@ -6,6 +6,10 @@ every account at once, and switches the Claude desktop app between them in one
 click while keeping your open Claude Code chats, their worktrees and their
 history.
 
+<p align="center">
+  <img src="docs/menu.png" width="355" alt="The ClaudeAccounts menu: four accounts with 5-hour and weekly usage bars, the one in use marked, and a Switch button on the others">
+</p>
+
 > ClaudeAccounts is an independent project. It is not made, endorsed or
 > supported by Anthropic. Claude is a trademark of Anthropic. Use each account
 > under Anthropic's terms for that account.
