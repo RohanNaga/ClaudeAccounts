@@ -1,18 +1,43 @@
-# Claude Accounts
+# ClaudeAccounts
 
-A macOS menu bar app that shows the 5-hour and weekly usage of several Claude
-accounts at once, and marks the one the Claude desktop app is signed in to.
+A macOS menu bar app for people with more than one Claude account, like a work
+plan, a school plan and a personal one. It shows the 5-hour and weekly usage of
+every account at once, and switches the Claude desktop app between them in one
+click while keeping your open Claude Code chats, their worktrees and their
+history.
+
+> ClaudeAccounts is an independent project. It is not made, endorsed or
+> supported by Anthropic. Claude is a trademark of Anthropic. Use each account
+> under Anthropic's terms for that account.
+
+## Requirements
+
+- macOS 15 or later on Apple Silicon
+- Xcode Command Line Tools (`xcode-select --install`), for `swiftc`
+- The Claude desktop app, and Claude Code installed at `~/.local/bin/claude`
+
+Tested with Claude desktop 2.9939.2 on macOS 27.
 
 ## Build and run
 
 ```bash
+git clone https://github.com/RohanNaga/ClaudeAccounts.git
+cd ClaudeAccounts
 ./build.sh
 open "Claude Accounts.app"
 ```
 
-It needs the Xcode Command Line Tools (`swiftc`) and Claude Code installed at
-`~/.local/bin/claude`. The build writes only into this folder. The icon is
-drawn by `app/make-icon.swift`; delete `app/AppIcon.icns` to regenerate it.
+The build writes only into this folder. The icon is drawn by
+`app/make-icon.swift`; delete `app/AppIcon.icns` to regenerate it.
+
+## Read this before you switch
+
+Switching works by editing the Claude desktop app's own files while it is quit:
+its cookie database, its settings file and its chat records. None of that is a
+public interface, and an update to Claude can change it. The app is built to
+fail closed. It backs everything up first, refuses to act when something looks
+off, and undoes a switch that Claude doesn't confirm. Still, use it at your own
+risk, and keep the backups in `data/backups/` until you trust it on your setup.
 
 ## How it works
 
@@ -75,8 +100,9 @@ your open Code sessions along:
    target account and organization. A sign-out, another account, or no answer
    within a minute undoes every step from the journal.
 
-The account shown as **In use** is the one Claude's own log reports
-(`[LocalSessionManager] Initialization succeeded — accountId=…, orgId=…`).
+The account shown as **In use** is the one Claude's own log reports: the line
+Claude writes each time it loads an account's chats, naming the account and its
+organization.
 **Set Up** on an account with no saved login saves the current one and reopens
 Claude at its sign-in page, so signing in as another account never signs the
 current one out. `ClaudeAccounts --status` prints what a switch would act on;

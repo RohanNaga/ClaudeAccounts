@@ -775,8 +775,10 @@ enum SwitchEngine {
                                            : "Claude opened signed out. Quit Claude and click Switch to undo."))
         case .other(let seen):
             let who = accounts.first { $0.accountUuid == seen?.account }?.name ?? (seen == nil ? "no account" : "another account")
+            let what = seen?.account == want.account ? "\(target.name) in a different organization than its saved login"
+                                                     : "\(who) instead of \(target.name)"
             let undone = await rollback(journal, progress: progress)
-            return SwitchOutcome(ok: false, message: "Claude opened as \(who) instead of \(target.name), so "
+            return SwitchOutcome(ok: false, message: "Claude opened as \(what), so "
                                  + (undone ? "the switch was undone." : "the switch needs undoing: quit Claude and click Switch."))
         }
     }
