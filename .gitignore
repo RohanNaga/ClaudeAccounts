@@ -2,3 +2,4 @@ Claude Accounts.app/
 data/
 .build-cache/
 .DS_Store
+dist/

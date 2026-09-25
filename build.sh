@@ -1,9 +1,11 @@
 #!/bin/bash
-# Build "Claude Accounts.app" into this folder. Nothing is installed elsewhere:
-# the app keeps its data in ./data beside itself, so this folder is the whole footprint.
+# Build "Claude Accounts.app" into this folder, as one binary for Apple Silicon and Intel.
+# The app keeps its state in ~/Library/Application Support/ClaudeAccounts.
 # Needs only the Xcode Command Line Tools (swiftc).
 set -euo pipefail
 
+VERSION="0.3.0"
+BUILD="3"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="$ROOT/Claude Accounts.app"
 BIN="$APP/Contents/MacOS/ClaudeAccounts"
@@ -16,8 +18,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # Keep swiftc's module cache inside this folder instead of ~/Library/Caches.
 export CLANG_MODULE_CACHE_PATH="$ROOT/.build-cache"
-swiftc -O -parse-as-library -target arm64-apple-macos15 \
-  -module-cache-path "$ROOT/.build-cache" -o "$BIN" "$ROOT/app/ClaudeAccounts.swift"
+for arch in arm64 x86_64; do
+  swiftc -O -parse-as-library -target "$arch-apple-macos15" \
+    -module-cache-path "$ROOT/.build-cache" -o "$ROOT/.build-cache/ClaudeAccounts-$arch" "$ROOT/app/ClaudeAccounts.swift"
+done
+lipo -create -output "$BIN" "$ROOT/.build-cache/ClaudeAccounts-arm64" "$ROOT/.build-cache/ClaudeAccounts-x86_64"
 
 # The icon is drawn by app/make-icon.swift; regenerate it by deleting app/AppIcon.icns.
 ICON="$ROOT/app/AppIcon.icns"
@@ -33,7 +38,7 @@ if [ ! -f "$ICON" ]; then
 fi
 cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -44,8 +49,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>ClaudeAccounts</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <!-- Menu bar only: no Dock icon, no app switcher entry. -->
   <key>LSUIElement</key><true/>

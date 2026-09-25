@@ -1,13 +1,14 @@
 // Claude Accounts: menu bar usage monitor for several Claude accounts.
 //
-// Self-contained: everything the app writes lives in a `data` folder beside the
-// app bundle, so the project folder is the whole footprint. Each account gets its
-// own private Claude Code login in data/logins/<id>, used only to read usage; its
-// token sits in the login keychain, and removing the account deletes it. The app
+// Everything the app writes lives in ~/Library/Application Support/ClaudeAccounts,
+// so the app itself can sit anywhere. Each account gets its own private Claude Code
+// login in logins/<id> there, used only to read usage; its token sits in the login
+// keychain, and removing the account deletes it. The app
 // reads Claude's log to show which account the Claude desktop app is using, and
 // writes to Claude's files only when you click Switch or Set Up, with Claude quit.
 
 import AppKit
+import CryptoKit
 import ServiceManagement
 import SwiftUI
 
@@ -15,9 +16,10 @@ import SwiftUI
 
 enum Paths {
     static let home = FileManager.default.homeDirectoryForCurrentUser
-    /// The folder holding the app bundle. Moving that folder moves everything, but the
-    /// logins are tied to their path, so accounts need adding again after a move.
-    static let stateDir = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("data")
+    /// Where the app keeps its state, so the app bundle can be installed anywhere.
+    static let stateDir = home.appendingPathComponent("Library/Application Support/ClaudeAccounts")
+    /// Before 0.3 the state sat in a `data` folder beside the app bundle.
+    static let legacyStateDir = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("data")
     static let accountsFile = stateDir.appendingPathComponent("accounts.json")
     static let loginsDir = stateDir.appendingPathComponent("logins")
 }
@@ -163,6 +165,12 @@ enum Keychain {
         return (account, secret.out.trimmingCharacters(in: .newlines))
     }
 
+    /// The item name Claude Code uses for a login folder: a hash of the folder's path.
+    static func service(forConfigDir dir: URL) -> String {
+        let digest = SHA256.hash(data: Data(dir.path.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "\(API.keychainPrefix)-\(digest.prefix(8))"
+    }
+
     static func restore(service: String, _ snap: (account: String, secret: String)) async {
         _ = await runProcess("/usr/bin/security",
                              ["add-generic-password", "-U", "-s", service, "-a", snap.account, "-w", snap.secret])
@@ -175,8 +183,8 @@ struct AccountRecord: Codable, Identifiable, Equatable {
     let id: String
     var name: String
     var color: String
-    let configDir: String
-    let keychainService: String
+    var configDir: String
+    var keychainService: String
     let email: String?
     let accountUuid: String?
     let orgName: String?
@@ -206,6 +214,53 @@ enum AccountStore {
     }
 }
 
+// MARK: - Moving state out of the app's folder
+
+enum Migration {
+    /// Move a pre-0.3 `data` folder beside the app into Application Support. A login's keychain
+    /// item is named after its folder's path, so each one is copied to the name its new path
+    /// hashes to, checked, and only then removed under the old name.
+    static func moveLegacyState() {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: Paths.legacyStateDir.appendingPathComponent("accounts.json").path),
+              !fm.fileExists(atPath: Paths.stateDir.path) else { return }
+        do {
+            try fm.createDirectory(at: Paths.stateDir.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.moveItem(at: Paths.legacyStateDir, to: Paths.stateDir)
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: Paths.stateDir.path)
+        } catch {
+            NSLog("ClaudeAccounts: could not move \(Paths.legacyStateDir.path): \(error)")
+            return
+        }
+        var accounts = AccountStore.load()
+        for i in accounts.indices {
+            let dir = Paths.loginsDir.appendingPathComponent(accounts[i].id)
+            let old = accounts[i].keychainService, new = Keychain.service(forConfigDir: dir)
+            if old != new, copyItem(from: old, to: new) {
+                _ = runProcessBlocking("/usr/bin/security", ["delete-generic-password", "-s", old], env: nil, cwd: nil, timeout: 10)
+            }
+            accounts[i].configDir = dir.path.replacingOccurrences(of: Paths.home.path, with: "~")
+            accounts[i].keychainService = new
+        }
+        try? AccountStore.save(accounts)
+    }
+
+    /// Copy one login to a new item name and read it back; the old item stays until this succeeds.
+    private static func copyItem(from old: String, to new: String) -> Bool {
+        let meta = runProcessBlocking("/usr/bin/security", ["find-generic-password", "-s", old], env: nil, cwd: nil, timeout: 10)
+        let secret = runProcessBlocking("/usr/bin/security", ["find-generic-password", "-s", old, "-w"], env: nil, cwd: nil, timeout: 10)
+        guard meta.status == 0, secret.status == 0,
+              let line = meta.out.split(separator: "\n").first(where: { $0.contains("\"acct\"<blob>=") }),
+              let value = line.split(separator: "=", maxSplits: 1).last else { return false }
+        let account = value.trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+        let stored = secret.out.trimmingCharacters(in: .newlines)
+        _ = runProcessBlocking("/usr/bin/security", ["add-generic-password", "-U", "-s", new, "-a", account, "-w", stored],
+                               env: nil, cwd: nil, timeout: 10)
+        let check = runProcessBlocking("/usr/bin/security", ["find-generic-password", "-s", new, "-w"], env: nil, cwd: nil, timeout: 10)
+        return check.status == 0 && check.out.trimmingCharacters(in: .newlines) == stored
+    }
+}
+
 // MARK: - Settings
 
 /// What the menu bar item shows next to its gauge.
@@ -228,7 +283,7 @@ enum UsageMetric: String, Codable, CaseIterable, Identifiable {
     var title: String { self == .fiveHour ? "5-Hour Limit" : "Weekly Limit" }
 }
 
-/// Menu bar preferences, kept in data/settings.json so the app's folder stays its whole footprint.
+/// Menu bar preferences, kept in settings.json in the app's state folder.
 struct AppSettings: Codable, Equatable {
     var display: MenuBarDisplay = .gaugeNamePercent
     var metric: UsageMetric = .fiveHour
@@ -1826,12 +1881,13 @@ private func drawWarning(centeredAt mid: NSPoint) {
 }
 
 /// `ClaudeAccounts --switch <account>` runs the menu's switch without the menu, prints the
-/// outcome as JSON, and saves it to data/last-switch.json. The account can be named by id,
+/// outcome as JSON, and saves it to last-switch.json in the app's state folder. The account can be named by id,
 /// label, email, or the email's first part. Run it from outside Claude: quitting Claude ends
 /// every process Claude started.
 @main
 enum Entry {
     static func main() {
+        Migration.moveLegacyState()
         let args = CommandLine.arguments
         if args.contains("--status") { printStatus() }
         guard let i = args.firstIndex(of: "--switch"), i + 1 < args.count else {
