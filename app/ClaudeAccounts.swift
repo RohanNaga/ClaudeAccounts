@@ -397,26 +397,48 @@ enum ClaudeApp {
 
     enum QuitResult { case quit, declined, failed }
 
+    /// Ids of Claude's on-screen windows. Reading ids needs no screen-recording permission.
+    static func windowIDs(_ owners: [pid_t]) -> Set<Int> {
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return Set(list.compactMap { w in
+            guard let owner = w[kCGWindowOwnerPID as String] as? Int32, owners.contains(owner) else { return nil }
+            return w[kCGWindowNumber as String] as? Int
+        })
+    }
+
     /// Quit the way ⌘Q does, then wait until the process is gone, so Claude has flushed its
-    /// cookies and settings. With a chat mid-reply Claude first asks whether to quit; the
-    /// wait leaves time to answer, and a "no" ends the switch before anything is written.
+    /// cookies and settings. With a chat mid-reply Claude first asks whether to quit, in a
+    /// window of its own. Claude logs nothing when that prompt is cancelled, so the answer is
+    /// read from the prompt closing: a Quit makes Claude try to quit again, which it logs, and
+    /// a Cancel leaves it running. The timeout covers a prompt that isn't a separate window.
     static func quit(timeout: TimeInterval = 90, progress: @Sendable (String) -> Void = { _ in }) async -> QuitResult {
         let running = pids()
         guard !running.isEmpty else { return .quit }
         let mark = logMark()
+        let windowsBefore = windowIDs(running)
         for pid in running {
             if let app = NSRunningApplication(processIdentifier: pid) { app.terminate() }
             else { _ = await runProcess("/usr/bin/osascript", ["-e", "tell application id \"\(bundleId)\" to quit"]) }
         }
         var asked = false
+        var promptSeen = false
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             try? await Task.sleep(nanoseconds: 500_000_000)
             if pids().isEmpty { return .quit }
-            if !asked, logText(since: mark).contains("vetoed by before-quit interceptor") {
+            guard logText(since: mark).contains("vetoed by before-quit interceptor") else { continue }
+            if !asked {
                 asked = true
                 progress("Claude is asking whether to quit while a chat runs…")
             }
+            if !windowIDs(running).subtracting(windowsBefore).isEmpty { promptSeen = true; continue }
+            guard promptSeen else { continue }
+            // The prompt has closed. Give a Quit a moment to show up in the log.
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            if pids().isEmpty { return .quit }
+            let later = logText(since: mark)
+            let afterVeto = later.range(of: "vetoed by before-quit interceptor").map { later[$0.upperBound...] } ?? ""
+            if !afterVeto.contains("beforeQuit: handler fired") { return .declined }
         }
         return asked ? .declined : .failed
     }
