@@ -179,28 +179,21 @@ enum Keychain {
 
 // MARK: - Accounts on disk
 
-struct AccountRecord: Codable, Identifiable, Equatable {
-    let id: String
-    var name: String
-    var color: String
-    var configDir: String
-    var keychainService: String
-    let email: String?
-    let accountUuid: String?
-    let orgName: String?
-
-    var configURL: URL { URL(fileURLWithPath: (configDir as NSString).expandingTildeInPath) }
-
-    /// The label without its domain, for the menu bar where space is tight.
-    var shortName: String { name.split(separator: "@").first.map(String.init) ?? name }
-}
-
 enum AccountStore {
     private struct File: Codable { var accounts: [AccountRecord] }
 
+    /// The rows on disk. A row saved before organizations were tracked takes its organization from its
+    /// saved Claude login, else from its Claude Code login; this only reads, so --dry-run stays
+    /// read-only, and the next save keeps it.
     static func load() -> [AccountRecord] {
-        guard let data = try? Data(contentsOf: Paths.accountsFile) else { return [] }
-        return (try? JSONDecoder().decode(File.self, from: data))?.accounts ?? []
+        guard let data = try? Data(contentsOf: Paths.accountsFile),
+              var accounts = (try? JSONDecoder().decode(File.self, from: data))?.accounts else { return [] }
+        for i in accounts.indices where accounts[i].orgUuid == nil {
+            let profile = LoginFlow.profile(in: accounts[i].configURL)
+            accounts[i].orgUuid = LoginSlot.meta(accounts[i])?.orgFolder ?? profile["organizationUuid"] as? String
+            if accounts[i].orgName == nil { accounts[i].orgName = profile["organizationName"] as? String }
+        }
+        return accounts
     }
 
     static func save(_ accounts: [AccountRecord]) throws {
@@ -287,6 +280,18 @@ enum UsageMetric: String, Codable, CaseIterable, Identifiable {
 struct AppSettings: Codable, Equatable {
     var display: MenuBarDisplay = .gaugeNamePercent
     var metric: UsageMetric = .fiveHour
+    /// Switch by itself when the account in use runs out of usage.
+    var autoSwitch = AutoSwitchRule.onByDefault
+
+    init() {}
+
+    /// Each key is optional, so a settings file from an older version keeps what it has.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        display = try c.decodeIfPresent(MenuBarDisplay.self, forKey: .display) ?? .gaugeNamePercent
+        metric = try c.decodeIfPresent(UsageMetric.self, forKey: .metric) ?? .fiveHour
+        autoSwitch = try c.decodeIfPresent(Bool.self, forKey: .autoSwitch) ?? AutoSwitchRule.onByDefault
+    }
 
     private static var url: URL { Paths.stateDir.appendingPathComponent("settings.json") }
 
@@ -413,12 +418,6 @@ enum Usage {
 
 // MARK: - Switching the Claude app's account
 
-/// The account Claude is signed in to and the organization whose Code sessions it shows.
-struct Identity: Equatable, Codable, Sendable {
-    let account: String
-    let org: String
-}
-
 /// The Claude desktop app's files that make up "which account is signed in". Switching
 /// swaps exactly these while Claude is closed, and moves open Code sessions' owner
 /// records to the target account's folder so the same sessions appear after the switch.
@@ -450,8 +449,6 @@ enum ClaudeApp {
             }
     }
 
-    enum QuitResult { case quit, declined, failed }
-
     /// Ids of Claude's on-screen windows. Reading ids needs no screen-recording permission.
     static func windowIDs(_ owners: [pid_t]) -> Set<Int> {
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -462,40 +459,56 @@ enum ClaudeApp {
     }
 
     /// Quit the way ⌘Q does, then wait until the process is gone, so Claude has flushed its
-    /// cookies and settings. With a chat mid-reply Claude first asks whether to quit, in a
-    /// window of its own. Claude logs nothing when that prompt is cancelled, so the answer is
-    /// read from the prompt closing: a Quit makes Claude try to quit again, which it logs, and
-    /// a Cancel leaves it running. The timeout covers a prompt that isn't a separate window.
-    static func quit(timeout: TimeInterval = 90, progress: @Sendable (String) -> Void = { _ in }) async -> QuitResult {
+    /// cookies and settings. With a chat mid-reply Claude first asks, in a native alert: Quit
+    /// anyway, Wait for Claude (it quits once its chats finish) or Cancel. `QuitWatch` decides
+    /// from what is on screen and in Claude's log; it never walks away while the prompt is open.
+    ///
+    /// `unattended` answers the prompt with Quit anyway through Accessibility, the answer a person
+    /// switching by hand gives; Claude then marks each cut-off chat to resume at its next launch.
+    /// Without Accessibility access an unattended quit waits for a person like any other.
+    static func quit(unattended: Bool = false,
+                     progress: @Sendable (String) -> Void = { _ in }) async -> (outcome: QuitWatch.Outcome, answered: Bool) {
         let running = pids()
-        guard !running.isEmpty else { return .quit }
+        guard !running.isEmpty else { return (.quit, false) }
         let mark = logMark()
         let windowsBefore = windowIDs(running)
         for pid in running {
             if let app = NSRunningApplication(processIdentifier: pid) { app.terminate() }
             else { _ = await runProcess("/usr/bin/osascript", ["-e", "tell application id \"\(bundleId)\" to quit"]) }
         }
-        var asked = false
-        var promptSeen = false
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        var watch = QuitWatch(unattended: unattended, canAnswer: QuitPrompt.trusted, started: Date())
+        var firstTry: Date?
+        var shown: String?
+        while true {
             try? await Task.sleep(nanoseconds: 500_000_000)
-            if pids().isEmpty { return .quit }
-            guard logText(since: mark).contains("vetoed by before-quit interceptor") else { continue }
-            if !asked {
-                asked = true
-                progress("Claude is asking whether to quit while a chat runs…")
+            let alive = !pids().isEmpty
+            let text = alive ? logText(since: mark) : ""
+            let veto = text.range(of: "vetoed by before-quit interceptor")
+            let afterVeto = veto.map { text[$0.upperBound...] } ?? ""
+            let seen = QuitObservation(
+                claudeRunning: alive,
+                // Accessibility finds the prompt by its Quit anyway button; a window Claude opened
+                // after the request also counts, which covers a prompt without that button.
+                promptOpen: alive && (QuitPrompt.isOpen(in: running) || !windowIDs(running).subtracting(windowsBefore).isEmpty),
+                vetoLogged: veto != nil,
+                waitLogged: afterVeto.contains("[updater-guard] restart deferred"),
+                quitLoggedAfterVeto: afterVeto.contains("beforeQuit: handler fired"))
+            switch watch.step(seen, now: Date()) {
+            case .done(let outcome): return (outcome, watch.answeredAt != nil)
+            case .wait(let what):
+                if what != shown { shown = what; progress(what) }
+            case .answer:
+                if QuitPrompt.press(QuitPrompt.quitAnyway, in: running) {
+                    watch.answered(at: Date())
+                    progress("Answered Claude's prompt with \(QuitPrompt.quitAnyway)…")
+                } else if Date().timeIntervalSince(firstTry ?? Date()) > QuitPrompt.findTimeout {
+                    // A new window with no Quit anyway button is not a prompt this app answers:
+                    // leave the answer to a person and keep waiting for it.
+                    watch.canAnswer = false
+                }
+                firstTry = firstTry ?? Date()
             }
-            if !windowIDs(running).subtracting(windowsBefore).isEmpty { promptSeen = true; continue }
-            guard promptSeen else { continue }
-            // The prompt has closed. Give a Quit a moment to show up in the log.
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            if pids().isEmpty { return .quit }
-            let later = logText(since: mark)
-            let afterVeto = later.range(of: "vetoed by before-quit interceptor").map { later[$0.upperBound...] } ?? ""
-            if !afterVeto.contains("beforeQuit: handler fired") { return .declined }
         }
-        return asked ? .declined : .failed
     }
 
     static func launch() async {
@@ -565,6 +578,12 @@ enum ClaudeApp {
         return value.count == 36 ? String(value) : nil
     }
 
+    /// The log of Claude's current run (or its last one, once it has quit), across a rotation.
+    static func currentRunText() -> String {
+        let text = readLines(logDir.appendingPathComponent("main1.log"), from: 0).text + readLines(log, from: 0).text
+        return text.range(of: "Starting app {", options: .backwards).map { String(text[$0.lowerBound...]) } ?? text
+    }
+
     /// Who Claude is signed in as now, or was when it last quit, from its own log.
     static func currentIdentity() -> Identity? {
         let older = readLines(logDir.appendingPathComponent("main1.log"), from: 0).text
@@ -585,6 +604,15 @@ enum ClaudeApp {
                   let obj = record(url) else { return false }
             return (obj["isArchived"] as? Bool) != true && obj["scheduledTaskId"] == nil
         }
+    }
+
+    /// The organizations of `account` that Claude has opened, from its session folders, with how
+    /// many chats each holds.
+    static func organizations(of account: String) -> [(org: String, chats: Int)] {
+        let dir = sessions.appendingPathComponent(account)
+        let orgs = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return orgs.filter { $0.hasDirectoryPath || (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+            .map { ($0.lastPathComponent, ((try? FileManager.default.contentsOfDirectory(atPath: $0.path)) ?? []).filter { $0.hasPrefix("local_") }.count) }
     }
 
     static func record(_ url: URL) -> [String: Any]? {
@@ -635,10 +663,12 @@ enum LoginSlot {
         return try? JSONDecoder().decode(Meta.self, from: data)
     }
 
-    /// Where the account's sessions go: set only when the saved login is the account's own.
+    /// Where the row's sessions go: set only when the saved login is the row's own account and
+    /// organization.
     static func identity(_ acct: AccountRecord) -> Identity? {
         guard let uuid = acct.accountUuid, let meta = meta(acct), let org = meta.orgFolder,
-              meta.config["lastKnownAccountUuid"] == uuid, (meta.account ?? uuid) == uuid else { return nil }
+              meta.config["lastKnownAccountUuid"] == uuid, (meta.account ?? uuid) == uuid,
+              acct.orgUuid == nil || acct.orgUuid == org else { return nil }
         return Identity(account: uuid, org: org)
     }
 
@@ -733,6 +763,10 @@ struct SwitchOutcome: Codable {
     var moved = 0
     var confirmed = false
     var backup: String? = nil
+    /// Titles of the chats a quit or a usage limit had stopped that are running again.
+    var resumed: [String] = []
+    /// Each stopped chat that is still waiting, as "title (why)".
+    var notResumed: [String] = []
 }
 
 /// One switch at a time across the menu and `--switch`, which are separate processes.
@@ -779,41 +813,48 @@ enum SwitchEngine {
     /// Quit Claude, save the current account's login, load the target's, move the open Code
     /// sessions into the target's folder, reopen Claude, and keep the result only once Claude
     /// reports the target account; anything else is undone.
-    static func run(to target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
-        await locked { await switchLocked(to: target, accounts: accounts, progress: progress) }
+    /// `unattended` answers Claude's quit prompt with Quit anyway, for a switch with nobody at the Mac.
+    static func run(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool = false,
+                    progress: @escaping Progress) async -> SwitchOutcome {
+        await locked(unattended: unattended) {
+            await switchLocked(to: target, accounts: accounts, unattended: unattended, progress: progress)
+        }
     }
 
     /// Quit Claude, save the current account's login, and reopen Claude at its sign-in page, so
     /// another account can sign in without signing the current one out.
     static func setUp(_ target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
-        await locked { await setUpLocked(target, accounts: accounts, progress: progress) }
+        await locked(unattended: false) { await setUpLocked(target, accounts: accounts, progress: progress) }
     }
 
-    private static func locked(_ body: () async -> SwitchOutcome) async -> SwitchOutcome {
+    private static func locked(unattended: Bool, _ body: () async -> SwitchOutcome) async -> SwitchOutcome {
         guard let lock = SwitchLock.acquire() else { return SwitchOutcome(ok: false, message: "Another switch is already running.") }
         defer { lock.release() }
         if let journal = SwitchJournal.load() {
-            let undone = await rollback(journal, progress: { _ in })
+            let undone = await rollback(journal, unattended: unattended, progress: { _ in })
             return SwitchOutcome(ok: false, message: undone ? "The last switch was interrupted, so it was undone. Try again."
                                                            : "The last switch was interrupted, and undoing it needs Claude to quit.")
         }
         return await body()
     }
 
-    private static func switchLocked(to target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
+    private static func switchLocked(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool,
+                                     progress: @escaping Progress) async -> SwitchOutcome {
         guard let want = LoginSlot.identity(target) else {
             return SwitchOutcome(ok: false, message: SwitchError.noSlot(target.name).localizedDescription)
         }
-        let before = ClaudeApp.currentIdentity()
-        if before?.account == want.account {
+        if ClaudeApp.currentIdentity() == want {
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
             return SwitchOutcome(ok: true, message: "Already using \(target.name).", confirmed: true)
         }
+        // Read before the quit: these are the chats whose last turn ended at a usage limit.
+        let limited = LimitLog.stoppedSessions(in: ClaudeApp.currentRunText())
 
         let current: (acct: AccountRecord, id: Identity)?
-        switch await prepare(accounts: accounts, progress: progress) {
+        let answered: Bool
+        switch await prepare(accounts: accounts, unattended: unattended, progress: progress) {
         case .failure(let e): return e.outcome
-        case .success(let c): current = c
+        case .success(let p): current = p.current; answered = p.answered
         }
         guard var journal = startJournal(from: current?.id, to: want) else {
             await ClaudeApp.launch()
@@ -828,43 +869,64 @@ enum SwitchEngine {
             try await LoginSlot.load(target)
             if let current { try moveSessions(from: current.id, to: want, journal: &journal) }
         } catch {
-            _ = await rollback(journal, progress: progress)
+            _ = await rollback(journal, unattended: unattended, progress: progress)
             return SwitchOutcome(ok: false, message: "Switch failed and was undone: \(error.localizedDescription)")
         }
 
         progress("Opening Claude as \(target.name)…")
+        let movedRecords = journal.moves.map { URL(fileURLWithPath: $0.to) }.filter { $0.deletingLastPathComponent().path == ClaudeApp.folder(want).path }
+        let chats = movedRecords.compactMap(ChatResume.chat)
         let mark = ClaudeApp.logMark()
+        let reopenedAt = Date().timeIntervalSince1970 * 1000
         await ClaudeApp.launch()
-        let moved = journal.moves.filter { !$0.to.contains("/quarantine/") }.count
         switch await confirm(want, since: mark) {
         case .confirmed:
             // Keep the record of what moved beside the backup it belongs to.
             try? FileManager.default.moveItem(at: SwitchJournal.url,
                                               to: URL(fileURLWithPath: journal.backup).appendingPathComponent("switch.json"))
             pruneBackups()
-            let sessions = "\(moved) open session\(moved == 1 ? "" : "s")"
-            return SwitchOutcome(ok: true, message: "Switched to \(target.name), with \(sessions).",
-                                 moved: moved, confirmed: true, backup: journal.backup)
+            let reports = await ChatResume.run(ResumeRule.toResume(chats, limited: limited), in: ClaudeApp.folder(want),
+                                               reopenedAt: reopenedAt, progress: progress)
+            let resumed = reports.filter { $0.result == .running || $0.result == .sent }
+            let waiting = reports.compactMap { r -> String? in
+                if case .notResumed(let why) = r.result { return "\(r.chat.title) (\(why))" }
+                return nil
+            }
+            var message = "Switched to \(target.name), with \(chats.count) open session\(chats.count == 1 ? "" : "s")."
+            if !reports.isEmpty {
+                message += " \(resumed.count) of \(reports.count) stopped chat\(reports.count == 1 ? "" : "s") running again."
+            } else if answered {
+                message += " No chat was marked as stopped; check the ones that were working."
+            }
+            return SwitchOutcome(ok: true, message: message, moved: chats.count, confirmed: true, backup: journal.backup,
+                                 resumed: resumed.map(\.chat.title), notResumed: waiting)
         case .signedOut:
-            let undone = await rollback(journal, progress: progress)
+            let undone = await rollback(journal, unattended: unattended, progress: progress)
             return SwitchOutcome(ok: false, message: "\(target.name)'s saved login has expired, so "
                                  + (undone ? "the switch was undone. Use Set Up on its row to sign in again."
                                            : "Claude opened signed out. Quit Claude and click Switch to undo."))
         case .other(let seen):
-            let who = accounts.first { $0.accountUuid == seen?.account }?.name ?? (seen == nil ? "no account" : "another account")
-            let what = seen?.account == want.account ? "\(target.name) in a different organization than its saved login"
+            let who = accounts.row(for: seen)?.name ?? (seen == nil ? "no account" : "another account")
+            let what = seen?.account == want.account ? "\(target.name) in another organization than its saved login"
                                                      : "\(who) instead of \(target.name)"
-            let undone = await rollback(journal, progress: progress)
+            let undone = await rollback(journal, unattended: unattended, progress: progress)
             return SwitchOutcome(ok: false, message: "Claude opened as \(what), so "
                                  + (undone ? "the switch was undone." : "the switch needs undoing: quit Claude and click Switch."))
         }
     }
 
     private static func setUpLocked(_ target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
+        // Another organization of the account Claude is signed in to needs no sign-in, only Claude's
+        // own organization switch; the next switch away from it saves that organization's login.
+        if let now = ClaudeApp.currentIdentity(), now.account == target.accountUuid {
+            return SwitchOutcome(ok: true, message: "Claude is already signed in to this account. Choose "
+                                 + (target.orgName ?? "this organization") + " once from your name at the bottom of Claude's sidebar. "
+                                 + "Claude Accounts saves it then, and from that point Switch moves your open sessions between the organizations.")
+        }
         let current: (acct: AccountRecord, id: Identity)?
-        switch await prepare(accounts: accounts, progress: progress) {
+        switch await prepare(accounts: accounts, unattended: false, progress: progress) {
         case .failure(let e): return e.outcome
-        case .success(let c): current = c
+        case .success(let p): current = p.current
         }
         guard let journal = startJournal(from: current?.id, to: nil) else {
             await ClaudeApp.launch()
@@ -883,31 +945,41 @@ enum SwitchEngine {
         // The sign-in itself happens in Claude; the next switch away from it saves the login.
         SwitchJournal.clear()
         await ClaudeApp.launch()
-        return SwitchOutcome(ok: true, message: "Sign in to Claude as \(target.email ?? target.name). Your open sessions stay with "
+        let organization = accounts.otherOrganizations(of: target).isEmpty ? ""
+            : ", then choose \(target.orgName ?? "this organization") from your name at the bottom of Claude's sidebar"
+        return SwitchOutcome(ok: true, message: "Sign in to Claude as \(target.email ?? target.name)\(organization). Your open sessions stay with "
                              + (current?.acct.name ?? "the previous account") + "; Switch brings them over.")
     }
 
+    /// Who Claude was when it quit, and whether its quit prompt was answered for nobody.
+    struct Prepared {
+        var current: (acct: AccountRecord, id: Identity)?
+        var answered = false
+    }
+
     /// Resolve who Claude is, quit it, and check again once it has gone. Nothing is written here.
-    private static func prepare(accounts: [AccountRecord], progress: @escaping Progress)
-        async -> Result<(acct: AccountRecord, id: Identity)?, OutcomeError> {
+    private static func prepare(accounts: [AccountRecord], unattended: Bool, progress: @escaping Progress)
+        async -> Result<Prepared, OutcomeError> {
         let before = ClaudeApp.currentIdentity()
-        if let before, !accounts.contains(where: { $0.accountUuid == before.account }) {
-            return .failure(OutcomeError("Claude is signed in to an account this app doesn't know. Add it first."))
+        if before != nil, accounts.row(for: before) == nil {
+            return .failure(OutcomeError("Claude is using an account or organization this app doesn't know. Add it first."))
         }
         progress("Quitting Claude…")
-        switch await ClaudeApp.quit(progress: progress) {
+        let (quit, answered) = await ClaudeApp.quit(unattended: unattended, progress: progress)
+        // Nothing has been written yet; make sure Claude is left running whatever the answer was.
+        if quit != .quit, ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
+        switch quit {
         case .quit: break
-        case .declined: return .failure(OutcomeError("Claude stayed open because a chat is still running. Nothing was changed."))
+        case .declined: return .failure(OutcomeError("Claude stayed open, so nothing was changed."))
         case .failed: return .failure(OutcomeError("Claude didn't quit, so nothing was changed."))
         }
         // Read again after the quit: this is the state Claude's files were flushed in.
-        guard let id = ClaudeApp.currentIdentity() else { return .success(nil) }
-        guard id == before, ClaudeApp.savedAccount() == id.account,
-              let acct = accounts.first(where: { $0.accountUuid == id.account }) else {
+        guard let id = ClaudeApp.currentIdentity() else { return .success(Prepared(current: nil, answered: answered)) }
+        guard id == before, ClaudeApp.savedAccount() == id.account, let acct = accounts.row(for: id) else {
             await ClaudeApp.launch()
             return .failure(OutcomeError(SwitchError.inconsistent.localizedDescription))
         }
-        return .success((acct, id))
+        return .success(Prepared(current: (acct, id), answered: answered))
     }
 
     struct OutcomeError: Error {
@@ -985,9 +1057,9 @@ enum SwitchEngine {
 
     /// Put Claude's files back as they were before the switch and reopen it. Returns false,
     /// keeping the journal for a later try, if Claude can't be quit first.
-    static func rollback(_ journal: SwitchJournal, progress: @escaping Progress) async -> Bool {
+    static func rollback(_ journal: SwitchJournal, unattended: Bool = false, progress: @escaping Progress) async -> Bool {
         progress("Undoing the switch…")
-        guard await ClaudeApp.quit(progress: progress) == .quit else { return false }
+        guard await ClaudeApp.quit(unattended: unattended, progress: progress).outcome == .quit else { return false }
         let fm = FileManager.default
         for m in journal.moves.reversed() where fm.fileExists(atPath: m.to) && !fm.fileExists(atPath: m.from) {
             try? fm.moveItem(atPath: m.to, toPath: m.from)
@@ -1016,6 +1088,118 @@ enum SwitchEngine {
     }
 }
 
+// MARK: - After a switch
+
+/// Gets the chats a quit or a usage limit stopped running again after a switch, through
+/// ChatResumer: Claude resumes the ones a quit cut off by itself, and each chat still idle gets a
+/// new message, "resume", typed into its own message box. Never Retry: retrying the failed
+/// message rewinds the chat and starts its transcript over without its subagents.
+enum ChatResume {
+    /// A moved session record as the resume step needs it.
+    static func chat(_ record: URL) -> MovedChat? {
+        guard let obj = ClaudeApp.record(record), let id = obj["sessionId"] as? String else { return nil }
+        return MovedChat(id: id, title: (obj["title"] as? String) ?? id,
+                         interrupted: obj["interruptedByQuitAt"] is NSNumber,
+                         lastActivity: (obj["lastActivityAt"] as? Double) ?? 0)
+    }
+
+    static func run(_ wanted: [MovedChat], in folder: URL, reopenedAt: Double,
+                    progress: @escaping SwitchEngine.Progress) async -> [ChatResumer.Report] {
+        let resumer = ChatResumer(
+            open: { id in _ = await runProcess("/usr/bin/open", ["claude://code/continue?session=\(id)"]) },
+            pids: ClaudeApp.pids,
+            running: { chat in
+                let obj = ClaudeApp.record(folder.appendingPathComponent(chat.id + ".json"))
+                let lastActivity = (obj?["lastActivityAt"] as? Double) ?? 0
+                // A chat a limit stopped has no mark to clear; only new activity shows it ran.
+                return chat.interrupted
+                    ? ResumeRule.resumed(markStillSet: obj?["interruptedByQuitAt"] is NSNumber, lastActivity: lastActivity, reopenedAt: reopenedAt)
+                    : lastActivity > reopenedAt
+            },
+            progress: progress)
+        return await resumer.run(wanted)
+    }
+}
+
+/// A macOS notification, for a switch nobody watched. It shows on this Mac only.
+enum Notify {
+    static func post(_ title: String, _ body: String) {
+        func quoted(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
+        _ = runProcessBlocking("/usr/bin/osascript", ["-e", "display notification \(quoted(body)) with title \(quoted(title))"],
+                               env: nil, cwd: nil, timeout: 10)
+    }
+
+    /// The outcome of an unattended switch, naming the stopped chats it couldn't get running. The
+    /// message they need has to be a new one: Retry on the failed message starts the chat over.
+    static func outcome(_ outcome: SwitchOutcome) {
+        var body = outcome.message
+        let waiting = outcome.notResumed
+        if !waiting.isEmpty {
+            let more = waiting.count > 3 ? " and \(waiting.count - 3) more" : ""
+            body += " Send a new message (not Retry) to: " + waiting.prefix(3).joined(separator: ", ") + more + "."
+        }
+        post(outcome.ok ? "Claude Accounts switched" : "Claude Accounts didn't switch", body)
+    }
+}
+
+// MARK: - Usage cache and auto-switch state
+
+/// The last good reading per account, kept so a relaunch shows numbers without asking again
+/// and so `--auto-switch` on the command line decides from what the menu last read.
+enum UsageCache {
+    struct Entry: Codable {
+        var polledAt: Date
+        var retryAt: Date?
+        var plan: String?
+        var fiveHour: UsageWindow?
+        var weekly: UsageWindow?
+        var loginExpiresAt: Date?
+        /// When the reading shown was taken; a later rate-limited ask doesn't move it.
+        var readAt: Date?
+    }
+
+    static var url: URL { Paths.stateDir.appendingPathComponent("usage-cache.json") }
+
+    static func load() -> [String: Entry] {
+        guard let data = try? Data(contentsOf: url) else { return [:] }
+        return (try? JSONDecoder().decode([String: Entry].self, from: data)) ?? [:]
+    }
+
+    static func save(_ entries: [String: Entry]) {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// The auto-switch rule's view of each row, from cached readings.
+    static func candidates(_ accounts: [AccountRecord], _ entries: [String: Entry]) -> [SwitchCandidate] {
+        accounts.map { acct in
+            let e = entries[acct.id]
+            let hasReading = e?.fiveHour != nil || e?.weekly != nil || e?.plan != nil
+            return SwitchCandidate(id: acct.id, name: acct.name, fiveHour: e?.fiveHour?.pct, weekly: e?.weekly?.pct,
+                                   readAt: hasReading ? (e?.readAt ?? e?.polledAt) : nil,
+                                   needsSignIn: e?.loginExpiresAt.map { $0.timeIntervalSinceNow < API.signInWarning } ?? false,
+                                   hasSavedLogin: LoginSlot.exists(acct))
+        }
+    }
+}
+
+/// When auto-switch last tried, shared by the menu and the command line so the cool-down holds
+/// across both and across relaunches.
+enum AutoSwitchLog {
+    private struct File: Codable { var lastAttempt: Date; var outcome: String? }
+    private static var url: URL { Paths.stateDir.appendingPathComponent("auto-switch.json") }
+
+    static func lastAttempt() -> Date? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return (try? JSONDecoder().decode(File.self, from: data))?.lastAttempt
+    }
+
+    static func record(_ date: Date, outcome: String? = nil) {
+        guard let data = try? JSONEncoder().encode(File(lastAttempt: date, outcome: outcome)) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+}
+
 // MARK: - Store
 
 @MainActor
@@ -1037,9 +1221,16 @@ final class Store: ObservableObject {
     /// When the usage service lets each rate-limited account be asked again.
     @Published var retryAt: [String: Date] = [:]
 
+    /// Whether this app may press Claude's quit prompt, which an unattended switch needs.
+    @Published var accessibilityGranted = QuitPrompt.trusted
+
     private var timer: Timer?
     private let identityWatcher = IdentityWatcher()
     private var polledAt: [String: Date] = [:]
+    /// When each row's shown reading was taken.
+    private var readAt: [String: Date] = [:]
+    /// The row the "no account has room" notice was last posted for, so it is posted once.
+    private var toldNowhereFor: String?
 
     /// The Claude app's own usage reader reuses a good reading for 60 s; asking faster than
     /// that earns a 429 with a multi-minute Retry-After, so no account is asked more often.
@@ -1055,11 +1246,14 @@ final class Store: ObservableObject {
         refresh()
         // Tick often so each account is read as soon as it is due; the interval above sets the pace.
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor in
+                self?.refresh()
+                self?.considerAutoSwitch()
+            }
         }
     }
 
-    func isInUse(_ acct: AccountRecord) -> Bool { acct.accountUuid != nil && acct.accountUuid == inUse?.account }
+    func isInUse(_ acct: AccountRecord) -> Bool { accounts.row(for: inUse)?.id == acct.id }
 
     /// Opening the menu calls this; accounts that aren't due yet keep their cached reading.
     func refreshIfStale() { refresh() }
@@ -1092,6 +1286,7 @@ final class Store: ObservableObject {
             self.lastUpdated = Date()
             self.loading = false
             self.saveCache()
+            self.considerAutoSwitch()
         }
     }
 
@@ -1105,30 +1300,20 @@ final class Store: ObservableObject {
         }
         retryAt[id] = nil
         states[id] = state
+        if case .ok = state { readAt[id] = Date() }
     }
 
     // MARK: Cache
 
-    /// The last good reading per account, so a relaunch shows numbers without asking again.
-    private struct CacheEntry: Codable {
-        var polledAt: Date
-        var retryAt: Date?
-        var plan: String?
-        var fiveHour: UsageWindow?
-        var weekly: UsageWindow?
-        var loginExpiresAt: Date?
-    }
-
-    private var cacheURL: URL { Paths.stateDir.appendingPathComponent("usage-cache.json") }
-
     private func loadCache() {
-        guard let data = try? Data(contentsOf: cacheURL),
-              let entries = try? JSONDecoder().decode([String: CacheEntry].self, from: data) else { return }
+        let entries = UsageCache.load()
+        guard !entries.isEmpty else { return }
         for (id, e) in entries {
             polledAt[id] = e.polledAt
             if let r = e.retryAt, r > Date() { retryAt[id] = r }
             if e.fiveHour != nil || e.weekly != nil || e.plan != nil {
                 states[id] = .ok(plan: e.plan, fiveHour: e.fiveHour, weekly: e.weekly, loginExpiresAt: e.loginExpiresAt)
+                readAt[id] = e.readAt ?? e.polledAt
             } else if let r = retryAt[id] {
                 states[id] = .rateLimited(until: r)
             }
@@ -1137,17 +1322,63 @@ final class Store: ObservableObject {
     }
 
     private func saveCache() {
-        var entries: [String: CacheEntry] = [:]
+        var entries: [String: UsageCache.Entry] = [:]
         for (id, polled) in polledAt {
             // A rate-limit wait is saved even without a reading, so a relaunch doesn't ask again early.
             if case .ok(let plan, let fh, let wk, let exp) = states[id] {
-                entries[id] = CacheEntry(polledAt: polled, retryAt: retryAt[id], plan: plan, fiveHour: fh, weekly: wk, loginExpiresAt: exp)
+                entries[id] = UsageCache.Entry(polledAt: polled, retryAt: retryAt[id], plan: plan, fiveHour: fh, weekly: wk,
+                                               loginExpiresAt: exp, readAt: readAt[id])
             } else if let wait = retryAt[id] {
-                entries[id] = CacheEntry(polledAt: polled, retryAt: wait)
+                entries[id] = UsageCache.Entry(polledAt: polled, retryAt: wait)
             }
         }
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: cacheURL, options: .atomic)
+        UsageCache.save(entries)
+    }
+
+    // MARK: Auto-switch
+
+    /// Run the auto-switch rule on the readings on screen, and switch with nobody at the Mac
+    /// when it says so. The attempt is logged before it starts, so the cool-down holds even if
+    /// this app quits partway.
+    func considerAutoSwitch() {
+        guard settings.autoSwitch, switching == nil else { return }
+        let all = accounts.map { acct in
+            var fiveHour: Int?, weekly: Int?, taken: Date?
+            if case .ok(_, let fh, let wk, _) = states[acct.id] { fiveHour = fh?.pct; weekly = wk?.pct; taken = readAt[acct.id] }
+            return SwitchCandidate(id: acct.id, name: acct.name, fiveHour: fiveHour, weekly: weekly, readAt: taken,
+                                   needsSignIn: states[acct.id]?.needsSignIn ?? false, hasSavedLogin: LoginSlot.exists(acct))
+        }
+        let current = accounts.row(for: inUse).flatMap { row in all.first { $0.id == row.id } }
+        // Only look for Claude's process once the account in use is out; `ps` is the reliable check.
+        let out = current?.out ?? false
+        let decision = AutoSwitchRule.decide(current: current, others: all, enabled: true,
+                                             claudeRunning: out && !ClaudeApp.pids().isEmpty,
+                                             lastAttempt: AutoSwitchLog.lastAttempt(), now: Date())
+        switch decision {
+        case .stay:
+            if !out { toldNowhereFor = nil }
+        case .nowhere(let why):
+            // Once per account running out, not on every tick while it stays out.
+            guard toldNowhereFor != current?.id else { return }
+            toldNowhereFor = current?.id
+            flash(why, for: 10)
+            Notify.post("Claude Accounts didn't switch", why)
+        case .switchTo(let id, let reason):
+            guard let target = accounts.first(where: { $0.id == id }) else { return }
+            toldNowhereFor = nil
+            AutoSwitchLog.record(Date())
+            flash(reason, for: 10)
+            runSwitch(notify: true) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1) }
+        }
+    }
+
+    /// Turn auto-switch on or off. Turning it on is a click by the person at the Mac, so this is
+    /// when macOS is asked to list the app under Accessibility.
+    func setAutoSwitch(_ on: Bool) {
+        settings.autoSwitch = on
+        if on, !QuitPrompt.trusted { QuitPrompt.requestAccess() }
+        accessibilityGranted = QuitPrompt.trusted
+        considerAutoSwitch()
     }
 
     /// Show a short status line that clears itself.
@@ -1196,7 +1427,9 @@ final class Store: ObservableObject {
     /// Reopen Claude at its sign-in page for an account that has no saved Claude login yet.
     func setUp(_ target: AccountRecord) { runSwitch { await SwitchEngine.setUp(target, accounts: $0, progress: $1) } }
 
-    private func runSwitch(_ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress) async -> SwitchOutcome) {
+    /// `notify` posts the outcome as a notification, for a switch nobody watched.
+    private func runSwitch(notify: Bool = false,
+                           _ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress) async -> SwitchOutcome) {
         guard switching == nil else { return }
         switching = "Starting…"
         let all = accounts
@@ -1205,6 +1438,10 @@ final class Store: ObservableObject {
             self.switching = nil
             self.flash(outcome.message, for: 10)
             self.inUse = self.identityWatcher.poll()
+            if notify {
+                AutoSwitchLog.record(AutoSwitchLog.lastAttempt() ?? Date(), outcome: outcome.message)
+                Notify.outcome(outcome)
+            }
         }
     }
 
@@ -1258,8 +1495,21 @@ final class LoginFlow: ObservableObject {
         case starting
         case waitingForCode
         case verifying
-        case done(String)
+        /// Who was added or signed in, and what is left to do, if anything.
+        case done(String, next: String?)
+        /// The login landed on an organization this account already has a row for.
+        case otherOrganization(OtherOrganization)
         case failed(String)
+    }
+
+    /// What the sheet needs to offer the account's other organization instead of a dead end.
+    struct OtherOrganization: Equatable {
+        /// The row that already stands for the organization the login landed on.
+        let existing: String
+        let email: String?
+        /// An organization of this account that Claude has opened and no row stands for yet; the
+        /// next login pre-selects it. Nil when Claude hasn't opened one.
+        let known: String?
     }
 
     @Published var phase: Phase = .idle
@@ -1277,11 +1527,15 @@ final class LoginFlow: ObservableObject {
 
     /// Start a login. With `target`, sign that account in again in its own folder, so its
     /// row keeps its place, name and color. Without it, add a new account; its email becomes
-    /// the label once sign-in finishes, so the folder gets a random id now.
-    func start(reauth target: AccountRecord? = nil) {
+    /// the label once sign-in finishes, so the folder gets a random id now. `organization`
+    /// (a target's own, or another organization of a known account) is pre-selected on the
+    /// sign-in page through Claude Code's `forceLoginOrgUUID` setting in that login's folder.
+    func start(reauth target: AccountRecord? = nil, organization: String? = nil, email: String? = nil) {
         guard let cli = ClaudeCLI.path else { phase = .failed("Claude Code isn't installed. Install it, then try again."); return }
         let id = target?.id ?? "acct-" + UUID().uuidString.prefix(8).lowercased()
         let dir = target?.configURL ?? Paths.loginsDir.appendingPathComponent(id)
+        let org = target?.orgUuid ?? organization
+        let prefill = target?.email ?? email
         reauth = target
         phase = .starting
         output = ""
@@ -1301,11 +1555,12 @@ final class LoginFlow: ObservableObject {
                 servicesBefore = await Keychain.services()
             }
             draft = (id, dir)
+            if let org { Self.preselect(org, in: dir) }
 
             let p = Process()
             p.executableURL = URL(fileURLWithPath: cli)
             // Pre-filling the email steers the browser to the right Google account.
-            p.arguments = ["auth", "login", "--claudeai"] + (target?.email.map { ["--email", $0] } ?? [])
+            p.arguments = ["auth", "login", "--claudeai"] + (prefill.map { ["--email", $0] } ?? [])
             p.environment = ClaudeCLI.env(configDir: dir)
             let inPipe = Pipe(), outPipe = Pipe()
             p.standardInput = inPipe
@@ -1392,30 +1647,43 @@ final class LoginFlow: ObservableObject {
         }
         let profile = Self.profile(in: draft.dir)
         var accounts = AccountStore.load()
+        let org = profile["organizationUuid"] as? String
+        let email = profile["emailAddress"] as? String
+        // One row per account and organization. Landing on one that is already added offers the
+        // account's other organization instead of stopping there.
         if let uuid = profile["accountUuid"] as? String,
-           let dup = accounts.first(where: { $0.accountUuid == uuid }) {
+           let dup = accounts.first(where: { $0.accountUuid == uuid && ($0.orgUuid == nil || org == nil || $0.orgUuid == org) }) {
             _ = await ClaudeCLI.run(configDir: draft.dir, ["auth", "logout"])
             await Keychain.delete(service: service)
             try? FileManager.default.removeItem(at: draft.dir)
-            phase = .failed("That Google account is already added as \(dup.name).")
+            let known = accounts.organizationsToAdd(account: uuid, opened: ClaudeApp.organizations(of: uuid)).first
+            phase = .otherOrganization(OtherOrganization(existing: dup.name, email: email, known: known))
             self.draft = nil
             return
         }
-        let email = profile["emailAddress"] as? String
+        let orgName = profile["organizationName"] as? String
+        let account = accounts.first { $0.accountUuid != nil && $0.accountUuid == profile["accountUuid"] as? String }
         let usedColors = Set(accounts.map(\.color))
         let record = AccountRecord(
             id: draft.id,
-            name: email ?? "Account \(accounts.count + 1)",
-            color: presetColors.first { !usedColors.contains($0) } ?? presetColors[accounts.count % presetColors.count],
+            name: rowName(email: email, orgName: orgName, accountAlreadyAdded: account != nil, fallback: "Account \(accounts.count + 1)"),
+            // Another organization of a known account keeps that account's color.
+            color: account?.color ?? presetColors.first { !usedColors.contains($0) } ?? presetColors[accounts.count % presetColors.count],
             configDir: draft.dir.path.replacingOccurrences(of: Paths.home.path, with: "~"),
             keychainService: service,
             email: email,
             accountUuid: profile["accountUuid"] as? String,
-            orgName: profile["organizationName"] as? String)
+            orgName: orgName,
+            orgUuid: org)
         accounts.append(record)
+        if let org { Self.preselect(org, in: draft.dir) }
         do {
             try AccountStore.save(accounts)
-            phase = .done(record.email ?? record.name)
+            // Claude's own login for this organization is the one step the app can't take.
+            let next = account == nil ? nil
+                : "To switch Claude to \(orgName ?? "this organization"), choose it once from your name at the bottom of Claude's sidebar. "
+                + "Claude Accounts saves it then, and from that point Switch and auto-switch move between the two organizations."
+            phase = .done(record.email ?? record.name, next: next)
         } catch {
             phase = .failed("Signed in, but could not save: \(error.localizedDescription)")
         }
@@ -1427,7 +1695,7 @@ final class LoginFlow: ObservableObject {
     private func finishReauth(_ target: AccountRecord, dir: URL) async {
         let signedIn = Self.profile(in: dir)
         if let uuid = target.accountUuid, signedIn["accountUuid"] as? String == uuid {
-            phase = .done(target.email ?? target.name)
+            phase = .done(target.email ?? target.name, next: nil)
             return
         }
         if let snap = rollback?.keychain { await Keychain.restore(service: target.keychainService, snap) }
@@ -1436,7 +1704,21 @@ final class LoginFlow: ObservableObject {
         phase = .failed("You signed in as \(other), but this row is \(target.email ?? target.name). The previous login was kept; try again and pick \(target.email ?? "the right account").")
     }
 
-    private static func profile(in dir: URL) -> [String: Any] {
+    /// Pin a login folder to one organization: Claude Code pre-selects it on the sign-in page
+    /// ("From any settings file, Claude Code also uses a single UUID to pre-select that
+    /// organization", per its settings reference), so a second organization of the same account
+    /// can be added and a sign-in again lands on the row's own organization.
+    nonisolated static func preselect(_ org: String, in dir: URL) {
+        let file = dir.appendingPathComponent("settings.json")
+        var settings = (try? JSONSerialization.jsonObject(with: Data(contentsOf: file))) as? [String: Any] ?? [:]
+        guard settings["forceLoginOrgUUID"] as? String != org else { return }
+        settings["forceLoginOrgUUID"] = org
+        guard let data = try? JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys]) else { return }
+        try? data.write(to: file, options: .atomic)
+    }
+
+    /// The Claude Code login's profile: account, email and organization. It holds no secret.
+    nonisolated static func profile(in dir: URL) -> [String: Any] {
         guard let data = try? Data(contentsOf: dir.appendingPathComponent(".claude.json")),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
         return obj["oauthAccount"] as? [String: Any] ?? [:]
@@ -1500,6 +1782,8 @@ struct AccountRow: View {
     let account: AccountRecord
     let state: AccountState?
     let inUse: Bool
+    /// Another organization of this row's account is the one in use.
+    let sameAccountInUse: Bool
     let canSwitch: Bool
     let switchBusy: Bool
     let onSwitch: () -> Void
@@ -1509,6 +1793,8 @@ struct AccountRow: View {
     let onRename: (String) -> Void
     let onRecolor: (String) -> Void
     let onRemove: () -> Void
+    /// Shown under its account's name as one of that account's organizations.
+    var organizationEntry = false
     @State private var confirmingRemove = false
     @State private var renaming = false
     @State private var draftName = ""
@@ -1531,7 +1817,8 @@ struct AccountRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Circle().fill(Color(hex: account.color)).frame(width: 9, height: 9)
+                // An organization entry lines up under its account's dot instead of repeating it.
+                Circle().fill(organizationEntry ? Color.clear : Color(hex: account.color)).frame(width: 9, height: 9)
                 if renaming {
                     TextField("Name", text: $draftName)
                         .textFieldStyle(.roundedBorder).controlSize(.small)
@@ -1539,7 +1826,8 @@ struct AccountRow: View {
                         .onSubmit(commitRename)
                         .onExitCommand { renaming = false }
                 } else {
-                    Text(account.name).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
+                    Text(organizationEntry ? (account.orgName ?? account.name) : account.name)
+                        .fontWeight(organizationEntry ? .regular : .semibold).lineLimit(1).truncationMode(.middle)
                         .help(account.email ?? account.name)
                     if case .ok(let plan?, _, _, _) = state {
                         Text(plan.capitalized).font(.caption).foregroundStyle(.secondary)
@@ -1554,15 +1842,19 @@ struct AccountRow: View {
                             .background(Capsule().fill(Color.accentColor.opacity(0.18)))
                     } else if canSwitch {
                         Button("Switch", action: onSwitch).controlSize(.small).disabled(switchBusy)
-                            .help("Quit Claude, sign it in as this account, and bring your open sessions along")
+                            .help(organizationEntry ? "Quit Claude, switch it to this organization, and bring your open sessions along"
+                                                    : "Quit Claude, sign it in as this account, and bring your open sessions along")
                     } else {
                         Button("Set Up", action: onSetUp).controlSize(.small).disabled(switchBusy)
-                            .help("Quit Claude, save the account it's using, and reopen it at the sign-in page for this account")
+                            .help(sameAccountInUse
+                                  ? "Shows how to save this organization: choose it once in Claude's own account menu"
+                                  : "Quit Claude, save the account it's using, and reopen it at the sign-in page for this account")
                     }
                 }
                 .frame(width: 62, height: 22, alignment: .trailing)
                 Menu {
                     if let email = account.email { Text(email) }
+                    if let org = account.orgName { Text(org) }
                     Divider()
                     Button("Rename…") {
                         draftName = account.name
@@ -1647,6 +1939,8 @@ struct MenuContent: View {
                         ForEach(UsageMetric.allCases) { Text($0.title).tag($0) }
                     }
                     Divider()
+                    Toggle("Auto-Switch When Out", isOn: Binding(get: { store.settings.autoSwitch },
+                                                                set: { store.setAutoSwitch($0) }))
                     Toggle("Open at Login", isOn: Binding(get: { store.openAtLogin }, set: { _ in store.toggleOpenAtLogin() }))
                     Divider()
                     Button("Quit Claude Accounts") { NSApp.terminate(nil) }.keyboardShortcut("q")
@@ -1662,26 +1956,66 @@ struct MenuContent: View {
             if let msg = store.message {
                 Text(msg).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 10).padding(.bottom, 4)
             }
+            if store.settings.autoSwitch, !store.accessibilityGranted {
+                HStack {
+                    Text("Allow Accessibility so auto-switch can answer Claude's quit prompt and resume stopped chats.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("Allow…") { store.setAutoSwitch(true) }.controlSize(.small)
+                }
+                .padding(.horizontal, 10).padding(.bottom, 4)
+            }
             if store.accounts.isEmpty {
                 Text("No accounts yet. Add one to see its 5-hour and weekly usage here.")
                     .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(10)
             }
-            ForEach(store.accounts) { acct in
-                AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct),
-                           canSwitch: LoginSlot.exists(acct), switchBusy: store.switching != nil,
-                           onSwitch: { store.switchTo(acct) }, onSetUp: { store.setUp(acct) },
-                           retryAt: store.retryAt[acct.id],
-                           onSignIn: { openSignIn(acct) },
-                           onRename: { store.update(acct, name: $0) },
-                           onRecolor: { store.update(acct, color: $0) },
-                           onRemove: { store.remove(acct) })
+            // One entry per account; an account in several organizations lists each beneath its name.
+            ForEach(store.accounts.groupedByAccount(), id: \.[0].id) { group in
+                if group.count == 1 {
+                    row(group[0], in: group)
+                } else {
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack(spacing: 8) {
+                            Circle().fill(Color(hex: group[0].color)).frame(width: 9, height: 9)
+                            Text(accountTitle(group)).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
+                                .help(group[0].email ?? group[0].name)
+                        }
+                        .padding(.horizontal, 10).padding(.top, 8)
+                        ForEach(group) { row($0, in: group) }
+                    }
+                }
             }
         }
         .padding(6)
         .frame(width: 330)
-        .onAppear { store.refreshIfStale() }
+        .onAppear {
+            store.accessibilityGranted = QuitPrompt.trusted
+            store.refreshIfStale()
+        }
+    }
+
+    private func row(_ acct: AccountRecord, in group: [AccountRecord]) -> some View {
+        AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct),
+                   sameAccountInUse: !store.isInUse(acct) && acct.accountUuid != nil && acct.accountUuid == store.inUse?.account,
+                   canSwitch: LoginSlot.exists(acct), switchBusy: store.switching != nil,
+                   onSwitch: { store.switchTo(acct) }, onSetUp: { store.setUp(acct) },
+                   retryAt: store.retryAt[acct.id],
+                   onSignIn: { openSignIn(acct) },
+                   onRename: { store.update(acct, name: $0) },
+                   // An account's color is shared by all of its organizations.
+                   onRecolor: { color in group.forEach { store.update($0, color: color) } },
+                   onRemove: { store.remove(acct) },
+                   organizationEntry: group.count > 1)
+    }
+
+    /// An account's name above its organizations: its first row's label, without the
+    /// organization that label may carry.
+    private func accountTitle(_ group: [AccountRecord]) -> String {
+        let first = group[0]
+        guard let org = first.orgName, first.name.hasSuffix(" · " + org) else { return first.name }
+        return String(first.name.dropLast(org.count + 3))
     }
 
     /// One window serves both jobs: adding an account (nil) or signing one in again.
@@ -1748,11 +2082,11 @@ struct SignInView: View {
         }
     }
 
-    private func restart(reauth: AccountRecord?) {
+    private func restart(reauth: AccountRecord?, organization: String? = nil, email: String? = nil) {
         code = ""
         target = reauth
         flow.reset()
-        flow.start(reauth: reauth)
+        flow.start(reauth: reauth, organization: organization, email: email)
     }
 
     private func close() { dismissWindow(id: "sign-in") }
@@ -1777,15 +2111,27 @@ struct SignInView: View {
             }
         case .verifying:
             HStack { ProgressView().controlSize(.small); Text("Checking the code…").font(.callout) }
-        case .done(let who):
+        case .done(let who, let next):
             Label(target == nil ? "Added \(who)." : "Signed in again as \(who).", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
+            if let next { Text(next).font(.callout).fixedSize(horizontal: false, vertical: true) }
             HStack {
                 if target == nil { Button("Add another") { restart(reauth: nil) } }
                 Spacer()
                 Button("Done") { close() }.keyboardShortcut(.defaultAction)
             }
             .onAppear { store.refresh(forcing: target?.id) }
+        case .otherOrganization(let other):
+            Text("That organization is already added as \(other.existing). To add this account's other organization, sign in once more"
+                 + (other.known == nil ? " and choose the other organization on the page before you click Authorize."
+                                       : "; the page picks the other organization for you."))
+                .font(.callout).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Close") { close() }
+                Spacer()
+                Button("Add Other Organization") { restart(reauth: nil, organization: other.known, email: other.email) }
+                    .keyboardShortcut(.defaultAction)
+            }
         case .failed(let why):
             Label(why, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1880,40 +2226,138 @@ private func drawWarning(centeredAt mid: NSPoint) {
     NSGraphicsContext.current?.compositingOperation = .sourceOver
 }
 
-/// `ClaudeAccounts --switch <account>` runs the menu's switch without the menu, prints the
-/// outcome as JSON, and saves it to last-switch.json in the app's state folder. The account can be named by id,
-/// label, email, or the email's first part. Run it from outside Claude: quitting Claude ends
-/// every process Claude started.
+/// The command line, for running a switch from outside Claude:
+///
+/// - `--status` prints what a switch would act on.
+/// - `--switch <account>` runs the menu's switch. The account can be named by id, label, email,
+///   or the email's first part.
+/// - `--auto-switch` runs the menu's Auto-Switch rule once on the usage the menu last read:
+///   if the account in use is out, it switches to the set-up account with the most room.
+/// - `--unattended` (implied by `--auto-switch`) answers Claude's quit prompt with Quit anyway.
+/// - `--dry-run` prints every check and what would happen, and changes nothing.
+/// - `--detach` starts the same command in its own session, so it outlives Claude quitting even
+///   when started from a shell inside Claude, and writes its output to `--log <file>`
+///   (default: last-switch.log in the app's state folder).
+///
+/// A real run prints the outcome as JSON and saves it to last-switch.json in the state folder.
 @main
 enum Entry {
     static func main() {
         Migration.moveLegacyState()
         let args = CommandLine.arguments
         if args.contains("--status") { printStatus() }
-        guard let i = args.firstIndex(of: "--switch"), i + 1 < args.count else {
+        let auto = args.contains("--auto-switch")
+        guard auto || args.contains("--switch") else {
             ClaudeAccountsApp.main()
             return
         }
+        if args.contains("--detach") { detach(args) }
         signal(SIGHUP, SIG_IGN)
-        let key = args[i + 1].lowercased()
         let accounts = AccountStore.load()
-        let matches = accounts.filter {
-            [$0.id, $0.name, $0.email ?? "", $0.shortName, String(($0.email ?? "").prefix { $0 != "@" })]
-                .map { $0.lowercased() }.contains(key)
+        let dryRun = args.contains("--dry-run")
+        let unattended = auto || args.contains("--unattended")
+
+        let target: AccountRecord
+        if auto {
+            let decision = printDecision(accounts: accounts)
+            switch decision {
+            case .switchTo(let id, _) where accounts.contains { $0.id == id }:
+                target = accounts.first { $0.id == id }!
+            case .nowhere(let why):
+                if dryRun { exit(0) }
+                Notify.post("Claude Accounts didn't switch", why)
+                finish(SwitchOutcome(ok: true, message: "No switch: \(why)"), save: false)
+            case .stay(let why):
+                if dryRun { exit(0) }
+                finish(SwitchOutcome(ok: true, message: "No switch: \(why)"), save: false)
+            case .switchTo:
+                exit(1)
+            }
+        } else {
+            let key = (value(after: "--switch", in: args) ?? "").lowercased()
+            let matches = accounts.filter {
+                [$0.id, $0.name, $0.email ?? "", $0.shortName, String(($0.email ?? "").prefix { $0 != "@" })]
+                    .map { $0.lowercased() }.contains(key)
+            }
+            guard matches.count == 1, let match = matches.first else {
+                finish(SwitchOutcome(ok: false, message: matches.isEmpty ? "No account is named \(key)." : "\(key) names more than one account."),
+                       save: !dryRun)
+            }
+            target = match
         }
-        guard matches.count == 1, let target = matches.first else {
-            finish(SwitchOutcome(ok: false, message: matches.isEmpty ? "No account is named \(key)." : "\(key) names more than one account."))
-        }
+        if dryRun { printPlan(to: target, accounts: accounts, unattended: unattended) }
+        if auto { AutoSwitchLog.record(Date()) }
         final class Box: @unchecked Sendable { var outcome = SwitchOutcome(ok: false, message: "did not run") }
         let box = Box(), done = DispatchSemaphore(value: 0)
         Task.detached {
-            box.outcome = await SwitchEngine.run(to: target, accounts: accounts) { step in
+            box.outcome = await SwitchEngine.run(to: target, accounts: accounts, unattended: unattended) { step in
                 FileHandle.standardError.write(Data("… \(step)\n".utf8))
             }
             done.signal()
         }
         done.wait()
-        finish(box.outcome)
+        if auto { AutoSwitchLog.record(AutoSwitchLog.lastAttempt() ?? Date(), outcome: box.outcome.message) }
+        if unattended { Notify.outcome(box.outcome) }
+        finish(box.outcome, save: true)
+    }
+
+    private static func value(after flag: String, in args: [String]) -> String? {
+        guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
+
+    /// Start this command again without `--detach`, as the leader of a new session with its
+    /// output in a log file, and return at once. Claude ends the processes it started when it
+    /// quits; a process in its own session, whose parent has exited, is not one of them.
+    private static func detach(_ args: [String]) -> Never {
+        let log = value(after: "--log", in: args) ?? Paths.stateDir.appendingPathComponent("last-switch.log").path
+        var rest = Array(args.dropFirst()).filter { $0 != "--detach" }
+        if let i = rest.firstIndex(of: "--log") { rest.removeSubrange(i...min(i + 1, rest.count - 1)) }
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_addopen(&actions, 1, log, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+        posix_spawn_file_actions_adddup2(&actions, 1, 2)
+        var attrs: posix_spawnattr_t?
+        posix_spawnattr_init(&attrs)
+        posix_spawnattr_setflags(&attrs, Int16(POSIX_SPAWN_SETSID))
+        let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let argv = ([exe] + rest).map { strdup($0) } + [nil]
+        var pid: pid_t = 0
+        let status = posix_spawn(&pid, exe, &actions, &attrs, argv, environ)
+        argv.forEach { free($0) }
+        guard status == 0 else {
+            FileHandle.standardError.write(Data("Could not start the switch: \(String(cString: strerror(status)))\n".utf8))
+            exit(1)
+        }
+        print("Started \(rest.joined(separator: " ")) as pid \(pid); output goes to \(log)")
+        exit(0)
+    }
+
+    /// `--auto-switch`: the rule's inputs and answer, read from the usage the menu last saved.
+    private static func printDecision(accounts: [AccountRecord]) -> AutoSwitchRule.Decision {
+        let entries = UsageCache.load()
+        let all = UsageCache.candidates(accounts, entries)
+        let current = accounts.row(for: ClaudeApp.currentIdentity()).flatMap { row in all.first { $0.id == row.id } }
+        func describe(_ c: SwitchCandidate) -> String {
+            guard let read = c.readAt else { return "no reading" }
+            let age = max(Int(Date().timeIntervalSince(read) / 60), 0)
+            return "\(c.used)% (5-hour \(c.fiveHour ?? 0)%, weekly \(c.weekly ?? 0)%), read \(age) min ago"
+                + (c.hasSavedLogin ? "" : ", not set up") + (c.needsSignIn ? ", needs sign-in" : "")
+        }
+        print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
+        print("In use:             \(current.map { "\($0.name): \(describe($0))" } ?? "an account this app doesn't know")")
+        for c in all where c.id != current?.id { print("Other:              \(c.name): \(describe(c))") }
+        let last = AutoSwitchLog.lastAttempt()
+        print("Last auto attempt:  \(last.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "never")")
+        let decision = AutoSwitchRule.decide(current: current, others: all, enabled: true,
+                                             claudeRunning: !ClaudeApp.pids().isEmpty, lastAttempt: last, now: Date())
+        switch decision {
+        case .stay(let why): print("Decision:           stay. \(why)")
+        case .nowhere(let why): print("Decision:           stay and notify. \(why)")
+        case .switchTo(let id, let why): print("Decision:           switch to \(accounts.first { $0.id == id }?.name ?? id). \(why)")
+        }
+        return decision
     }
 
     /// `--status`: what a switch would act on, read-only.
@@ -1922,18 +2366,53 @@ enum Entry {
         let accounts = AccountStore.load()
         func name(_ uuid: String?) -> String { accounts.first { $0.accountUuid == uuid }?.name ?? (uuid ?? "none") }
         print("Claude processes: \(ClaudeApp.pids())")
-        print("Claude reports:   \(id.map { "\(name($0.account)) (org \($0.org.prefix(8)))" } ?? "signed out")")
+        print("Claude reports:   \(id.map { "\(accounts.row(for: $0)?.name ?? "an unknown account") (organization \($0.org.prefix(8)))" } ?? "signed out")")
         print("Claude settings:  \(name(ClaudeApp.savedAccount()))")
         print("Interrupted switch: \(SwitchJournal.load() == nil ? "none" : "yes")")
+        print("Auto-switch:      \(AppSettings.load().autoSwitch ? "on, when the account in use runs out" : "off")")
+        print("Accessibility:    \(QuitPrompt.trusted ? "granted to this process" : "not granted to this process")")
         for acct in accounts {
-            print("Saved login \(acct.name): \(LoginSlot.identity(acct).map { "org \($0.org.prefix(8))" } ?? "none")")
+            print("Saved login \(acct.name): \(LoginSlot.identity(acct).map { "organization \($0.org.prefix(8))" } ?? "none")")
         }
         exit(0)
     }
 
-    private static func finish(_ outcome: SwitchOutcome) -> Never {
+    /// `--dry-run`: every check a switch makes before it quits Claude, and what it would then
+    /// move, without quitting Claude or writing anything.
+    private static func printPlan(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool) -> Never {
+        var problems: [String] = []
+        let current = ClaudeApp.currentIdentity()
+        let currentAcct = accounts.row(for: current)
+        let want = LoginSlot.identity(target)
+        print("Target:             \(target.name)")
+        print("Target saved login: \(want.map { "organization \($0.org.prefix(8))" } ?? "none")")
+        if want == nil { problems.append(SwitchError.noSlot(target.name).localizedDescription) }
+        print("Claude reports:     \(currentAcct?.name ?? (current == nil ? "signed out" : "an account or organization this app doesn't know"))")
+        if current != nil, currentAcct == nil { problems.append("Claude is using an account or organization this app doesn't know.") }
+        if let want, current == want { problems.append("Claude already uses \(target.name).") }
+        if let current, ClaudeApp.savedAccount() != current.account { problems.append(SwitchError.inconsistent.localizedDescription) }
+        if SwitchJournal.load() != nil { problems.append("An interrupted switch would be undone first.") }
+        print("Claude processes:   \(ClaudeApp.pids().count)")
+        let records = current.map { ClaudeApp.openSessionRecords(in: ClaudeApp.folder($0)) } ?? []
+        print("Open sessions:      \(records.count) would move to \(target.name)")
+        let limited = LimitLog.stoppedSessions(in: ClaudeApp.currentRunText())
+        let stopped = records.compactMap(ChatResume.chat).filter { limited.contains($0.id) }.count
+        print("Stopped at a limit: \(stopped) chat\(stopped == 1 ? "" : "s"), sent \u{201C}\(ResumeRule.message)\u{201D} after the switch")
+        if unattended {
+            print("Quit prompt:        " + (QuitPrompt.trusted
+                ? "answered with \(QuitPrompt.quitAnyway) through Accessibility"
+                : "waits for a person: this process has no Accessibility access"))
+            print("After the switch:   each chat the quit or a limit stopped runs again: Claude resumes it, or it is sent \u{201C}\(ResumeRule.message)\u{201D}")
+        } else {
+            print("Quit prompt:        waits for a person while it is open")
+        }
+        print(problems.isEmpty ? "Would switch: yes" : "Would switch: no\n" + problems.map { "  - \($0)" }.joined(separator: "\n"))
+        exit(problems.isEmpty ? 0 : 1)
+    }
+
+    private static func finish(_ outcome: SwitchOutcome, save: Bool) -> Never {
         let data = (try? JSONEncoder().encode(outcome)) ?? Data("{}".utf8)
-        try? data.write(to: Paths.stateDir.appendingPathComponent("last-switch.json"), options: .atomic)
+        if save { try? data.write(to: Paths.stateDir.appendingPathComponent("last-switch.json"), options: .atomic) }
         print(String(decoding: data, as: UTF8.self))
         exit(outcome.ok ? 0 : 1)
     }
