@@ -25,7 +25,7 @@ row that isn't set up yet says how. An account that is out of usage shows
 **Out** in place of Switch until its limit resets.
 
 <p align="center">
-  <img src="docs/menu.png" width="355" alt="The ClaudeAccounts menu: an account with two organizations, the one in use marked, an account out of usage, and Switch on the others, each with its usage">
+  <img src="docs/menu.png" width="355" alt="The ClaudeAccounts menu: an account with two organizations, the one in use marked, the row auto-switch goes to next marked Next, an account out of usage, and Switch on the others, each with its usage">
 </p>
 
 > ClaudeAccounts is an independent project. It is not made, endorsed or
