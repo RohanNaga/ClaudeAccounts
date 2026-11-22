@@ -802,7 +802,7 @@ enum SwitchEngine {
                                  resumed: resumed.map(\.chat.title), notResumed: waiting)
         case .signedOut:
             let undone = await rollback(journal, unattended: unattended, progress: progress)
-            return SwitchOutcome(ok: false, message: "\(target.label)'s saved login has expired, so "
+            return SwitchOutcome(ok: false, message: "The saved login of \(target.label) has expired, so "
                                  + (undone ? "the switch was undone. Use Set Up on its row to sign in again."
                                            : "Claude opened signed out. Quit Claude and click Switch to undo."))
         case .other(let seen):
@@ -1197,7 +1197,7 @@ final class Store: ObservableObject {
     /// The message stays until closed instead of clearing itself.
     @Published var messageStays = false
     /// The row whose set up the message asks for; the message goes once that row is set up.
-    private var messageEndsWithSetUp: String?
+    private(set) var messageEndsWithSetUp: String?
     /// The account the sign-in window re-authenticates; nil means it adds a new one.
     @Published var signInTarget: AccountRecord?
     @Published var openAtLogin = SMAppService.mainApp.status == .enabled
@@ -1232,8 +1232,10 @@ final class Store: ObservableObject {
         loadCache()
         refresh()
         // Tick often so each account is read as soon as it is due; the interval above sets the pace.
+        checkAccessibility()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
+                self?.checkAccessibility()
                 self?.refresh()
                 self?.considerAutoSwitch()
             }
@@ -1368,8 +1370,28 @@ final class Store: ObservableObject {
     func setAutoSwitch(_ on: Bool) {
         settings.autoSwitch = on
         if on, !QuitPrompt.trusted { QuitPrompt.requestAccess() }
-        accessibilityGranted = QuitPrompt.trusted
+        checkAccessibility()
         considerAutoSwitch()
+    }
+
+    /// Read the Accessibility grant again, on every tick and each time the menu opens, so the
+    /// Allow line goes as soon as it is granted. A grant is remembered: an update changes the
+    /// app's signature, and macOS then stops trusting it while its old entry still shows as on.
+    func checkAccessibility() {
+        let trusted = QuitPrompt.trusted
+        if trusted { UserDefaults.standard.set(true, forKey: Self.grantedBeforeKey) }
+        if accessibilityGranted != trusted { accessibilityGranted = trusted }
+    }
+
+    private static let grantedBeforeKey = "accessibilityGrantedBefore"
+
+    /// An earlier build had Accessibility, so its entry in System Settings is the stale one.
+    var accessibilityGrantedBefore: Bool { UserDefaults.standard.bool(forKey: Self.grantedBeforeKey) }
+
+    func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     /// Show a short status line that clears itself.
@@ -2096,10 +2118,18 @@ struct MenuContent: View {
             }
             if store.settings.autoSwitch, !store.accessibilityGranted {
                 HStack {
-                    Text("Auto-switch moves Claude to another account when Claude stops a chat at the usage limit. Allow Accessibility so it can answer Claude's quit prompt and send \u{201C}resume\u{201D} to the chats that were working.")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    Button("Allow…") { store.setAutoSwitch(true) }.controlSize(.small)
+                    if store.accessibilityGrantedBefore {
+                        // macOS keeps the old entry switched on, so allowing it again does nothing until it is replaced.
+                        Text("After an update, macOS needs Accessibility allowed again. Remove Claude Accounts from the Accessibility list with \u{201C}\u{2212}\u{201D}, then add it again.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button("Settings…") { store.openAccessibilitySettings() }.controlSize(.small)
+                    } else {
+                        Text("Auto-switch moves Claude to another account when Claude stops a chat at the usage limit. Allow Accessibility so it can answer Claude's quit prompt and send \u{201C}resume\u{201D} to the chats that were working.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button("Allow…") { store.setAutoSwitch(true) }.controlSize(.small)
+                    }
                 }
                 .padding(.horizontal, 10).padding(.bottom, 4)
             }
@@ -2139,7 +2169,7 @@ struct MenuContent: View {
         .padding(6)
         .frame(width: 330)
         .onAppear {
-            store.accessibilityGranted = QuitPrompt.trusted
+            store.checkAccessibility()
             store.refreshIfStale()
         }
     }
@@ -2148,7 +2178,9 @@ struct MenuContent: View {
         AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct),
                    sameAccountInUse: !store.isInUse(acct) && acct.accountUuid != nil && acct.accountUuid == store.inUse?.account,
                    canSwitch: LoginSlot.exists(acct),
-                   setUpStep: LoginSlot.exists(acct) || store.isInUse(acct) ? nil : SetUpRule.step(for: acct, claudeAccount: store.inUse?.account),
+                   // The status line already says it once Set Up was clicked.
+                   setUpStep: LoginSlot.exists(acct) || store.isInUse(acct) || store.messageEndsWithSetUp == acct.id ? nil
+                       : SetUpRule.step(for: acct, claudeAccount: store.inUse?.account),
                    switchBusy: store.switching != nil,
                    onSwitch: { store.switchTo(acct) }, onSetUp: { store.setUp(acct) },
                    retryAt: store.retryAt[acct.id],

@@ -406,9 +406,9 @@ enum AutoSwitchRule {
             if (a.weekly ?? 0) != (b.weekly ?? 0) { return (a.weekly ?? 0) < (b.weekly ?? 0) }
             return a.name < b.name
         }) else {
-            return .nowhere("Claude stopped a chat at \(current.name)'s usage limit, and no other set-up account has room. Chats wait until a limit resets.")
+            return .nowhere("Claude stopped a chat because \(current.name) is out of usage, and no other set-up account has room. Chats wait until a limit resets.")
         }
-        return .switchTo(id: best.id, reason: "Claude stopped a chat at \(current.name)'s usage limit; \(best.name) is at \(percent(best.used)).")
+        return .switchTo(id: best.id, reason: "Claude stopped a chat because \(current.name) is out of usage; \(best.name) is at \(percent(best.used)).")
     }
 
     /// Until when the row a switch leaves counts as out: the reset of its fuller meter, else of
