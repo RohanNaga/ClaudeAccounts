@@ -31,6 +31,13 @@ if ! grep -q 'RowAction.pick' <<<"$(section '^struct AccountRow')" \
 fi
 echo "Manual switch to any row: ok"
 
+# A confirmed set-up brings the previous row's chats over through the switch's own move and reopen.
+if ! grep -q 'moveSessions(from: previous.id' <<<"$(awk '/private static func setUpLocked/,/struct Prepared/' "$ROOT/app/ClaudeAccounts.swift")" \
+   || ! grep -q 'await reopen(as: want' <<<"$(awk '/private static func setUpLocked/,/struct Prepared/' "$ROOT/app/ClaudeAccounts.swift")"; then
+  echo "FAIL: a confirmed set-up must move the previous row's chats with moveSessions and reopen like a switch"; exit 1
+fi
+echo "Set up brings the chats: ok"
+
 swiftc -module-cache-path "$OUT" -o "$OUT/prompt-fixture" "$ROOT/tests/PromptFixture.swift"
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/prompt-test" \
   "$ROOT/app/QuitPrompt.swift" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/PromptTest.swift"
