@@ -13,7 +13,8 @@ once: the 5-hour and weekly limits, or the weekly limit alone for a plan that
 has no 5-hour limit. One click switches the Claude desktop app to another
 account, and your open Claude Code chats come with you: same history, same
 worktrees. When Claude stops a chat because the account in use is out of usage,
-it switches by itself to the account with the most room left. An account that
+it switches by itself to the next account in the menu, in the order you set.
+An account that
 belongs to two
 organizations, like a personal plan and a team, shows both under the account's
 name, each with its own usage, and either one can be switched to; click the
@@ -79,7 +80,7 @@ xattr -dr com.apple.quarantine "/Applications/Claude Accounts.app"
    that account.
 4. Auto-switch is on from the start: when Claude stops a chat because the
    account in use is out of usage, the app quits Claude, reopens it on the
-   account with the most room, and sends "resume" to each chat that was working. Click **Allow…** in the menu, then
+   next account in the menu that has room, and sends "resume" to each chat that was working. Click **Allow…** in the menu, then
    turn on **Claude Accounts** under System Settings › Privacy & Security ›
    Accessibility, so an automatic switch can answer Claude's quit prompt and
    type that message (see [Auto-switch](#auto-switch)).
@@ -160,11 +161,19 @@ out-of-usage messages and writes that to its log. The app reads Claude's log
 every 15 seconds. The usage meters never start a switch, at any value, so the
 account is used up to the last request Claude accepts.
 
-On that stop, the app quits Claude and reopens it on the set-up account with the
-most room left, as if you had clicked Switch, then sends one "resume" message
-to each chat that was working (see [After the switch](#after-the-switch)). An
-account's other organization counts as an account here: if it has the most
-room, auto-switch picks it.
+On that stop, the app quits Claude and reopens it on the next row in the menu
+that is set up and has room, as if you had clicked Switch, then sends one
+"resume" message to each chat that was working (see
+[After the switch](#after-the-switch)). It goes down the menu from the row in
+use and wraps round to the top. Each organization of an account is its own row,
+in the order the menu lists them. The menu marks the row it would go to with
+**Next**; when that row's account is folded away, the mark is on the account's
+name.
+
+You choose the order. **Move Up** and **Move Down** in a row's `···` menu move
+it: on an organization row they move it among that account's organizations, and
+on an account they move the whole account. The app remembers the order. A new
+install, or an update, keeps the order the menu already shows.
 
 It never switches:
 
@@ -289,7 +298,7 @@ The binary is at `Claude Accounts.app/Contents/MacOS/ClaudeAccounts`.
 |---|---|
 | `--status` | Prints what a switch would act on |
 | `--switch <name>` | Runs a switch to the row named by id, label, email or the email's first part |
-| `--auto-switch` | Runs the Auto-Switch rule once: if Claude's log shows it stopped a chat of the account in use for usage, switches to the set-up account with the most room, judged on the usage the menu last read |
+| `--auto-switch` | Runs the Auto-Switch rule once: if Claude's log shows it stopped a chat of the account in use for usage, switches to the next row in the menu's order that is set up and has room, judged on the usage the menu last read. With `--dry-run` it prints the rows in that order and the one it would choose |
 | `--unattended` | With `--switch`, answers Claude's quit prompt with Quit anyway (implied by `--auto-switch`) |
 | `--dry-run` | Prints every check and what would happen, and changes nothing |
 | `--detach` | Starts the command in its own session and returns; output goes to `--log <file>`, by default `last-switch.log` in the app's state folder |

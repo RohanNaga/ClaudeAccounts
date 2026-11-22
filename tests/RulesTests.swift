@@ -481,9 +481,9 @@ struct RulesTests {
         check(MeterRule.gauge(.fiveHour, fiveHour: fh, weekly: wk) == fh && MeterRule.gauge(.weekly, fiveHour: fh, weekly: wk) == wk,
               "otherwise it follows the chosen limit")
 
-        // Out and most room: an account without a 5-hour window is judged on its weekly meter alone.
+        // Out: an account without a 5-hour window is judged on its weekly meter alone.
         check(picked(decide(row("busy", 40, 70), [row("ultra", nil, 30), row("max", 35, 5)])) == "ultra",
-              "no 5-hour window: its weekly meter is its room")
+              "no 5-hour window: a weekly meter with room makes it a target")
         check(row("ultra", nil, 100).isOut(at: now) && !row("ultra", nil, 99.6).isOut(at: now), "and its weekly meter alone makes it out")
         check(picked(decide(row("busy", 40, 70), [row("ultra", nil, 100), row("max", 35, 5)])) == "max", "never to it when its weekly is full")
 
