@@ -126,7 +126,7 @@ struct RulesTests {
         var w = QuitWatch(unattended: false, canAnswer: false, started: now)
         check(w.step(gone, now: at(1)) == .done(.quit), "Claude gone means it quit")
 
-        // The failure seen on a real Mac: Claude's log was silent and nobody answered for minutes.
+        // Claude's log is silent and nobody answers the prompt for a long time.
         w = QuitWatch(unattended: false, canAnswer: false, started: now)
         var gaveUp = false
         for t in stride(from: 1.0, through: 3600, by: 30) where w.step(prompt, now: at(t)) != .wait("Claude is asking whether to quit while a chat runs…") {

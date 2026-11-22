@@ -195,8 +195,8 @@ struct QuitObservation: Equatable {
 
 /// Follows one quit request to its end. It never gives up while Claude's quit prompt is open or
 /// while Claude may still quit because of this request, so a late answer can never quit Claude
-/// after the switch has walked away. Claude's log can go silent (it did for a day on one Mac),
-/// so the prompt is also watched on screen and a silent log is never read as a Cancel at once.
+/// after the switch has walked away. Claude's log can go silent for hours, so the prompt is
+/// also watched on screen and a silent log is never read as a Cancel at once.
 struct QuitWatch {
     enum Outcome: Equatable { case quit, declined, failed }
     enum Step: Equatable {

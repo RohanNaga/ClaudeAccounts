@@ -52,7 +52,7 @@ final class Fixture: NSObject, NSApplicationDelegate {
             }
         } else {
             // The alert's own window, shown without a modal session so the fixture never takes
-            // keyboard focus from whatever else is running on this Mac.
+            // keyboard focus from whatever else is running.
             for button in alert.buttons {
                 button.target = self
                 button.action = #selector(pressed(_:))

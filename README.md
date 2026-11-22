@@ -44,8 +44,10 @@ unzip it, and move **Claude Accounts** to Applications.
 You also need the Claude desktop app, and Claude Code installed at
 `~/.local/bin/claude` (the app uses it to sign in to each account). The app runs
 on macOS 15 or later, on Apple Silicon and Intel. Switching was tested with
-Claude desktop 2.9939.2 on macOS 27; auto-switch was built against Claude
-desktop 6.6395.1.
+Claude desktop 2.9939.2 on macOS 27. Auto-switch, resuming stopped chats and
+switching between organizations were built against Claude desktop 6.6395.1
+and are tested on fixtures only so far (see
+[Read this before you switch](#read-this-before-you-switch)).
 
 ### First launch
 
@@ -68,10 +70,12 @@ xattr -dr com.apple.quarantine "/Applications/Claude Accounts.app"
    saves the account's Claude login without signing the others out.
 3. From then on, **Switch** on any row moves Claude, and your open chats, to
    that account.
-4. Auto-switch is on from the start. Click **Allow…** in the menu, then turn
-   on **Claude Accounts** under System Settings › Privacy & Security ›
+4. Auto-switch is on from the start: when the account in use runs out, the app
+   quits Claude, reopens it on the account with the most room, and sends
+   "resume" to each chat that had stopped. Click **Allow…** in the menu, then
+   turn on **Claude Accounts** under System Settings › Privacy & Security ›
    Accessibility, so an automatic switch can answer Claude's quit prompt and
-   get your stopped chats running again (see [Auto-switch](#auto-switch)).
+   type that message (see [Auto-switch](#auto-switch)).
 
 ## Read this before you switch
 
@@ -83,6 +87,13 @@ fail closed. It backs everything up first, refuses to act when something looks
 off, and undoes a switch that Claude doesn't confirm. Still, use it at your own
 risk, and keep the backups in the app's `backups` folder until you trust it on
 your setup.
+
+Auto-switch, answering Claude's quit prompt, resuming stopped chats and
+switching between an account's organizations are new. So far they are tested
+on fixtures: rule checks, plus stand-in windows built like Claude's quit prompt
+and chat window. They have not yet run through a real switch. A chat the app
+can't resume is named in a notification, and **Auto-Switch When Out** in the
+header's `···` menu turns the automatic part off.
 
 ## What it touches
 
@@ -137,8 +148,10 @@ it and `switch.json` listing what moved; the last ten are kept.
 
 Auto-switch is on unless you turn off **Auto-Switch When Out** in the header's
 `···` menu. About once a minute it checks the account in use. When either its
-5-hour or its weekly meter reaches 100 percent, it switches Claude to the
-set-up account with the most room left, as if you had clicked Switch. An
+5-hour or its weekly meter reaches 100 percent, it quits Claude and reopens it
+on the set-up account with the most room left, as if you had clicked Switch,
+then sends one "resume" message to each chat that had stopped (see
+[After the switch](#after-the-switch)). An
 account's other organization counts as an account here: if it has the most
 room, auto-switch picks it.
 
@@ -156,12 +169,12 @@ When every other account is out too, it stays put and posts one notification
 saying so.
 
 Nobody is there to answer Claude's quit prompt, so an automatic switch presses
-**Quit anyway** itself, through Accessibility. Once an account is out its chats
-have stopped, so the prompt rarely appears; when it does, for a chat still
-mid-reply or a background command, Quit anyway is what a person switching by
-hand presses. The app needs Accessibility access for this and for resuming
-chats, and the menu asks for it while it is missing. Without it an automatic switch waits at the prompt
-for a person, and nothing changes until someone answers. macOS ties the
+**Quit anyway** itself, through Accessibility. Claude shows that prompt only
+while a chat is still mid-reply or running a command, and Quit anyway is what a
+person switching by hand presses then. The app needs Accessibility access for
+this and for resuming chats, and the menu asks for it while it is missing.
+Without it an automatic switch waits at the prompt for a person, and nothing
+changes until someone answers. macOS ties the
 permission to the app's signature, so after installing a new version you may
 need to allow it again.
 
@@ -291,8 +304,9 @@ open "Claude Accounts.app"
 It needs the Xcode Command Line Tools (`xcode-select --install`). `build.sh`
 compiles one binary for Apple Silicon and Intel with `swiftc`. `test.sh` runs
 the tests for the switching rules in `app/Rules.swift`, then drives the quit
-prompt code against a real native alert, which flashes a small window for a
-moment; that part needs Accessibility access for your terminal. `release.sh`
+prompt code against a real native alert and the resume step against a
+stand-in chat window, which flash small windows for a moment; those parts need
+Accessibility access for your terminal. `release.sh`
 builds and zips it into `dist/` for a GitHub release and prints the checksum the
 Homebrew cask needs. The icon is drawn by `app/make-icon.swift`; delete
 `app/AppIcon.icns` to regenerate it. Before 0.3 the app kept its state in a
