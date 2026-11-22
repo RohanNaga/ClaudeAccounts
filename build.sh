@@ -20,7 +20,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 export CLANG_MODULE_CACHE_PATH="$ROOT/.build-cache"
 for arch in arm64 x86_64; do
   swiftc -O -parse-as-library -target "$arch-apple-macos15" \
-    -module-cache-path "$ROOT/.build-cache" -o "$ROOT/.build-cache/ClaudeAccounts-$arch" "$ROOT/app/ClaudeAccounts.swift"
+    -module-cache-path "$ROOT/.build-cache" -o "$ROOT/.build-cache/ClaudeAccounts-$arch" \
+    "$ROOT/app/ClaudeAccounts.swift" "$ROOT/app/Rules.swift" "$ROOT/app/QuitPrompt.swift"
 done
 lipo -create -output "$BIN" "$ROOT/.build-cache/ClaudeAccounts-arm64" "$ROOT/.build-cache/ClaudeAccounts-x86_64"
 
