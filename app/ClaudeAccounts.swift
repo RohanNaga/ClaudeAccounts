@@ -666,6 +666,14 @@ struct SwitchOutcome: Codable {
     var notResumed: [String] = []
     /// The row the message tells the person how to set up in Claude.
     var setsUp: String? = nil
+
+    /// The message, naming the stopped chats still not running and what they need: a new message,
+    /// since Retry on the failed one starts the chat over.
+    var messageWithChatsLeft: String {
+        guard !notResumed.isEmpty else { return message }
+        let more = notResumed.count > 3 ? " and \(notResumed.count - 3) more" : ""
+        return message + " Send a new message (not Retry) to: " + notResumed.prefix(3).joined(separator: ", ") + more + "."
+    }
 }
 
 /// One switch at a time across the menu and `--switch`, which are separate processes.
@@ -787,14 +795,17 @@ enum SwitchEngine {
             pruneBackups()
             let working = ResumeRule.toResume(chats, stoppedByLimit: ended.stoppedByLimit, cutByQuit: ended.cutByQuit)
             let reports = await ChatResume.run(working, in: ClaudeApp.folder(want), reopenedAt: reopenedAt, progress: progress)
-            let resumed = reports.filter { $0.result == .running || $0.result == .sent }
+            let resumed = reports.filter(\.result.runningAgain)
             let waiting = reports.compactMap { r -> String? in
-                if case .notResumed(let why) = r.result { return "\(r.chat.title) (\(why))" }
-                return nil
+                switch r.result {
+                case .notResumed(let why): return "\(r.chat.title) (\(why))"
+                case .draft: return "\(r.chat.title) (it has an unsent draft)"
+                case .running, .sent: return nil
+                }
             }
             var message = "Switched to \(target.label), with \(chats.count) open session\(chats.count == 1 ? "" : "s")."
             if !reports.isEmpty {
-                message += " \(resumed.count) of \(reports.count) stopped chat\(reports.count == 1 ? "" : "s") running again."
+                message += " " + ResumeRule.summary(running: resumed.count, of: reports.count)
             } else if answered {
                 message += " No stopped chat was found; check the ones that were working."
             }
@@ -999,9 +1010,12 @@ enum SwitchEngine {
 /// Gets the chats that were working, which a usage limit or the quit stopped, running again after
 /// a switch, through ChatResumer: Claude resumes the ones it marked as cut off by the quit by
 /// itself, and each chat still idle gets a new message, "resume", typed into its own message
-/// box. Never Retry: retrying the failed
-/// message rewinds the chat and starts its transcript over without its subagents.
+/// box; a chat that isn't running yet is tried again every minute for half an hour. Never Retry:
+/// retrying the failed message rewinds the chat and starts its transcript over without its
+/// subagents. Each step goes to resume.log in the app's state folder.
 enum ChatResume {
+    static let logURL = Paths.stateDir.appendingPathComponent("resume.log")
+
     /// A moved session record as the resume step needs it.
     static func chat(_ record: URL) -> MovedChat? {
         guard let obj = ClaudeApp.record(record), let id = obj["sessionId"] as? String else { return nil }
@@ -1010,9 +1024,14 @@ enum ChatResume {
                          lastActivity: (obj["lastActivityAt"] as? Double) ?? 0)
     }
 
-    static func run(_ wanted: [MovedChat], in folder: URL, reopenedAt: Double,
-                    progress: @escaping SwitchEngine.Progress) async -> [ChatResumer.Report] {
-        let resumer = ChatResumer(
+    /// The resume step for chats whose records are in `folder`, Claude having reopened at
+    /// `reopenedAt` (ms). `retrying` keeps trying on ResumeRule's schedule; `echo` also hears each step.
+    static func resumer(in folder: URL, reopenedAt: Double, retrying: Bool = true,
+                        progress: @escaping SwitchEngine.Progress, echo: @escaping (String) -> Void = { _ in }) -> ChatResumer {
+        try? Data().write(to: logURL, options: .atomic)
+        let log = try? FileHandle(forWritingTo: logURL)
+        let stamp = ISO8601DateFormatter()
+        return ChatResumer(
             open: { id in _ = await runProcess("/usr/bin/open", ["claude://code/continue?session=\(id)"]) },
             pids: ClaudeApp.pids,
             running: { chat in
@@ -1023,8 +1042,17 @@ enum ChatResume {
                     ? ResumeRule.resumed(markStillSet: obj?["interruptedByQuitAt"] is NSNumber, lastActivity: lastActivity, reopenedAt: reopenedAt)
                     : lastActivity > reopenedAt
             },
-            progress: progress)
-        return await resumer.run(wanted)
+            progress: progress,
+            trace: { step in
+                log?.write(Data("\(stamp.string(from: Date())) \(step)\n".utf8))
+                echo(step)
+            },
+            retrying: retrying)
+    }
+
+    static func run(_ wanted: [MovedChat], in folder: URL, reopenedAt: Double,
+                    progress: @escaping SwitchEngine.Progress) async -> [ChatResumer.Report] {
+        await resumer(in: folder, reopenedAt: reopenedAt, progress: progress).run(wanted)
     }
 }
 
@@ -1081,12 +1109,7 @@ enum Notify {
     /// stopped chats it couldn't get running. The message they need has to be a new one: Retry on
     /// the failed message starts the chat over.
     static func outcome(_ outcome: SwitchOutcome, reason: String? = nil) {
-        var body = [reason, outcome.message].compactMap { $0 }.joined(separator: " ")
-        let waiting = outcome.notResumed
-        if !waiting.isEmpty {
-            let more = waiting.count > 3 ? " and \(waiting.count - 3) more" : ""
-            body += " Send a new message (not Retry) to: " + waiting.prefix(3).joined(separator: ", ") + more + "."
-        }
+        let body = [reason, outcome.messageWithChatsLeft].compactMap { $0 }.joined(separator: " ")
         post(outcome.ok ? "Claude Accounts switched" : "Claude Accounts didn't switch", body)
     }
 }
@@ -1428,8 +1451,8 @@ final class Store: ObservableObject {
 
     /// What a switch or a set up reports: a success clears itself, a failure or an instruction stays.
     func show(_ outcome: SwitchOutcome) {
-        if outcome.ok, outcome.setsUp == nil { flash(outcome.message, for: 10) }
-        else { keep(outcome.message, untilSetUp: outcome.setsUp) }
+        if outcome.ok, outcome.setsUp == nil, outcome.notResumed.isEmpty { flash(outcome.message, for: 10) }
+        else { keep(outcome.messageWithChatsLeft, untilSetUp: outcome.setsUp) }
     }
 
     /// Register or unregister as a macOS login item; it appears in System Settings > Login Items.
@@ -2417,6 +2440,10 @@ private func drawWarning(centeredAt mid: NSPoint) {
 ///   when started from a shell inside Claude, and writes its output to `--log <file>`
 ///   (default: last-switch.log in the app's state folder).
 ///
+/// - `--test-resume <session id or title>` sends "resume" to that one chat of the account Claude
+///   has open, by the same steps a switch takes after it reopens Claude, in one pass, and prints
+///   each step. It takes the switch lock, so it never runs during a switch.
+///
 /// A real run prints the outcome as JSON and saves it to last-switch.json in the state folder.
 @main
 enum Entry {
@@ -2424,6 +2451,7 @@ enum Entry {
         Migration.moveLegacyState()
         let args = CommandLine.arguments
         if args.contains("--status") { printStatus() }
+        if let key = value(after: "--test-resume", in: args) { TestResume.run(key) }
         let auto = args.contains("--auto-switch")
         guard auto || args.contains("--switch") else {
             ClaudeAccountsApp.main()
@@ -2596,7 +2624,7 @@ enum Entry {
             print("Quit prompt:        " + (QuitPrompt.trusted
                 ? "answered with \(QuitPrompt.quitAnyway) through Accessibility"
                 : "waits for a person: this process has no Accessibility access"))
-            print("After the switch:   each chat that was working, stopped by the limit or cut off by the quit, runs again: Claude resumes it, or it is sent \u{201C}\(ResumeRule.message)\u{201D}")
+            print("After the switch:   each chat that was working, stopped by the limit or cut off by the quit, runs again: Claude resumes it, or it is sent \u{201C}\(ResumeRule.message)\u{201D}, tried again every minute for 30 minutes while nobody uses the Mac")
         } else {
             print("Quit prompt:        waits for a person while it is open")
         }
@@ -2630,5 +2658,48 @@ struct ClaudeAccountsApp: App {
             SignInView(store: store)
         }
         .windowResizability(.contentSize)
+    }
+}
+
+/// `--test-resume`: the resume step a switch runs, once, at one chat the person names, printing
+/// each step, so the path that runs with nobody at the Mac can be watched on a chat of their choice.
+enum TestResume {
+    static func run(_ key: String) -> Never {
+        func say(_ line: String) { print(line); fflush(stdout) }
+        guard !ClaudeApp.pids().isEmpty else { say("Claude isn't open."); exit(1) }
+        guard let identity = ClaudeApp.currentIdentity() else { say("Claude's log doesn't name the account it has open."); exit(1) }
+        let folder = ClaudeApp.folder(identity)
+        let matches = ClaudeApp.openSessionRecords(in: folder).compactMap(ChatResume.chat)
+            .filter { $0.id == key || $0.title.lowercased() == key.lowercased() }
+        guard matches.count == 1, let chat = matches.first else {
+            say(matches.isEmpty ? "No open chat of the account Claude has open has that title or session id."
+                                : "\(matches.count) open chats have that title; name one by its session id:")
+            for match in matches { say("  \(match.id)") }
+            exit(1)
+        }
+        guard SwitchLock.acquire() != nil else { say("A switch is running; try again once it's done."); exit(1) }
+        guard AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary) else {
+            say("This process has no Accessibility access. Run it through the app, which has its own:")
+            say("  open -n -W -o \"$(tty)\" --stderr \"$(tty)\" -a \"\(Bundle.main.bundlePath)\" --args --test-resume \"\(key)\"")
+            exit(1)
+        }
+        say("Chat: \(chat.title) (\(chat.id))")
+        let resumer = ChatResume.resumer(in: folder, reopenedAt: Date().timeIntervalSince1970 * 1000, retrying: false,
+                                         progress: { _ in }, echo: { say("  " + $0) })
+        final class Box: @unchecked Sendable { var reports: [ChatResumer.Report] = [] }
+        let box = Box(), done = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.reports = await resumer.run([chat])
+            done.signal()
+        }
+        done.wait()
+        let result = box.reports.first?.result ?? .notResumed("not tried")
+        switch result {
+        case .sent: say("Result: sent \u{201C}\(ResumeRule.message)\u{201D}, and the chat is running.")
+        case .running: say("Result: the chat was already running, so nothing was sent.")
+        case .draft: say("Result: its message box holds unsent text, so nothing was sent.")
+        case .notResumed(let why): say("Result: not running: \(why).")
+        }
+        exit(result.runningAgain ? 0 : 1)
     }
 }

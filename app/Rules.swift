@@ -612,9 +612,12 @@ struct MovedChat: Equatable {
 /// What the resume step sees of one chat in Claude's window, through Accessibility. Nil when no
 /// window shows that chat.
 struct ChatScreen: Equatable {
+    /// The chat's page hasn't finished loading.
+    var loading = false
     /// Its composer shows Stop: a turn is running.
     var busy: Bool
-    /// Its message box and its send control were both found.
+    /// Its message box was found. Claude shows Send only once the box holds text, so the box,
+    /// not a send control, is what has to be there before the message is typed.
     var composer: Bool
     /// Its message box holds text someone typed and hasn't sent.
     var draft: Bool
@@ -625,20 +628,38 @@ enum ResumeRule {
     static let message = "resume"
     /// How long Claude gets to resume the chats a quit cut off on its own before the app opens them.
     static let ownPassWait: TimeInterval = 45
-    /// How long an opened chat may take to show in Claude's window with its message box.
-    static let showWait: TimeInterval = 20
+    /// How long an opened chat may take to show in Claude's window, finish loading and show its
+    /// message box. Claude reopening with many sessions and long transcripts can take minutes.
+    static let readyWait: TimeInterval = 120
     /// Claude resumes a chat a quit cut off when it is opened; this long after it shows, the app
     /// sends the message itself.
     static let resumeOnOpenWait: TimeInterval = 10
     /// How long a sent message may take to show a turn running.
     static let startWait: TimeInterval = 30
+    /// A chat that isn't running after a pass is tried again this often, while nobody is using
+    /// the Mac,
+    static let retryEvery: TimeInterval = 60
+    /// for this long after the switch; then the notification names it.
+    static let retryFor: TimeInterval = 30 * 60
 
     enum Result: Equatable {
-        /// Running without a message from the app: Claude resumed it, or it was already running.
+        /// Running without a message from the app: Claude resumed it, someone sent it a message,
+        /// or it was already running.
         case running
         /// The app sent the message and Claude showed the turn start.
         case sent
+        /// Someone has typed in its message box and not sent it: left to them.
+        case draft
+        /// Not running yet, for this reason; tried again until `retryFor` has passed.
         case notResumed(String)
+
+        /// Running, or left to the person at the Mac: nothing more to try.
+        var settled: Bool {
+            if case .notResumed = self { return false }
+            return true
+        }
+
+        var runningAgain: Bool { self == .running || self == .sent }
     }
 
     enum Step: Equatable {
@@ -650,7 +671,8 @@ enum ResumeRule {
     /// The chats to get running again: every moved chat that was working when the switch began,
     /// which is each one Claude stopped for usage (`stoppedByLimit`) and each one whose turn the
     /// quit cut off (Claude's mark, or `cutByQuit` from its log). Each once, most recently active
-    /// first. A chat that was idle is left alone.
+    /// first. A chat that was idle is left alone. A chat's subagents run inside it and stop with
+    /// it, so the chat is the unit: its next turn starts them again.
     static func toResume(_ chats: [MovedChat], stoppedByLimit: Set<String>, cutByQuit: Set<String>) -> [MovedChat] {
         var seen = Set<String>()
         return chats.filter { chat in
@@ -665,19 +687,72 @@ enum ResumeRule {
     }
 
     /// What to do with one opened chat. `waited` counts from the open, `shownFor` from the moment
-    /// its window first showed it. Only an idle chat with an empty message box gets the message,
-    /// so a running chat, a chat whose message box has someone's unsent text, and a chat Claude
-    /// didn't show are never sent to.
+    /// its message box was first ready. Only an idle chat with an empty message box gets the
+    /// message, so a running chat, a chat whose message box has someone's unsent text, and a chat
+    /// Claude didn't show are never sent to.
     static func step(_ screen: ChatScreen?, interrupted: Bool, waited: TimeInterval, shownFor: TimeInterval?) -> Step {
         guard let screen else {
-            return waited >= showWait ? .done(.notResumed("Claude didn't show it")) : .wait
+            return waited >= readyWait ? .done(.notResumed("Claude didn't show it")) : .wait
         }
         if screen.busy { return .done(.running) }
-        guard screen.composer else {
-            return waited >= showWait ? .done(.notResumed("its message box wasn't found")) : .wait
+        guard screen.composer, !screen.loading else {
+            let why = screen.loading ? "it was still loading" : "its message box wasn't found"
+            return waited >= readyWait ? .done(.notResumed(why)) : .wait
         }
-        if screen.draft { return .done(.notResumed("it has an unsent draft")) }
+        if screen.draft { return .done(.draft) }
         if interrupted, (shownFor ?? 0) < resumeOnOpenWait { return .wait }
         return .send
+    }
+
+    /// Whether to make another pass at the chats still not running, `elapsed` after the first:
+    /// while some are left and the pass would start within `retryFor`.
+    static func tryAgain(left: Int, elapsed: TimeInterval) -> Bool {
+        left > 0 && elapsed + retryEvery <= retryFor
+    }
+
+    /// Whether a pass after the first may open chats in Claude's window: only while nobody is
+    /// using the Mac, so a person working in another chat isn't pulled away from it every minute.
+    static func mayRetry(secondsSinceInput: TimeInterval) -> Bool {
+        secondsSinceInput >= retryEvery
+    }
+
+    /// How many stopped chats run again, as the switch's message and notification say it.
+    static func summary(running: Int, of total: Int) -> String {
+        "Running again: \(running) of \(total) stopped chat\(total == 1 ? "" : "s")."
+    }
+}
+
+/// Telling a chat's message box apart from the other editable text boxes on its page, such as a
+/// side panel's address field. The box is found by what it is, not by one layout.
+enum ComposerRule {
+    /// One editable text box, as Accessibility describes it.
+    struct Box: Equatable {
+        /// Its name, description or placeholder is "Prompt", as Claude names its message box.
+        var named: Bool
+        /// A text area rather than a one-line field: a message box takes several lines.
+        var multiline: Bool
+        /// It has keyboard focus.
+        var focused: Bool
+    }
+
+    enum FoundBy: String, Equatable {
+        case name = "the text box named Prompt"
+        case multiline = "the only multi-line text box"
+        case focus = "the multi-line text box with keyboard focus"
+    }
+
+    /// The message box among `boxes`: the one named Prompt; else the only multi-line one; else
+    /// the multi-line one with keyboard focus. When some are named Prompt, only those are
+    /// weighed. A one-line field without that name, such as a side panel's address bar, is never
+    /// the message box. Nil when there is none or no single one stands out, so the app never
+    /// types into a box it isn't sure of.
+    static func pick(_ boxes: [Box]) -> (index: Int, by: FoundBy)? {
+        let named = boxes.indices.filter { boxes[$0].named }
+        if named.count == 1 { return (named[0], .name) }
+        let pool = (named.isEmpty ? Array(boxes.indices) : named).filter { boxes[$0].multiline }
+        if pool.count == 1 { return (pool[0], named.isEmpty ? .multiline : .name) }
+        let focused = pool.filter { boxes[$0].focused }
+        if focused.count == 1 { return (focused[0], .focus) }
+        return nil
     }
 }
