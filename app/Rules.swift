@@ -1,7 +1,7 @@
 // The decisions behind switching, kept free of AppKit, files and the network so the tests in
 // tests/RulesTests.swift drive them directly: which account a Claude identity belongs to, when
 // auto-switch moves and to which account, how a quit request is followed to its end, and which
-// interrupted chats get reopened after a switch.
+// stopped chats get a new message after a switch.
 
 import Foundation
 
@@ -267,9 +267,10 @@ struct QuitWatch {
 
 // MARK: - After the switch
 
-/// A moved chat as the resume step sees it: Claude marks a chat whose reply was cut off by a
-/// quit (`interruptedByQuitAt`) and resumes it itself, a few at once at launch and the rest
-/// when each is opened.
+/// A moved chat as the resume step sees it. Claude marks a chat whose reply a quit cut off
+/// (`interruptedByQuitAt`) and resumes it itself, a few at once at launch and the rest when each
+/// is opened. A chat a usage limit stopped has no mark: its turn already ended, so it waits for a
+/// new message.
 struct MovedChat: Equatable {
     let id: String
     let title: String
@@ -277,19 +278,71 @@ struct MovedChat: Equatable {
     let lastActivity: Double
 }
 
-enum ResumeRule {
-    /// How long Claude gets to resume chats on its own before the app opens the rest.
-    static let ownPassWait: TimeInterval = 45
-    /// How long each opened chat gets to show it resumed before the next one is opened.
-    static let perChatWait: TimeInterval = 45
+/// What the resume step sees of one chat in Claude's window, through Accessibility. Nil when no
+/// window shows that chat.
+struct ChatScreen: Equatable {
+    /// Its composer shows Stop: a turn is running.
+    var busy: Bool
+    /// Its message box and its send control were both found.
+    var composer: Bool
+    /// Its message box holds text someone typed and hasn't sent.
+    var draft: Bool
+}
 
-    /// The interrupted chats, most recently active first, which is the order Claude uses too.
-    static func toResume(_ chats: [MovedChat]) -> [MovedChat] {
-        chats.filter(\.interrupted).sorted { $0.lastActivity > $1.lastActivity }
+enum ResumeRule {
+    /// The new message each stopped chat gets.
+    static let message = "resume"
+    /// How long Claude gets to resume the chats a quit cut off on its own before the app opens them.
+    static let ownPassWait: TimeInterval = 45
+    /// How long an opened chat may take to show in Claude's window with its message box.
+    static let showWait: TimeInterval = 20
+    /// Claude resumes a chat a quit cut off when it is opened; this long after it shows, the app
+    /// sends the message itself.
+    static let resumeOnOpenWait: TimeInterval = 10
+    /// How long a sent message may take to show a turn running.
+    static let startWait: TimeInterval = 30
+
+    enum Result: Equatable {
+        /// Running without a message from the app: Claude resumed it, or it was already running.
+        case running
+        /// The app sent the message and Claude showed the turn start.
+        case sent
+        case notResumed(String)
     }
 
-    /// A chat has resumed once Claude cleared its mark or it ran after Claude reopened.
+    enum Step: Equatable {
+        case wait
+        case send
+        case done(Result)
+    }
+
+    /// The chats to get running again: every moved chat a quit cut off or a usage limit stopped,
+    /// each once, most recently active first. A chat neither stopped is left alone.
+    static func toResume(_ chats: [MovedChat], limited: Set<String>) -> [MovedChat] {
+        var seen = Set<String>()
+        return chats.filter { ($0.interrupted || limited.contains($0.id)) && seen.insert($0.id).inserted }
+            .sorted { $0.lastActivity > $1.lastActivity }
+    }
+
+    /// A chat a quit cut off has resumed once Claude cleared its mark or it ran after Claude reopened.
     static func resumed(markStillSet: Bool, lastActivity: Double, reopenedAt: Double) -> Bool {
         !markStillSet || lastActivity > reopenedAt
+    }
+
+    /// What to do with one opened chat. `waited` counts from the open, `shownFor` from the moment
+    /// its window first showed it. Only an idle chat with an empty message box gets the message,
+    /// so a running chat, a chat whose message box has someone's unsent text, and a chat Claude
+    /// didn't show are never sent to.
+    static func step(_ screen: ChatScreen?, interrupted: Bool, waited: TimeInterval, shownFor: TimeInterval?) -> Step {
+        guard let screen else {
+            return waited >= showWait ? .done(.notResumed("Claude didn't show it")) : .wait
+        }
+        if screen.busy { return .done(.running) }
+        guard screen.composer else {
+            return waited >= showWait ? .done(.notResumed("its message box wasn't found")) : .wait
+        }
+        if screen.draft { return .done(.notResumed("it has an unsent draft")) }
+        if interrupted, (shownFor ?? 0) < resumeOnOpenWait { return .wait }
+        return .send
     }
 }

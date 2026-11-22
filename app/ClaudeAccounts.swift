@@ -763,13 +763,10 @@ struct SwitchOutcome: Codable {
     var moved = 0
     var confirmed = false
     var backup: String? = nil
-    /// Titles of the chats a quit cut off that carried on by themselves after the switch.
+    /// Titles of the chats a quit or a usage limit had stopped that are running again.
     var resumed: [String] = []
-    /// Titles of the cut-off chats that are still waiting for a message.
+    /// Each stopped chat that is still waiting, as "title (why)".
     var notResumed: [String] = []
-    /// Titles of the chats a usage limit had stopped before the switch. Nothing supported can
-    /// restart such a turn from outside Claude, so each waits for a new message (not Retry).
-    var stoppedByLimit: [String] = []
 }
 
 /// One switch at a time across the menu and `--switch`, which are separate processes.
@@ -888,20 +885,21 @@ enum SwitchEngine {
             try? FileManager.default.moveItem(at: SwitchJournal.url,
                                               to: URL(fileURLWithPath: journal.backup).appendingPathComponent("switch.json"))
             pruneBackups()
-            let resume = await ChatResume.run(chats, in: ClaudeApp.folder(want), reopenedAt: reopenedAt, progress: progress)
-            let stopped = chats.filter { limited.contains($0.id) && !$0.interrupted }
-            var message = "Switched to \(target.name), with \(chats.count) open session\(chats.count == 1 ? "" : "s")."
-            if !resume.resumed.isEmpty || !resume.waiting.isEmpty {
-                message += " \(resume.resumed.count) of \(resume.resumed.count + resume.waiting.count) cut-off chats carried on."
-            } else if answered {
-                message += " Claude didn't mark any chat to resume; send a message to the ones that were working."
+            let reports = await ChatResume.run(ResumeRule.toResume(chats, limited: limited), in: ClaudeApp.folder(want),
+                                               reopenedAt: reopenedAt, progress: progress)
+            let resumed = reports.filter { $0.result == .running || $0.result == .sent }
+            let waiting = reports.compactMap { r -> String? in
+                if case .notResumed(let why) = r.result { return "\(r.chat.title) (\(why))" }
+                return nil
             }
-            if !stopped.isEmpty {
-                message += " \(stopped.count) stopped at the limit and wait for a new message."
+            var message = "Switched to \(target.name), with \(chats.count) open session\(chats.count == 1 ? "" : "s")."
+            if !reports.isEmpty {
+                message += " \(resumed.count) of \(reports.count) stopped chat\(reports.count == 1 ? "" : "s") running again."
+            } else if answered {
+                message += " No chat was marked as stopped; check the ones that were working."
             }
             return SwitchOutcome(ok: true, message: message, moved: chats.count, confirmed: true, backup: journal.backup,
-                                 resumed: resume.resumed.map(\.title), notResumed: resume.waiting.map(\.title),
-                                 stoppedByLimit: stopped.map(\.title))
+                                 resumed: resumed.map(\.chat.title), notResumed: waiting)
         case .signedOut:
             let undone = await rollback(journal, unattended: unattended, progress: progress)
             return SwitchOutcome(ok: false, message: "\(target.name)'s saved login has expired, so "
@@ -1092,10 +1090,10 @@ enum SwitchEngine {
 
 // MARK: - After a switch
 
-/// Gets the chats a quit cut off going again. Nothing outside Claude can type into a chat, but
-/// Claude itself marks each chat whose reply a quit cut off and resumes it: a few at once when it
-/// next opens, and each of the rest when that chat is opened. So the app waits for Claude's own
-/// pass, then opens each chat still waiting through Claude's claude://code/continue link.
+/// Gets the chats a quit or a usage limit stopped running again after a switch, through
+/// ChatResumer: Claude resumes the ones a quit cut off by itself, and each chat still idle gets a
+/// new message, "resume", typed into its own message box. Never Retry: retrying the failed
+/// message rewinds the chat and starts its transcript over without its subagents.
 enum ChatResume {
     /// A moved session record as the resume step needs it.
     static func chat(_ record: URL) -> MovedChat? {
@@ -1105,28 +1103,21 @@ enum ChatResume {
                          lastActivity: (obj["lastActivityAt"] as? Double) ?? 0)
     }
 
-    static func run(_ chats: [MovedChat], in folder: URL, reopenedAt: Double,
-                    progress: @escaping SwitchEngine.Progress) async -> (resumed: [MovedChat], waiting: [MovedChat]) {
-        let wanted = ResumeRule.toResume(chats)
-        guard !wanted.isEmpty else { return ([], []) }
-        func going(_ chat: MovedChat) -> Bool {
-            let obj = ClaudeApp.record(folder.appendingPathComponent(chat.id + ".json"))
-            return ResumeRule.resumed(markStillSet: obj?["interruptedByQuitAt"] is NSNumber,
-                                      lastActivity: (obj?["lastActivityAt"] as? Double) ?? 0, reopenedAt: reopenedAt)
-        }
-        func wait(_ seconds: TimeInterval, until done: () -> Bool) async {
-            let deadline = Date().addingTimeInterval(seconds)
-            while Date() < deadline, !done() { try? await Task.sleep(nanoseconds: 3_000_000_000) }
-        }
-        progress("Waiting for Claude to resume \(wanted.count) cut-off chat\(wanted.count == 1 ? "" : "s")…")
-        await wait(ResumeRule.ownPassWait) { wanted.allSatisfy(going) }
-        for chat in wanted where !going(chat) {
-            progress("Opening \(chat.title) so Claude resumes it…")
-            _ = await runProcess("/usr/bin/open", ["claude://code/continue?session=\(chat.id)"])
-            await wait(ResumeRule.perChatWait) { going(chat) }
-        }
-        let resumed = wanted.filter(going)
-        return (resumed, wanted.filter { !going($0) })
+    static func run(_ wanted: [MovedChat], in folder: URL, reopenedAt: Double,
+                    progress: @escaping SwitchEngine.Progress) async -> [ChatResumer.Report] {
+        let resumer = ChatResumer(
+            open: { id in _ = await runProcess("/usr/bin/open", ["claude://code/continue?session=\(id)"]) },
+            pids: ClaudeApp.pids,
+            running: { chat in
+                let obj = ClaudeApp.record(folder.appendingPathComponent(chat.id + ".json"))
+                let lastActivity = (obj?["lastActivityAt"] as? Double) ?? 0
+                // A chat a limit stopped has no mark to clear; only new activity shows it ran.
+                return chat.interrupted
+                    ? ResumeRule.resumed(markStillSet: obj?["interruptedByQuitAt"] is NSNumber, lastActivity: lastActivity, reopenedAt: reopenedAt)
+                    : lastActivity > reopenedAt
+            },
+            progress: progress)
+        return await resumer.run(wanted)
     }
 }
 
@@ -1138,11 +1129,11 @@ enum Notify {
                                env: nil, cwd: nil, timeout: 10)
     }
 
-    /// The outcome of an unattended switch, naming the chats that still need a message. The
-    /// message has to be a new one: Retry on the failed message starts the chat over.
+    /// The outcome of an unattended switch, naming the stopped chats it couldn't get running. The
+    /// message they need has to be a new one: Retry on the failed message starts the chat over.
     static func outcome(_ outcome: SwitchOutcome) {
         var body = outcome.message
-        let waiting = outcome.stoppedByLimit + outcome.notResumed
+        let waiting = outcome.notResumed
         if !waiting.isEmpty {
             let more = waiting.count > 3 ? " and \(waiting.count - 3) more" : ""
             body += " Send a new message (not Retry) to: " + waiting.prefix(3).joined(separator: ", ") + more + "."
@@ -1967,7 +1958,7 @@ struct MenuContent: View {
             }
             if store.settings.autoSwitch, !store.accessibilityGranted {
                 HStack {
-                    Text("Allow Accessibility so auto-switch can answer Claude's quit prompt.")
+                    Text("Allow Accessibility so auto-switch can answer Claude's quit prompt and resume stopped chats.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Spacer()
                     Button("Allow…") { store.setAutoSwitch(true) }.controlSize(.small)
@@ -2406,12 +2397,12 @@ enum Entry {
         print("Open sessions:      \(records.count) would move to \(target.name)")
         let limited = LimitLog.stoppedSessions(in: ClaudeApp.currentRunText())
         let stopped = records.compactMap(ChatResume.chat).filter { limited.contains($0.id) }.count
-        print("Stopped at a limit: \(stopped) chat\(stopped == 1 ? "" : "s"), which would wait for a new message after the switch")
+        print("Stopped at a limit: \(stopped) chat\(stopped == 1 ? "" : "s"), sent \u{201C}\(ResumeRule.message)\u{201D} after the switch")
         if unattended {
             print("Quit prompt:        " + (QuitPrompt.trusted
                 ? "answered with \(QuitPrompt.quitAnyway) through Accessibility"
                 : "waits for a person: this process has no Accessibility access"))
-            print("After the switch:   chats the quit cuts off are resumed by Claude, or opened one by one so Claude resumes them")
+            print("After the switch:   each chat the quit or a limit stopped runs again: Claude resumes it, or it is sent \u{201C}\(ResumeRule.message)\u{201D}")
         } else {
             print("Quit prompt:        waits for a person while it is open")
         }

@@ -241,11 +241,37 @@ struct RulesTests {
         let chats = [
             MovedChat(id: "old", title: "old", interrupted: true, lastActivity: 1),
             MovedChat(id: "idle", title: "idle", interrupted: false, lastActivity: 9),
+            MovedChat(id: "limit", title: "limit", interrupted: false, lastActivity: 7),
             MovedChat(id: "new", title: "new", interrupted: true, lastActivity: 5),
+            MovedChat(id: "limit", title: "limit", interrupted: false, lastActivity: 7),
         ]
-        check(ResumeRule.toResume(chats).map(\.id) == ["new", "old"], "only cut-off chats, most recent first")
+        let wanted = ResumeRule.toResume(chats, limited: ["limit", "gone"])
+        check(wanted.map(\.id) == ["limit", "new", "old"],
+              "chats a quit cut off or a limit stopped, each once, most recent first; an idle chat the limit didn't stop is left alone")
+        check(ResumeRule.toResume(chats, limited: []).map(\.id) == ["new", "old"], "with no limit in the log, only the cut-off chats")
+        check(ResumeRule.message == "resume", "the message is \"resume\"")
         check(ResumeRule.resumed(markStillSet: false, lastActivity: 0, reopenedAt: 100), "a cleared mark means it resumed")
         check(!ResumeRule.resumed(markStillSet: true, lastActivity: 50, reopenedAt: 100), "a mark and no activity means it waits")
         check(ResumeRule.resumed(markStillSet: true, lastActivity: 150, reopenedAt: 100), "activity after the reopen means it resumed")
+
+        // One opened chat, step by step.
+        let idle = ChatScreen(busy: false, composer: true, draft: false)
+        func step(_ s: ChatScreen?, interrupted: Bool = false, waited: TimeInterval = 1, shownFor: TimeInterval? = 1) -> ResumeRule.Step {
+            ResumeRule.step(s, interrupted: interrupted, waited: waited, shownFor: shownFor)
+        }
+        check(step(idle) == .send, "an idle chat with an empty message box gets the message")
+        check(step(ChatScreen(busy: true, composer: true, draft: false)) == .done(.running), "a running chat is never sent to")
+        check(step(ChatScreen(busy: false, composer: true, draft: true)) == .done(.notResumed("it has an unsent draft")),
+              "a chat with someone's unsent text is never sent to")
+        check(step(nil, waited: 5, shownFor: nil) == .wait, "it waits for Claude to show the chat")
+        check(step(nil, waited: ResumeRule.showWait, shownFor: nil) == .done(.notResumed("Claude didn't show it")),
+              "a chat Claude never shows is reported, not sent to")
+        check(step(ChatScreen(busy: false, composer: false, draft: false), waited: 5) == .wait, "it waits for the message box to load")
+        check(step(ChatScreen(busy: false, composer: false, draft: false), waited: ResumeRule.showWait)
+              == .done(.notResumed("its message box wasn't found")), "a chat without a message box and send control is reported")
+        check(step(idle, interrupted: true, shownFor: 2) == .wait, "a chat a quit cut off gets time to resume by itself on open")
+        check(step(idle, interrupted: true, shownFor: ResumeRule.resumeOnOpenWait) == .send, "then it gets the message")
+        check(ResumeRule.showWait == 20 && ResumeRule.resumeOnOpenWait == 10 && ResumeRule.startWait == 30 && ResumeRule.ownPassWait == 45,
+              "the waits are 20 s to show, 10 s for Claude's own resume on open, 30 s for the turn to start, 45 s for Claude's launch pass")
     }
 }

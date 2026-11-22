@@ -70,14 +70,15 @@ xattr -dr com.apple.quarantine "/Applications/Claude Accounts.app"
    that account.
 4. Auto-switch is on from the start. Click **Allow…** in the menu, then turn
    on **Claude Accounts** under System Settings › Privacy & Security ›
-   Accessibility, so an automatic switch can answer Claude's quit prompt (see
-   [Auto-switch](#auto-switch)).
+   Accessibility, so an automatic switch can answer Claude's quit prompt and
+   get your stopped chats running again (see [Auto-switch](#auto-switch)).
 
 ## Read this before you switch
 
 Switching works by editing the Claude desktop app's own files while it is quit:
-its cookie database, its settings file and its chat records. None of that is a
-public interface, and an update to Claude can change it. The app is built to
+its cookie database, its settings file and its chat records. Resuming chats
+reads Claude's window through Accessibility. None of that is a public
+interface, and an update to Claude can change it. The app is built to
 fail closed. It backs everything up first, refuses to act when something looks
 off, and undoes a switch that Claude doesn't confirm. Still, use it at your own
 risk, and keep the backups in the app's `backups` folder until you trust it on
@@ -93,7 +94,7 @@ your setup.
 | `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Only on **Switch** or **Set Up**, with Claude quit; the folder names in `claude-code-sessions` are also read to find an account's other organizations |
 | `~/Library/Logs/Claude/main.log` | Read only, to see which account Claude reports | Always |
 | Claude's quit prompt, through Accessibility | Reads whether the prompt is open; presses **Quit anyway** | Only on an automatic or `--unattended` switch |
-| `claude://code/continue?session=…` | Opens a chat a quit cut off, so Claude resumes it | After an automatic or `--unattended` switch |
+| `claude://code/continue?session=…` and the chat's message box, through Accessibility | Opens each chat the quit or the limit stopped; types "resume" into that chat's own message box and presses its Send button, once | After every switch Claude confirms |
 
 **Remove** on an account's `···` menu signs its login out and deletes its
 keychain item. To uninstall, remove your accounts, quit the app, and delete it
@@ -124,8 +125,8 @@ your open Code sessions along:
 6. It reopens Claude. The switch counts only when Claude's log reports the
    target account and organization. A sign-out, another account, or no answer
    within a minute undoes every step from the journal.
-7. After an automatic switch it gets the chats the quit cut off going again
-   (see [After the switch](#after-the-switch)).
+7. Once Claude confirms, it gets every chat the quit or the limit stopped
+   running again (see [After the switch](#after-the-switch)).
 
 The account shown as **In use** is the one Claude's own log reports: the line
 Claude writes each time it loads an account's chats, naming the account and its
@@ -158,8 +159,8 @@ Nobody is there to answer Claude's quit prompt, so an automatic switch presses
 **Quit anyway** itself, through Accessibility. Once an account is out its chats
 have stopped, so the prompt rarely appears; when it does, for a chat still
 mid-reply or a background command, Quit anyway is what a person switching by
-hand presses. The app needs Accessibility access for this, and the menu asks
-for it while it is missing. Without it an automatic switch waits at the prompt
+hand presses. The app needs Accessibility access for this and for resuming
+chats, and the menu asks for it while it is missing. Without it an automatic switch waits at the prompt
 for a person, and nothing changes until someone answers. macOS ties the
 permission to the app's signature, so after installing a new version you may
 need to allow it again.
@@ -169,25 +170,37 @@ shows on the Mac only.
 
 ## After the switch
 
-Nothing outside Claude can type into a Claude Code chat, so what carries on by
-itself depends on how a chat stopped:
+Once Claude confirms the new account, the app gets every chat that had stopped
+running again, the way you would by hand: it sends each one a new message,
+"resume". A chat stops in one of two ways:
 
 - **Stopped by the limit.** When the account runs out, Claude ends each
-  working chat's turn with "You've hit your … limit". That chat is idle, its
-  history intact. No quit cut it off, so Claude doesn't resume it at its next
-  launch. Opening it with `claude://code/continue` only opens it. Claude's own
-  "continue when the limit resets" sends a fresh message at that account's
-  reset time, not at the switch. These chats wait for a message. The
-  notification lists them; send each a new message, like "continue". Don't use
-  Retry on the failed message: Retry rewinds the chat and starts its transcript
-  over under a new id, without its subagents.
-- **Cut off by the quit.** A chat still mid-reply when Claude quits is marked
-  by Claude, and at its next launch Claude resumes a few such chats in the
-  background and each of the rest when it is opened. The mark travels with the
-  chat's record, so it survives the switch. After an automatic switch the app
-  waits for Claude's own pass, then opens each marked chat that hasn't carried
-  on yet with Claude's `claude://code/continue?session=<id>` link, one at a time.
-  Claude's resume sends a new message as well; nothing retries a failed one.
+  working chat's turn with "You've hit your … limit". The app reads these from
+  Claude's log before it quits Claude.
+- **Cut off by the quit.** Claude marks a chat still mid-reply when it quits,
+  and resumes such chats itself after it reopens. The app gives Claude 45
+  seconds for that first.
+
+Then, one chat at a time, most recently active first:
+
+1. It opens the chat with `claude://code/continue?session=<id>`.
+2. It checks, through Accessibility, that Claude's window now shows that chat.
+   It matches the session id in the page's address, never the window's place
+   or order.
+3. If the chat is already running, it leaves it alone. If its message box holds
+   text you haven't sent, it leaves that too. A chat the quit cut off gets 10
+   seconds to resume by itself on open.
+4. Otherwise it puts "resume" in that chat's message box and presses that
+   chat's Send button, once. It posts no keystrokes, so it doesn't matter which
+   window has keyboard focus.
+5. It waits for the chat to show its turn running, up to 30 seconds, before it
+   opens the next one.
+
+It never presses Retry or Rewind. Retry on a failed message rewinds the chat and
+starts its transcript over under a new id, without its subagents; a new message
+keeps them. A chat that couldn't be resumed is named in the notification with
+the reason, for example "it has an unsent draft". Send that one a message
+yourself.
 
 Reaching a chat from your phone: Remote Control re-registers under the new
 account, so the Claude app on your phone has to be signed in to that account

@@ -2,7 +2,7 @@
 // Claude's buttons, as a sheet and as a window of its own. It checks that the prompt is seen
 // only once it is open, that the ordinary Cancel button in the window is never pressed, and that
 // Quit anyway is the button that gets pressed. Needs Accessibility access for the process that
-// runs it; ./test.sh skips it, with a note, when that is missing.
+// runs it; ./test.sh skips it, with a note, when that is missing. Shares tests/FixtureSupport.swift.
 
 import Foundation
 
@@ -63,52 +63,10 @@ struct PromptTest {
         let pid = proc.processIdentifier
         guard lines.wait(for: "ready", timeout: 10) else { return "the fixture window never came up" }
         input.fileHandleForWriting.write(Data("show\n".utf8))
-        // Give the alert the same time the quit prompt gets to show, then check it was ignored.
-        if poll(timeout: 3, { QuitPrompt.isOpen(in: [pid]) }) { return "took an unrelated alert for the quit prompt" }
+        // Once the fixture says the alert is up, it must not count as the quit prompt.
+        guard lines.wait(for: "alert shown", timeout: 10) else { return "the fixture never showed its alert" }
+        if QuitPrompt.isOpen(in: [pid]) { return "took an unrelated alert for the quit prompt" }
         if QuitPrompt.press("Cancel", in: [pid]) { return "pressed Cancel on an unrelated alert" }
-        return lines.next(prefix: "pressed: ", timeout: 0.5).map { "the fixture saw \($0)" }
-    }
-
-    /// Check `condition` every 100 ms until it holds or `timeout` passes.
-    static func poll(timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return true }
-            usleep(100_000)
-        }
-        return condition()
-    }
-}
-
-/// Reads the fixture's output line by line as it arrives.
-final class LineReader: @unchecked Sendable {
-    private var lines: [String] = []
-    private let lock = NSLock()
-
-    init(_ handle: FileHandle) {
-        var buffer = ""
-        handle.readabilityHandler = { [weak self] h in
-            let chunk = String(decoding: h.availableData, as: UTF8.self)
-            guard !chunk.isEmpty else { h.readabilityHandler = nil; return }
-            buffer += chunk
-            while let newline = buffer.firstIndex(of: "\n") {
-                let line = String(buffer[..<newline])
-                buffer = String(buffer[buffer.index(after: newline)...])
-                self?.lock.lock(); self?.lines.append(line); self?.lock.unlock()
-            }
-        }
-    }
-
-    func wait(for line: String, timeout: TimeInterval) -> Bool { next(prefix: line, timeout: timeout) != nil }
-
-    /// The rest of the first line starting with `prefix`, once it arrives.
-    func next(prefix: String, timeout: TimeInterval) -> String? {
-        var found: String?
-        _ = PromptTest.poll(timeout: timeout) {
-            lock.lock(); defer { lock.unlock() }
-            found = lines.first { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }
-            return found != nil
-        }
-        return found
+        return lines.all(prefix: "pressed: ").first.map { "the fixture saw \($0)" }
     }
 }
