@@ -8,14 +8,17 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-6e5aff?style=flat-square)](LICENSE)
 
 A macOS menu bar app for people with more than one Claude account, like a work
-plan, a school plan and a personal one. It shows the 5-hour and weekly usage of
-every account at once. One click switches the Claude desktop app to another
+plan, a school plan and a personal one. It shows the usage of every account at
+once: the 5-hour and weekly limits, or the weekly limit alone for a plan that
+has no 5-hour limit. One click switches the Claude desktop app to another
 account, and your open Claude Code chats come with you: same history, same
 worktrees. When Claude stops a chat because the account in use is out of usage,
 it switches by itself to the account with the most room left. An account that
 belongs to two
-organizations, like a personal plan and a team, shows both, each with its own
-usage, and either one can be switched to.
+organizations, like a personal plan and a team, shows both under the account's
+name, each with its own usage, and either one can be switched to; click the
+name to fold them away. An account that is out of usage shows **Out** in place
+of Switch until its limit resets.
 
 <p align="center">
   <img src="docs/menu.png" width="355" alt="The ClaudeAccounts menu: four accounts with 5-hour and weekly usage bars, the one in use marked, and a Switch button on the others">
@@ -185,8 +188,10 @@ permission to the app's signature, so after installing a new version you may
 need to allow it again.
 
 Each automatic switch posts a notification that says which account Claude
-stopped at its limit and how the switch went. The notification shows on the Mac
-only.
+stopped at its limit and how the switch went. The app posts its notifications
+itself, so its first launch asks once to allow them; until you allow them in
+that prompt or in System Settings > Notifications, none are shown. They show on
+the Mac only.
 
 ## After the switch
 

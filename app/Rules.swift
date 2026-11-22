@@ -99,6 +99,20 @@ extension Array where Element == AccountRecord {
     }
 }
 
+/// The app's accounts.json, the rows in menu order. Its format has not changed since rows gained
+/// organizations, so a file an earlier version saved reads back as it was saved.
+enum AccountsFile {
+    private struct File: Codable { var accounts: [AccountRecord] }
+
+    static func decode(_ data: Data) -> [AccountRecord]? { (try? JSONDecoder().decode(File.self, from: data))?.accounts }
+
+    static func encode(_ accounts: [AccountRecord]) throws -> Data {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try enc.encode(File(accounts: accounts))
+    }
+}
+
 // MARK: - Usage
 
 /// One usage window from Claude's usage service: how much of it is used and when it resets.

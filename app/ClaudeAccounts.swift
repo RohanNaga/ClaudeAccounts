@@ -181,14 +181,12 @@ enum Keychain {
 // MARK: - Accounts on disk
 
 enum AccountStore {
-    private struct File: Codable { var accounts: [AccountRecord] }
-
     /// The rows on disk. A row saved before organizations were tracked takes its organization from its
     /// saved Claude login, else from its Claude Code login, and a label that shows an email gets its
     /// default label; this only reads, so --dry-run stays read-only, and the next save keeps it.
     static func load() -> [AccountRecord] {
         guard let data = try? Data(contentsOf: Paths.accountsFile),
-              var accounts = (try? JSONDecoder().decode(File.self, from: data))?.accounts else { return [] }
+              var accounts = AccountsFile.decode(data) else { return [] }
         for i in accounts.indices where accounts[i].orgUuid == nil {
             let profile = LoginFlow.profile(in: accounts[i].configURL)
             accounts[i].orgUuid = LoginSlot.meta(accounts[i])?.orgFolder ?? profile["organizationUuid"] as? String
@@ -201,9 +199,7 @@ enum AccountStore {
         let fm = FileManager.default
         try fm.createDirectory(at: Paths.stateDir, withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try enc.encode(File(accounts: accounts)).write(to: Paths.accountsFile, options: .atomic)
+        try AccountsFile.encode(accounts).write(to: Paths.accountsFile, options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Paths.accountsFile.path)
     }
 }

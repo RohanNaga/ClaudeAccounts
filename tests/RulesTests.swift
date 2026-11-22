@@ -22,6 +22,7 @@ struct RulesTests {
         quitWatch()
         organizations()
         labels()
+        upgrade()
         meters()
         settings()
         resume()
@@ -332,6 +333,56 @@ struct RulesTests {
               "a new account with no organization name is Account N")
         check((old + personal).relabeled().allSatisfy { !$0.name.contains("@") }, "no label shows an email or part of one")
         check(shownName("me@example.com") == nil && shownName("Work") == "Work" && shownName("") == nil, "only a name without an email is shown")
+    }
+
+    // MARK: Upgrade
+
+    /// The files as the previous release saved them, read from a copy on disk the way the app loads
+    /// them: every row, every name someone chose and every setting comes back as saved, and only a
+    /// label that shows an email gets its default label.
+    static func upgrade() {
+        let saved = ##"""
+        {
+          "accounts" : [
+            { "accountUuid" : "acct-1", "color" : "#3B82F6", "configDir" : "~/logins/a", "email" : "me@example.com",
+              "id" : "a", "keychainService" : "kc-a", "name" : "Work", "orgName" : "Northwind Labs", "orgUuid" : "org-1" },
+            { "accountUuid" : "acct-1", "color" : "#3B82F6", "configDir" : "~/logins/b", "email" : "me@example.com",
+              "id" : "b", "keychainService" : "kc-b", "name" : "Research team", "orgName" : "Northwind Research", "orgUuid" : "org-2" },
+            { "accountUuid" : "acct-1", "color" : "#3B82F6", "configDir" : "~/logins/c", "email" : "me@example.com",
+              "id" : "c", "keychainService" : "kc-c", "name" : "me@example.com · Northwind Support", "orgName" : "Northwind Support", "orgUuid" : "org-3" },
+            { "accountUuid" : "acct-2", "color" : "#10B981", "configDir" : "~/logins/d", "email" : "you@example.com",
+              "id" : "d", "keychainService" : "kc-d", "name" : "Side project", "orgName" : "you@example.com's Organization", "orgUuid" : "org-4" },
+            { "accountUuid" : "acct-3", "color" : "#F59E0B", "configDir" : "~/logins/e", "email" : "them@example.com",
+              "id" : "e", "keychainService" : "kc-e", "name" : "them@example.com", "orgName" : "them@example.com's Organization", "orgUuid" : "org-5" }
+          ]
+        }
+        """##
+        let copy = FileManager.default.temporaryDirectory.appendingPathComponent("accounts-upgrade-\(getpid()).json")
+        defer { try? FileManager.default.removeItem(at: copy) }
+        func rows(_ data: Data) -> [[String: String]] {
+            ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["accounts"] as? [[String: String]] ?? []
+        }
+        guard (try? Data(saved.utf8).write(to: copy)) != nil, let onDisk = try? Data(contentsOf: copy),
+              let loaded = AccountsFile.decode(onDisk)?.relabeled(), let resaved = try? AccountsFile.encode(loaded) else {
+            return check(false, "the previous release's accounts file loads and saves")
+        }
+        let before = rows(onDisk), after = rows(resaved)
+        check(after.count == 5 && after.map { $0["id"] } == before.map { $0["id"] }, "every row loads, in the saved order")
+        check(zip(before, after).allSatisfy { Set($0.keys) == Set($1.keys) }, "no saved field is dropped or added")
+        check(zip(before, after).allSatisfy { old, new in old.allSatisfy { $0.key == "name" || new[$0.key] == $0.value } },
+              "every login folder, keychain item, organization and color is kept as saved")
+        check(after.map { $0["name"] ?? "" } == ["Work", "Research team", "Work · Northwind Support", "Side project", "Account 3"],
+              "names someone chose are kept, for accounts and organization rows; only labels that show an email change")
+        check(AccountsFile.decode(resaved) == loaded, "saving again changes nothing further")
+
+        var settings = AppSettings()
+        settings.display = .gaugePercent
+        settings.autoSwitch = false
+        var old = ((try? JSONSerialization.jsonObject(with: JSONEncoder().encode(settings))) as? [String: Any]) ?? [:]
+        old["collapsed"] = nil
+        let oldSettings = (try? JSONSerialization.data(withJSONObject: old)).flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) }
+        check(oldSettings == settings && oldSettings?.collapsed.isEmpty == true,
+              "a settings file from the previous release keeps its choices and shows every organization")
     }
 
     // MARK: Meters
