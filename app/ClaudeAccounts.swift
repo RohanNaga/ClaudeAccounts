@@ -2396,7 +2396,7 @@ struct MenuContent: View {
             .padding(.horizontal, 10).padding(.top, 6).padding(.bottom, 4)
 
             if let step = store.switching {
-                HStack(spacing: 6) { ProgressView().controlSize(.mini); Text(step).font(.caption) }
+                HStack(spacing: 6) { ProgressView().controlSize(.mini); Text(step).font(.caption).fixedSize(horizontal: false, vertical: true) }
                     .padding(.horizontal, 10).padding(.bottom, 4)
             }
             if let msg = store.message {
