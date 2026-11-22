@@ -47,39 +47,39 @@ struct RulesTests {
     }
 
     static func autoSwitch() {
-        let personal = row("personal", 40, 92)
-        let support = row("support", 5, 20)
+        let busy = row("busy", 40, 92)
+        let roomy = row("roomy", 5, 20)
         let work = row("work", 30, 10)
 
-        check(picked(decide(personal, [personal, support, work], threshold: nil)) == nil, "off never switches")
-        check(picked(decide(personal, [personal, support], running: false)) == nil, "no switch while Claude isn't running")
-        check(picked(decide(nil, [support])) == nil, "no switch when Claude's account is unknown")
-        check(picked(decide(row("personal", 40, 70), [support])) == nil, "no switch under the threshold")
-        check(picked(decide(personal, [personal, support, work])) == "support", "weekly past the threshold switches, to the most room")
-        check(picked(decide(row("personal", 95, 10), [work])) == "work", "the 5-hour meter alone also triggers")
-        check(picked(decide(row("personal", 100, 100), [support])) == "support", "an account that ran out switches")
-        check(picked(decide(personal, [personal, personal])) == nil, "never switches to the account in use")
+        check(picked(decide(busy, [busy, roomy, work], threshold: nil)) == nil, "off never switches")
+        check(picked(decide(busy, [busy, roomy], running: false)) == nil, "no switch while Claude isn't running")
+        check(picked(decide(nil, [roomy])) == nil, "no switch when Claude's account is unknown")
+        check(picked(decide(row("busy", 40, 70), [roomy])) == nil, "no switch under the threshold")
+        check(picked(decide(busy, [busy, roomy, work])) == "roomy", "weekly past the threshold switches, to the most room")
+        check(picked(decide(row("busy", 95, 10), [work])) == "work", "the 5-hour meter alone also triggers")
+        check(picked(decide(row("busy", 100, 100), [roomy])) == "roomy", "an account that ran out switches")
+        check(picked(decide(busy, [busy, busy])) == nil, "never switches to the account in use")
 
-        // Tonight's case: the target itself had run out of its weekly limit.
-        check(picked(decide(personal, [row("support", 0, 100)])) == nil, "never switches to an account that is out")
-        check(picked(decide(personal, [row("a", 10, 91), row("b", 95, 0)])) == nil, "never to an account past the threshold")
-        check(picked(decide(personal, [row("a", 10, 89)])) == "a", "just under the threshold is room")
+        // A target that has itself run out of its weekly limit.
+        check(picked(decide(busy, [row("roomy", 0, 100)])) == nil, "never switches to an account that is out")
+        check(picked(decide(busy, [row("a", 10, 91), row("b", 95, 0)])) == nil, "never to an account past the threshold")
+        check(picked(decide(busy, [row("a", 10, 89)])) == "a", "just under the threshold is room")
 
-        check(picked(decide(personal, [row("a", 0, 0, needsSignIn: true), work])) == "work", "skips a login at its deadline")
-        check(picked(decide(personal, [row("a", 0, 0, saved: false), work])) == "work", "skips an account that isn't set up")
-        check(picked(decide(personal, [row("a", 0, 0, readMinutesAgo: 20), work])) == "work", "skips a stale reading")
-        check(picked(decide(row("personal", 40, 92, readMinutesAgo: 20), [work])) == nil, "a stale reading never starts a switch")
-        check(picked(decide(personal, [row("a", nil, nil), row("b", 1, 1)])) == "a", "a window not started yet counts as nothing used")
+        check(picked(decide(busy, [row("a", 0, 0, needsSignIn: true), work])) == "work", "skips a login at its deadline")
+        check(picked(decide(busy, [row("a", 0, 0, saved: false), work])) == "work", "skips an account that isn't set up")
+        check(picked(decide(busy, [row("a", 0, 0, readMinutesAgo: 20), work])) == "work", "skips a stale reading")
+        check(picked(decide(row("busy", 40, 92, readMinutesAgo: 20), [work])) == nil, "a stale reading never starts a switch")
+        check(picked(decide(busy, [row("a", nil, nil), row("b", 1, 1)])) == "a", "a window not started yet counts as nothing used")
         let never = SwitchCandidate(id: "x", name: "x", fiveHour: nil, weekly: nil, readAt: nil, needsSignIn: false, hasSavedLogin: true)
-        check(picked(decide(personal, [never])) == nil, "an account never read is not a target")
+        check(picked(decide(busy, [never])) == nil, "an account never read is not a target")
 
-        check(picked(decide(personal, [row("b", 20, 20), row("a", 20, 5)])) == "a", "a tie goes to less weekly use")
-        check(picked(decide(personal, [row("b", 20, 20), row("a", 20, 20)])) == "a", "then to the name")
+        check(picked(decide(busy, [row("b", 20, 20), row("a", 20, 5)])) == "a", "a tie goes to less weekly use")
+        check(picked(decide(busy, [row("b", 20, 20), row("a", 20, 20)])) == "a", "then to the name")
 
-        check(picked(decide(personal, [support], lastAttemptMinutesAgo: 10)) == nil, "no second switch inside the cool-down")
-        check(picked(decide(personal, [support], lastAttemptMinutesAgo: 31)) == "support", "switches again after the cool-down")
-        // Flapping: just after moving to support, support passing the threshold must not bounce back at once.
-        check(picked(decide(row("support", 91, 20), [row("personal", 10, 10)], lastAttemptMinutesAgo: 2)) == nil,
+        check(picked(decide(busy, [roomy], lastAttemptMinutesAgo: 10)) == nil, "no second switch inside the cool-down")
+        check(picked(decide(busy, [roomy], lastAttemptMinutesAgo: 31)) == "roomy", "switches again after the cool-down")
+        // Flapping: just after a switch, the new account passing the threshold must not bounce back at once.
+        check(picked(decide(row("roomy", 91, 20), [row("busy", 10, 10)], lastAttemptMinutesAgo: 2)) == nil,
               "no flap back inside the cool-down")
         check(AutoSwitchRule.thresholds.contains(AutoSwitchRule.defaultThreshold), "the default threshold is on the menu")
         check(AutoSwitchRule.thresholds.allSatisfy { $0 < 100 }, "every threshold switches before the limit")
