@@ -1,7 +1,8 @@
-// The decisions behind switching, kept free of AppKit, files and the network so the tests in
-// tests/RulesTests.swift drive them directly: which account a Claude identity belongs to, what
-// Claude's log says, when auto-switch moves and to which account, how a quit request is followed
-// to its end, and which stopped chats get a new message after a switch.
+// The decisions behind the menu and switching, kept free of AppKit, files and the network so the
+// tests in tests/RulesTests.swift drive them directly: which account a Claude identity belongs to,
+// how rows are labelled, which meters a row shows, the menu's settings, what Claude's log says,
+// when auto-switch moves and to which account, how a quit request is followed to its end, and
+// which stopped chats get a new message after a switch.
 
 import Foundation
 
@@ -29,8 +30,16 @@ struct AccountRecord: Codable, Identifiable, Equatable {
 
     var configURL: URL { URL(fileURLWithPath: (configDir as NSString).expandingTildeInPath) }
 
-    /// The label without its domain, for the menu bar where space is tight.
-    var shortName: String { name.split(separator: "@").first.map(String.init) ?? name }
+    /// The organization's name as the app shows it; nil when Claude named it after an email.
+    var organization: String? { shownName(orgName) }
+}
+
+/// A name the app may show, or nil when it holds an email address or part of one. Claude names a
+/// personal organization after its email, so no label, row, message or notification shows a name
+/// with "@" in it.
+func shownName(_ name: String?) -> String? {
+    guard let name, !name.isEmpty, !name.contains("@") else { return nil }
+    return name
 }
 
 extension Array where Element == AccountRecord {
@@ -68,12 +77,187 @@ extension Array where Element == AccountRecord {
         let added = Set(filter { $0.accountUuid == account }.compactMap(\.orgUuid))
         return opened.filter { !added.contains($0.org) }.sorted { $0.chats > $1.chats }.map(\.org)
     }
+
+    /// The label a row gets when it has none of its own: never an email. An account's first row
+    /// is named after its organization, else "Account N"; each further organization of the
+    /// account is "<the account's label> · <organization>", so its rows read apart.
+    func defaultLabel(for row: AccountRecord) -> String {
+        let groups = groupedByAccount()
+        guard let g = groups.firstIndex(where: { $0.contains { $0.id == row.id } }),
+              let k = groups[g].firstIndex(where: { $0.id == row.id }) else { return row.name }
+        guard k > 0 else { return row.organization ?? "Account \(g + 1)" }
+        let first = groups[g][0]
+        return (shownName(first.name) ?? defaultLabel(for: first)) + " · " + (row.organization ?? "Organization \(k + 1)")
+    }
+
+    /// The rows with every label that shows an email replaced by its default label. Labels used
+    /// to default to the email, so this runs on load; the next save keeps the new labels.
+    func relabeled() -> [AccountRecord] {
+        var rows = self
+        for i in rows.indices where shownName(rows[i].name) == nil { rows[i].name = rows.defaultLabel(for: rows[i]) }
+        return rows
+    }
 }
 
-/// The label for a new row: the email, with the organization added when the account already
-/// has a row, so its two organizations read apart.
-func rowName(email: String?, orgName: String?, accountAlreadyAdded: Bool, fallback: String) -> String {
-    [email ?? fallback, accountAlreadyAdded ? orgName : nil].compactMap { $0 }.joined(separator: " · ")
+/// The app's accounts.json, the rows in menu order. Its format has not changed since rows gained
+/// organizations, so a file an earlier version saved reads back as it was saved.
+enum AccountsFile {
+    private struct File: Codable { var accounts: [AccountRecord] }
+
+    static func decode(_ data: Data) -> [AccountRecord]? { (try? JSONDecoder().decode(File.self, from: data))?.accounts }
+
+    static func encode(_ accounts: [AccountRecord]) throws -> Data {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try enc.encode(File(accounts: accounts))
+    }
+}
+
+// MARK: - Usage
+
+/// One usage window from Claude's usage service: how much of it is used and when it resets.
+struct UsageWindow: Equatable, Codable {
+    /// Percent used as the usage service reports it, unrounded; "out" is decided on this.
+    let utilization: Double
+    let resetsAt: Date?
+
+    /// Rounded, for display only.
+    var pct: Int { Int(utilization.rounded()) }
+
+    private enum CodingKeys: String, CodingKey { case utilization, pct, resetsAt }
+
+    init(utilization: Double, resetsAt: Date?) {
+        self.utilization = utilization
+        self.resetsAt = resetsAt
+    }
+
+    /// A cache written before the unrounded value was kept has only `pct`.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        utilization = try c.decodeIfPresent(Double.self, forKey: .utilization) ?? Double(c.decode(Int.self, forKey: .pct))
+        resetsAt = try c.decodeIfPresent(Date.self, forKey: .resetsAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(utilization, forKey: .utilization)
+        try c.encode(pct, forKey: .pct)
+        try c.encodeIfPresent(resetsAt, forKey: .resetsAt)
+    }
+
+    /// Relative and absolute together: "in 2 h 05 m · 13:10" today, "in 2 days · Sep 27, 13:00"
+    /// further out, and "No reset pending" for a window that hasn't started.
+    var resetText: String {
+        guard let date = resetsAt else { return "No reset pending" }
+        let secs = date.timeIntervalSinceNow
+        if secs <= 0 { return "Resetting now" }
+        let f = DateFormatter()
+        let relative: String
+        if secs < 24 * 3600 {
+            let h = Int(secs) / 3600, m = (Int(secs) % 3600) / 60
+            relative = h > 0 ? "in \(h) h \(String(format: "%02d", m)) m" : "in \(max(m, 1)) min"
+            f.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm" : "EEE HH:mm"
+        } else {
+            let days = Int((secs / 86400).rounded())
+            relative = "in \(days) day\(days == 1 ? "" : "s")"
+            f.dateFormat = "MMM d, HH:mm"
+        }
+        return "\(relative) · \(f.string(from: date))"
+    }
+
+    /// A reset this close means the account frees up soon, which is when switching to it pays off.
+    var resetsSoon: Bool { resetsAt.map { $0.timeIntervalSinceNow > 0 && $0.timeIntervalSinceNow <= 15 * 60 } ?? false }
+
+    /// One window of the usage response, such as its `five_hour` object. Nil when the response has
+    /// no such window: the object is missing or null, or its utilization is null. Claude's own
+    /// usage panels leave such a window out in exactly this case.
+    init?(_ raw: Any?) {
+        guard let dict = raw as? [String: Any], let util = dict["utilization"] as? Double else { return nil }
+        utilization = util
+        resetsAt = (dict["resets_at"] as? String).flatMap(Self.parseDate)
+    }
+
+    private static func parseDate(_ s: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: s)
+    }
+}
+
+/// What a row's meters and the menu bar gauge show.
+enum MeterRule {
+    /// The 5-hour meter shows unless a reading says the account has no 5-hour window: Claude's
+    /// usage service leaves that window out for a plan without the limit, and Claude's own usage
+    /// panels then show no 5-hour row. A reading with no weekly window either carries no such
+    /// signal, so the meter still shows rather than hide a real limit.
+    static func showsFiveHour(fiveHour: UsageWindow?, weekly: UsageWindow?) -> Bool { fiveHour != nil || weekly == nil }
+
+    /// The meter that holds an account at its limit, and of two the one that resets last; nil
+    /// while every meter it has has room. Compared unrounded, like `SwitchCandidate.atLimit`.
+    static func limiting(fiveHour: UsageWindow?, weekly: UsageWindow?) -> UsageWindow? {
+        [fiveHour, weekly].compactMap { $0 }.filter { $0.utilization >= AutoSwitchRule.limit }
+            .max { ($0.resetsAt ?? .distantPast) < ($1.resetsAt ?? .distantPast) }
+    }
+
+    /// The window the menu bar gauge follows: the chosen limit, or the weekly one for an account
+    /// without a 5-hour window.
+    static func gauge(_ metric: UsageMetric, fiveHour: UsageWindow?, weekly: UsageWindow?) -> UsageWindow? {
+        metric == .fiveHour ? fiveHour ?? weekly : weekly
+    }
+}
+
+// MARK: - Settings
+
+/// What the menu bar item shows next to its gauge.
+enum MenuBarDisplay: String, Codable, CaseIterable, Identifiable {
+    case gauge, gaugePercent, gaugeNamePercent
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .gauge: return "Gauge Only"
+        case .gaugePercent: return "Gauge and Percentage"
+        case .gaugeNamePercent: return "Gauge, Name and Percentage"
+        }
+    }
+}
+
+/// Which limit the gauge and percentage follow.
+enum UsageMetric: String, Codable, CaseIterable, Identifiable {
+    case fiveHour, weekly
+    var id: String { rawValue }
+    var title: String { self == .fiveHour ? "5-Hour Limit" : "Weekly Limit" }
+}
+
+/// Menu preferences, kept in settings.json in the app's state folder.
+struct AppSettings: Codable, Equatable {
+    var display: MenuBarDisplay = .gaugeNamePercent
+    var metric: UsageMetric = .fiveHour
+    /// Switch by itself when the account in use runs out of usage.
+    var autoSwitch = AutoSwitchRule.onByDefault
+    /// Accounts whose organizations the menu folds under the account's name. Empty at first, so
+    /// every organization shows.
+    var collapsed: Set<String> = []
+
+    init() {}
+
+    /// Each key is optional, so a settings file from an older version keeps what it has.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        display = try c.decodeIfPresent(MenuBarDisplay.self, forKey: .display) ?? .gaugeNamePercent
+        metric = try c.decodeIfPresent(UsageMetric.self, forKey: .metric) ?? .fiveHour
+        autoSwitch = try c.decodeIfPresent(Bool.self, forKey: .autoSwitch) ?? AutoSwitchRule.onByDefault
+        collapsed = try c.decodeIfPresent(Set<String>.self, forKey: .collapsed) ?? []
+    }
+
+    /// Whether the menu shows the organizations of `account`.
+    func showsOrganizations(of account: String) -> Bool { !collapsed.contains(account) }
+
+    /// Show or fold away the organizations of `account`.
+    mutating func setShowsOrganizations(of account: String, _ shown: Bool) {
+        if shown { collapsed.remove(account) } else { collapsed.insert(account) }
+    }
 }
 
 // MARK: - Auto-switch
@@ -82,7 +266,8 @@ func rowName(email: String?, orgName: String?, accountAlreadyAdded: Bool, fallba
 struct SwitchCandidate: Equatable {
     let id: String
     let name: String
-    /// Percent used, unrounded; nil when the window hasn't started, which counts as nothing used.
+    /// Percent used, unrounded; nil when the account has no such window, so an account without a
+    /// 5-hour limit is judged on its weekly meter alone.
     let fiveHour: Double?
     let weekly: Double?
     /// When this reading was taken; nil when there is no reading at all.
@@ -95,12 +280,14 @@ struct SwitchCandidate: Equatable {
     /// Until when a switch away from this row counts it as out, whatever its meters read.
     var outUntil: Date? = nil
 
-    /// The fuller of the two meters.
+    /// The fuller of the meters it has.
     var used: Double { Swift.max(fiveHour ?? 0, weekly ?? 0) }
 
-    /// Out of usage: a meter at its limit, compared unrounded, or a switch left this row and its
-    /// reset hasn't come yet.
-    func isOut(at now: Date) -> Bool { used >= AutoSwitchRule.limit || (outUntil.map { now < $0 } ?? false) }
+    /// A meter it has is at its limit, compared unrounded. The menu offers no Switch to such a row.
+    var atLimit: Bool { used >= AutoSwitchRule.limit }
+
+    /// Out of usage: a meter at its limit, or a switch left this row and its reset hasn't come yet.
+    func isOut(at now: Date) -> Bool { atLimit || (outUntil.map { now < $0 } ?? false) }
 }
 
 enum AutoSwitchRule {
