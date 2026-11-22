@@ -41,9 +41,11 @@ struct RulesTests {
                         outUntil: outUntil)
     }
 
-    static func decide(_ current: SwitchCandidate?, _ others: [SwitchCandidate], stopped: Bool = true, enabled: Bool = true,
+    /// `rows` are in menu order; the row in use is put first when the list leaves it out.
+    static func decide(_ current: SwitchCandidate?, _ rows: [SwitchCandidate], stopped: Bool = true, enabled: Bool = true,
                        running: Bool = true, lastAttemptMinutesAgo: Double? = nil) -> AutoSwitchRule.Decision {
-        AutoSwitchRule.decide(current: current, others: others, enabled: enabled, limitStopped: stopped, claudeRunning: running,
+        let all = current.map { c in rows.contains { $0.id == c.id } ? rows : [c] + rows } ?? rows
+        return AutoSwitchRule.decide(current: current, rows: all, enabled: enabled, limitStopped: stopped, claudeRunning: running,
                               lastAttempt: lastAttemptMinutesAgo.map { now.addingTimeInterval(-$0 * 60) }, now: now)
     }
 
@@ -64,7 +66,7 @@ struct RulesTests {
 
         // The one trigger is Claude stopping a chat for usage; the meters never start a switch.
         check(AutoSwitchRule.onByDefault, "auto-switch is on without touching anything")
-        check(picked(decide(busy, [busy, roomy, work])) == "roomy", "Claude stopped a chat: switch to the most room")
+        check(picked(decide(busy, [busy, roomy, work])) == "roomy", "Claude stopped a chat: switch to the next row in the menu")
         check(picked(decide(busy, [roomy], stopped: false)) == nil, "no stop in Claude's log, no switch")
         check(picked(decide(row("busy", 100, 100), [roomy], stopped: false)) == nil, "both meters at 100 with no stop: no switch")
         check(picked(decide(row("busy", 103, 40), [roomy], stopped: false)) == nil, "a meter over 100 with no stop: no switch")
@@ -91,12 +93,24 @@ struct RulesTests {
         check(nowhere(decide(busy, [row("a", 0, 0, readMinutesAgo: 20)])), "only stale targets: a notice, no switch")
         check(picked(decide(row("busy", 40, 70, readMinutesAgo: 600), [work])) == "work",
               "a stale reading of the account in use doesn't hold back a stop")
-        check(picked(decide(busy, [row("a", nil, nil), row("b", 1, 1)])) == "a", "a meter the account doesn't have counts as nothing used")
+        check(picked(decide(busy, [row("a", nil, 30), work])) == "a", "an account without a 5-hour limit is judged on its weekly meter")
         let never = SwitchCandidate(id: "x", name: "x", fiveHour: nil, weekly: nil, readAt: nil, needsSignIn: false, hasSavedLogin: true)
         check(picked(decide(busy, [never])) == nil, "an account never read is not a target")
 
-        check(picked(decide(busy, [row("b", 20, 20), row("a", 20, 5)])) == "a", "a tie goes to less weekly use")
-        check(picked(decide(busy, [row("b", 20, 20), row("a", 20, 20)])) == "a", "then to the name")
+        // The menu's order is the switch order: down from the row in use, wrapping round to the top.
+        let a = row("a", 90, 90), b = row("b", 50, 50), c = row("c", 1, 1), d = row("d", 10, 10)
+        check(picked(decide(a, [a, b, c, d])) == "b", "the first row below the one in use, not the one with the most room")
+        check(picked(decide(a, [a, d, c, b])) == "d", "reordering the rows changes the target")
+        check(picked(decide(a, [a, row("b", 0, 100), row("c", 0, 0, saved: false), d])) == "d",
+              "skips rows that are out or not set up, in order")
+        check(picked(decide(b, [a, b, c, d])) == "c", "starts below the row in use, never above it while a lower row has room")
+        check(picked(decide(c, [a, b, c, row("d", 100, 0)])) == "a", "wraps round to the top when every lower row is out")
+        check(picked(decide(d, [a, b, c, d])) == "a", "the last row's next is the first")
+        check(picked(decide(c, [c])) == nil && nowhere(decide(c, [c])), "never the row just left: alone, it stays and says so")
+        let none = decide(b, [row("a", 100, 0), b, row("c", 0, 0, needsSignIn: true), row("d", 0, 0, readMinutesAgo: 30)])
+        check(picked(none) == nil && nowhere(none), "no other row with room: no switch, one notice")
+        check(AutoSwitchRule.next(after: a, in: [a, b, c], now: now)?.id == "b" && AutoSwitchRule.next(after: c, in: [c], now: now) == nil,
+              "the row the menu marks next is the one a switch would choose")
 
         check(picked(decide(busy, [roomy], lastAttemptMinutesAgo: 5)) == nil, "no second try inside the cool-down")
         check(picked(decide(busy, [roomy], lastAttemptMinutesAgo: 11)) == "roomy", "tries again after the cool-down")
@@ -281,6 +295,22 @@ struct RulesTests {
         check(rows.groupedByAccount().map { $0.map(\.id) } == [["a", "b"], ["c"]], "organizations group under their account")
         check([record("x", account: nil, org: nil), record("y", account: nil, org: nil)].groupedByAccount().count == 2,
               "rows without an account id stand alone")
+        check(rows.inMenuOrder.map(\.id) == ["a", "b", "c"], "one sequence: each account's organizations in turn, then the next account")
+
+        // Move Up and Move Down: an organization among its account's, any other row with its whole account.
+        let three = [personal, team, other, record("d", account: "solo", org: "org-d")]
+        check(three.moved(team, by: -1, organization: true)?.map(\.id) == ["b", "a", "c", "d"], "an organization moves up within its account")
+        check(three.moved(personal, by: -1, organization: true) == nil && three.moved(team, by: 1, organization: true) == nil,
+              "an organization never leaves its account")
+        check(three.moved(personal, by: 1, organization: false)?.map(\.id) == ["c", "a", "b", "d"], "an account moves down past the next account")
+        check(three.moved(other, by: -1, organization: false)?.map(\.id) == ["c", "a", "b", "d"], "and a one-row account moves up past it")
+        check(three.moved(three[3], by: 1, organization: false) == nil && three.moved(personal, by: -1, organization: false) == nil,
+              "nothing moves past either end")
+        let named = [record("a", account: "acct", org: "org-a", name: "Work", orgName: "Labs"),
+                     record("b", account: "acct", org: "org-b", name: "Team name", orgName: "Research")].labelled()
+        let swapped = named.moved(named[1], by: -1, organization: true)
+        check(swapped?.map(\.label) == ["Work · Team name", "Work · Labs"],
+              "the account keeps its name whichever organization comes first, and each organization its own")
 
         // Adding the other organization: the one Claude has opened that no row stands for, most used first.
         let opened = [(org: "org-a", chats: 50), (org: "org-c", chats: 2), (org: "org-b", chats: 9)]
@@ -291,10 +321,10 @@ struct RulesTests {
 
         // Auto-switch treats each account-and-organization pair as its own target.
         let outPersonal = row("a", 10, 60)
-        check(picked(decide(outPersonal, [outPersonal, row("b", 30, 40), row("c", 60, 60)])) == "b",
-              "the account's other organization is a target, by the same most-room rule")
-        check(picked(decide(outPersonal, [outPersonal, row("b", 30, 40), row("c", 5, 5)])) == "c",
-              "and loses to another account with more room")
+        check(picked(decide(outPersonal, [outPersonal, row("b", 30, 40), row("c", 5, 5)])) == "b",
+              "the account's other organization is a target, by the same order")
+        check(picked(decide(outPersonal, [outPersonal, row("c", 5, 5), row("b", 30, 40)])) == "c",
+              "and another account comes first when the menu lists it first")
         check(picked(decide(outPersonal, [outPersonal, row("b", 0, 100), row("c", 60, 60)])) == "c",
               "the other organization is skipped when it is out too")
 
@@ -405,6 +435,20 @@ struct RulesTests {
               "and the menu names each row by them")
         check(AccountsFile.decode(resaved)?.labelled() == loaded, "saving again changes nothing further")
 
+        // The switch order is the menu's order, kept in this file: an upgrade starts from the order
+        // the menu already showed, and a new order is saved and read back as a relaunch reads it.
+        check(loaded.inMenuOrder.map(\.id) == ["a", "b", "c", "d", "e"], "after an upgrade the switch order is the order the menu showed")
+        guard let reordered = loaded.moved(loaded[2], by: -1, organization: true)?.moved(loaded[3], by: -1, organization: false),
+              let reorderedData = try? AccountsFile.encode(reordered), (try? reorderedData.write(to: copy)) != nil,
+              let reread = (try? Data(contentsOf: copy)).flatMap(AccountsFile.decode)?.labelled() else {
+            return check(false, "a new order saves and loads")
+        }
+        check(reread.inMenuOrder.map(\.id) == ["d", "a", "c", "b", "e"], "a new order is saved and comes back after a relaunch")
+        let afterMove = Dictionary(uniqueKeysWithValues: rows(reorderedData).map { ($0["id"] ?? "", $0) })
+        check(after.allSatisfy { old in old.allSatisfy { $0.key == "name" || afterMove[old["id"] ?? ""]?[$0.key] == $0.value } },
+              "moving rows keeps every login folder, keychain item, organization, color and chosen name")
+        check(Set(reread.map(\.label)) == Set(loaded.map(\.label)), "and every row is still called what it was")
+
         var settings = AppSettings()
         settings.display = .gaugePercent
         settings.autoSwitch = false
@@ -437,9 +481,9 @@ struct RulesTests {
         check(MeterRule.gauge(.fiveHour, fiveHour: fh, weekly: wk) == fh && MeterRule.gauge(.weekly, fiveHour: fh, weekly: wk) == wk,
               "otherwise it follows the chosen limit")
 
-        // Out and most room: an account without a 5-hour window is judged on its weekly meter alone.
+        // Out: an account without a 5-hour window is judged on its weekly meter alone.
         check(picked(decide(row("busy", 40, 70), [row("ultra", nil, 30), row("max", 35, 5)])) == "ultra",
-              "no 5-hour window: its weekly meter is its room")
+              "no 5-hour window: a weekly meter with room makes it a target")
         check(row("ultra", nil, 100).isOut(at: now) && !row("ultra", nil, 99.6).isOut(at: now), "and its weekly meter alone makes it out")
         check(picked(decide(row("busy", 40, 70), [row("ultra", nil, 100), row("max", 35, 5)])) == "max", "never to it when its weekly is full")
 

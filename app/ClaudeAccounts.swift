@@ -1356,18 +1356,12 @@ final class Store: ObservableObject {
         guard settings.autoSwitch, switching == nil else { return }
         inUse = logWatcher.poll()
         let now = Date()
-        let outUntil = AutoSwitchLog.outUntil(now: now)
-        let all = accounts.map { acct in
-            var fiveHour: UsageWindow?, weekly: UsageWindow?, taken: Date?
-            if case .ok(_, let fh, let wk, _) = states[acct.id] { fiveHour = fh; weekly = wk; taken = readAt[acct.id] }
-            return SwitchCandidate(acct, fiveHour: fiveHour, weekly: weekly, readAt: taken,
-                                   needsSignIn: states[acct.id]?.needsSignIn ?? false, outUntil: outUntil[acct.id])
-        }
+        let all = candidates(now: now)
         let current = accounts.row(for: inUse).flatMap { row in all.first { $0.id == row.id } }
         // The log's stops belong to the account it names, which is `inUse`.
         let stopped = !logWatcher.log.stoppedByLimit.isEmpty
         // Only look for Claude's process once Claude has stopped a chat; `ps` is the reliable check.
-        let decision = AutoSwitchRule.decide(current: current, others: all, enabled: true, limitStopped: stopped,
+        let decision = AutoSwitchRule.decide(current: current, rows: all, enabled: true, limitStopped: stopped,
                                              claudeRunning: stopped && !ClaudeApp.pids().isEmpty,
                                              lastAttempt: AutoSwitchLog.lastAttempt(), now: now)
         switch decision {
@@ -1386,6 +1380,26 @@ final class Store: ObservableObject {
             flash(reason, for: 10)
             runSwitch(notify: reason) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1) }
         }
+    }
+
+    /// Every row as the auto-switch rule sees it, from what the menu shows, in menu order.
+    private func candidates(now: Date) -> [SwitchCandidate] {
+        let outUntil = AutoSwitchLog.outUntil(now: now)
+        return accounts.inMenuOrder.map { acct in
+            var fiveHour: UsageWindow?, weekly: UsageWindow?, taken: Date?
+            if case .ok(_, let fh, let wk, _) = states[acct.id] { fiveHour = fh; weekly = wk; taken = readAt[acct.id] }
+            return SwitchCandidate(acct, fiveHour: fiveHour, weekly: weekly, readAt: taken,
+                                   needsSignIn: states[acct.id]?.needsSignIn ?? false, outUntil: outUntil[acct.id])
+        }
+    }
+
+    /// The row the next automatic switch would go to, which the menu marks; nil while auto-switch
+    /// is off or Claude uses no row this app knows.
+    var nextRow: String? {
+        guard settings.autoSwitch, let row = accounts.row(for: inUse) else { return nil }
+        let all = candidates(now: Date())
+        guard let current = all.first(where: { $0.id == row.id }) else { return nil }
+        return AutoSwitchRule.next(after: current, in: all, now: Date())?.id
     }
 
     /// Turn auto-switch on or off. Turning it on is a click by the person at the Mac, so this is
@@ -1483,6 +1497,13 @@ final class Store: ObservableObject {
             all[i].color = color
         }
         save(all)
+    }
+
+    /// Move a row one place up (`step` -1) or down (`step` 1) in the menu, which is the order
+    /// auto-switch tries the rows in: an organization entry among its account's organizations,
+    /// any other row with its whole account.
+    func move(_ acct: AccountRecord, by step: Int, organization: Bool) {
+        if let moved = AccountStore.load().moved(acct, by: step, organization: organization) { save(moved) }
     }
 
     private func save(_ all: [AccountRecord]) {
@@ -1905,6 +1926,29 @@ struct ColorMenu: View {
     }
 }
 
+/// Move Up and Move Down in a row's menu: the menu's order is the order auto-switch tries rows in.
+/// Each is nil where the row is already at that end; with neither, the menu leaves them out.
+struct RowMoves {
+    let up: (() -> Void)?
+    let down: (() -> Void)?
+
+    @ViewBuilder var items: some View {
+        if up != nil || down != nil {
+            Divider()
+            Button("Move Up") { up?() }.disabled(up == nil)
+            Button("Move Down") { down?() }.disabled(down == nil)
+        }
+    }
+}
+
+/// The mark on the row the next automatic switch goes to.
+struct NextMark: View {
+    var body: some View {
+        Text("Next").font(.caption.weight(.semibold)).foregroundStyle(.tint)
+            .help("Auto-switch goes here next when Claude stops a chat for usage. Move rows up or down from their ··· menu to change the order.")
+    }
+}
+
 /// The name above an account's organizations: clicking it shows or folds them away, and its own
 /// menu renames or recolors the account.
 struct AccountHeader: View {
@@ -1913,10 +1957,13 @@ struct AccountHeader: View {
     let shown: Bool
     /// Folded away while one of the organizations is in use.
     let inUse: Bool
+    /// Folded away while the next automatic switch goes to one of the organizations.
+    let next: Bool
     let canReset: Bool
     let onFold: () -> Void
     let onRename: (String) -> Void
     let onRecolor: (String) -> Void
+    let move: RowMoves
     @State private var renaming = false
 
     var body: some View {
@@ -1931,6 +1978,7 @@ struct AccountHeader: View {
                         Text(name).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
                         Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                             .rotationEffect(.degrees(shown ? 90 : 0))
+                        if next { NextMark() }
                         Spacer()
                         if inUse { Badge(text: "In use") }
                     }
@@ -1945,6 +1993,7 @@ struct AccountHeader: View {
                 Button("Rename…") { renaming = true }
                 if canReset { Button("Reset Name") { onRename("") } }
                 ColorMenu(current: color, onPick: onRecolor)
+                move.items
             } label: { Image(systemName: "ellipsis") }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .accessibilityLabel("\(name) options")
@@ -1956,6 +2005,8 @@ struct AccountRow: View {
     let account: AccountRecord
     let state: AccountState?
     let inUse: Bool
+    /// The next automatic switch goes to this row.
+    let next: Bool
     /// Another organization of this row's account is the one in use.
     let sameAccountInUse: Bool
     let canSwitch: Bool
@@ -1971,6 +2022,7 @@ struct AccountRow: View {
     let canReset: Bool
     let onRecolor: (String) -> Void
     let onRemove: () -> Void
+    let move: RowMoves
     /// Set when the row is shown under its account's name as one of that account's organizations.
     var organizationTitle: String? = nil
     private var organizationEntry: Bool { organizationTitle != nil }
@@ -2004,6 +2056,7 @@ struct AccountRow: View {
                     if case .ok(let plan?, _, _, _) = state {
                         Text(plan.capitalized).font(.caption).foregroundStyle(.secondary)
                     }
+                    if next { NextMark() }
                 }
                 Spacer()
                 // One fixed box for both, so "In use" and Switch share a center line and right edge.
@@ -2036,6 +2089,7 @@ struct AccountRow: View {
                     Button("Rename…") { renaming = true }
                     if canReset { Button("Reset Name") { onRename("") } }
                     if !organizationEntry { ColorMenu(current: account.color, onPick: onRecolor) }
+                    move.items
                     Divider()
                     Button("Sign in again…", action: onSignIn)
                     Button("Remove…") { confirmingRemove = true }
@@ -2113,7 +2167,7 @@ struct MenuContent: View {
                     Divider()
                     Toggle("Auto-Switch When Out", isOn: Binding(get: { store.settings.autoSwitch },
                                                                 set: { store.setAutoSwitch($0) }))
-                        .help("When Claude stops a chat because the account in use is out of usage, quit Claude, reopen it on the account with the most room, and send \u{201C}resume\u{201D} to the chats that were working")
+                        .help("When Claude stops a chat because the account in use is out of usage, quit Claude, reopen it on the next account in this menu's order that has room, and send \u{201C}resume\u{201D} to the chats that were working")
                     Toggle("Open at Login", isOn: Binding(get: { store.openAtLogin }, set: { _ in store.toggleOpenAtLogin() }))
                     Divider()
                     Button("Quit Claude Accounts") { NSApp.terminate(nil) }.keyboardShortcut("q")
@@ -2164,25 +2218,29 @@ struct MenuContent: View {
             }
             // One entry per account; an account in several organizations lists each beneath its
             // name, shown until its name is clicked to fold them away.
-            ForEach(store.accounts.groupedByAccount(), id: \.[0].id) { group in
+            let groups = store.accounts.groupedByAccount()
+            let next = store.nextRow
+            ForEach(groups, id: \.[0].id) { group in
                 if group.count == 1 {
-                    row(group[0], in: group)
+                    row(group[0], in: group, next: next)
                 } else {
                     let account = group[0].accountUuid ?? group[0].id
                     let shown = store.settings.showsOrganizations(of: account)
                     VStack(alignment: .leading, spacing: 0) {
                         AccountHeader(name: group[0].name, color: group[0].color, shown: shown,
                                       inUse: !shown && group.contains(where: store.isInUse),
+                                      next: !shown && group.contains { $0.id == next },
                                       canReset: store.accounts.renamed(group[0], to: "", organization: false).first { $0.id == group[0].id }?.name != group[0].name,
                                       onFold: {
                                           withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { store.setShowsOrganizations(of: account, !shown) }
                                       },
                                       onRename: { store.rename(group[0], to: $0, organization: false) },
-                                      onRecolor: { store.recolor(group[0], $0) })
+                                      onRecolor: { store.recolor(group[0], $0) },
+                                      move: moves(group[0], organization: false))
                         .padding(.horizontal, 10).padding(.top, 8).padding(.bottom, shown ? 0 : 8)
                         if shown {
                             ForEach(group) { acct in
-                                row(acct, in: group, organizationTitle: acct.organization)
+                                row(acct, in: group, next: next, organizationTitle: acct.organization)
                             }
                         }
                     }
@@ -2197,8 +2255,8 @@ struct MenuContent: View {
         }
     }
 
-    private func row(_ acct: AccountRecord, in group: [AccountRecord], organizationTitle: String? = nil) -> some View {
-        AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct),
+    private func row(_ acct: AccountRecord, in group: [AccountRecord], next: String?, organizationTitle: String? = nil) -> some View {
+        AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct), next: acct.id == next,
                    sameAccountInUse: !store.isInUse(acct) && acct.accountUuid != nil && acct.accountUuid == store.inUse?.account,
                    canSwitch: LoginSlot.exists(acct),
                    // The status line already says it once Set Up was clicked.
@@ -2214,7 +2272,17 @@ struct MenuContent: View {
                    // An account's color is shared by all of its organizations.
                    onRecolor: { store.recolor(acct, $0) },
                    onRemove: { store.remove(acct) },
+                   move: moves(acct, organization: organizationTitle != nil),
                    organizationTitle: organizationTitle)
+    }
+
+    /// Move Up and Move Down for a row's menu, each nil where the row is already at that end.
+    private func moves(_ acct: AccountRecord, organization: Bool) -> RowMoves {
+        func step(_ by: Int) -> (() -> Void)? {
+            store.accounts.moved(acct, by: by, organization: organization) == nil ? nil
+                : { store.move(acct, by: by, organization: organization) }
+        }
+        return RowMoves(up: step(-1), down: step(1))
     }
 
 
@@ -2432,8 +2500,8 @@ private func drawWarning(centeredAt mid: NSPoint) {
 /// - `--switch <account>` runs the menu's switch. The account can be named by id, label, email,
 ///   or the email's first part; none of them is printed back beyond the label.
 /// - `--auto-switch` runs the menu's Auto-Switch rule once: if Claude's log shows it stopped a
-///   chat of the account in use for usage, it switches to the set-up account with the most room,
-///   judged on the usage the menu last read.
+///   chat of the account in use for usage, it switches to the next row in the menu's order that
+///   is set up and has room, judged on the usage the menu last read.
 /// - `--unattended` (implied by `--auto-switch`) answers Claude's quit prompt with Quit anyway.
 /// - `--dry-run` prints every check and what would happen, and changes nothing.
 /// - `--detach` starts the same command in its own session, so it outlives Claude quitting even
@@ -2549,7 +2617,7 @@ enum Entry {
     private static func printDecision(accounts: [AccountRecord]) -> (AutoSwitchRule.Decision, SwitchCandidate?) {
         var log = LogFollower()
         log.read(ClaudeApp.currentRunText())
-        let all = UsageCache.candidates(accounts, UsageCache.load())
+        let all = UsageCache.candidates(accounts.inMenuOrder, UsageCache.load())
         let current = accounts.row(for: log.identity).flatMap { row in all.first { $0.id == row.id } }
         let now = Date()
         func describe(_ c: SwitchCandidate) -> String {
@@ -2564,13 +2632,20 @@ enum Entry {
             return ", not set up: " + SetUpRule.step(for: row, claudeAccount: log.identity?.account)
         }
         print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
-        print("In use:             \(current.map { "\($0.name): \(describe($0))" } ?? "an account this app doesn't know")")
+        print("In use:             \(current?.name ?? "an account this app doesn't know")")
         print("Stopped for usage:  \(log.stoppedByLimit.count) chat\(log.stoppedByLimit.count == 1 ? "" : "s") in Claude's log")
-        for c in all where c.id != current?.id { print("Other:              \(c.name): \(describe(c))") }
+        // The menu's order is the switch order: down from the row in use, wrapping round to the top.
+        let next = current.flatMap { AutoSwitchRule.next(after: $0, in: all, now: now) }
+        print("Switch order, as in the menu:")
+        for (n, c) in all.enumerated() {
+            let mark = c.id == current?.id ? "in use, " : c.id == next?.id ? "next, " : ""
+            print("  \(n + 1). \(c.name): \(mark)\(describe(c))")
+        }
+        print("Next switch goes to: \(next?.name ?? (current == nil ? "no row: Claude's account isn't one this app knows" : "no row: none other is set up with room"))")
         let last = AutoSwitchLog.lastAttempt()
         print("Last auto attempt:  \(last.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "never")")
         let stopped = !log.stoppedByLimit.isEmpty
-        let decision = AutoSwitchRule.decide(current: current, others: all, enabled: true, limitStopped: stopped,
+        let decision = AutoSwitchRule.decide(current: current, rows: all, enabled: true, limitStopped: stopped,
                                              claudeRunning: stopped && !ClaudeApp.pids().isEmpty, lastAttempt: last, now: now)
         switch decision {
         case .stay(let why): print("Decision:           stay. \(why)")
