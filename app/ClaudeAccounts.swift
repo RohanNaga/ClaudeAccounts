@@ -2105,8 +2105,7 @@ struct Card<Content: View>: View {
         let quiet = contrast == .increased ? Color.primary.opacity(0.55) : Color(nsColor: .tertiaryLabelColor)
         content
             .background(shape.fill(fill))
-            .overlay(shape.strokeBorder(edge ?? quiet,
-                                        lineWidth: edge == nil ? 1 : 1.5))
+            .overlay(shape.strokeBorder(edge ?? quiet, lineWidth: edge == nil ? 1 : 1.5))
             .clipShape(shape)
     }
 }
@@ -2460,7 +2459,7 @@ struct MenuContent: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(10)
             }
-            // One entry per account; an account in several organizations lists each beneath its
+            // One card per account; an account in several organizations lists each beneath its
             // name, shown until its name is clicked to fold them away.
             let groups = store.accounts.groupedByAccount()
             let next = store.nextRow
