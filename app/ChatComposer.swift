@@ -290,6 +290,11 @@ struct ChatResumer {
     var clock = ResumeClock()
     /// Try again on ResumeRule's schedule; off for a single pass.
     var retrying = true
+    /// False once another switch has started: Claude may be quitting or showing another account,
+    /// so this resume types nothing more and stops.
+    var current: () -> Bool = { true }
+
+    static let superseded = "another switch started"
 
     static let noReply = "it was sent \u{201C}\(ResumeRule.message)\u{201D}, but no reply started"
 
@@ -315,12 +320,18 @@ struct ChatResumer {
         while true {
             trace(pass == 1 ? "pass 1" : "pass \(pass), \(Int(clock.now().timeIntervalSince(started) / 60)) min after the first")
             for chat in chats where results[chat.id]?.settled != true {
+                guard current() else { break }
                 guard let tried = await attempt(chat, pass: pass, sentBefore: sentTo.contains(chat.id)) else { continue }
                 if tried.sent { sentTo.insert(chat.id) }
                 results[chat.id] = tried.result
                 trace("\(chat.title): \(Self.describe(tried.result))")
             }
             let left = chats.filter { results[$0.id]?.settled != true }.count
+            guard current() else {
+                trace("\(Self.superseded); this resume stops")
+                for chat in chats where results[chat.id]?.settled != true { results[chat.id] = .notResumed(Self.superseded) }
+                break
+            }
             guard retrying, ResumeRule.tryAgain(left: left, elapsed: clock.now().timeIntervalSince(started)) else { break }
             progress("\(left) stopped chat\(left == 1 ? " isn't" : "s aren't") running yet; trying again in a minute…")
             await clock.sleep(ResumeRule.retryEvery)
@@ -354,6 +365,7 @@ struct ChatResumer {
         var readyAt: Date?
         var said = ""
         while true {
+            guard current() else { return (.notResumed(Self.superseded), false) }
             let screen = ChatComposer.screen(session: chat.id, in: pids())
             let state = Self.describe(screen)
             if state != said { trace(state); said = state }

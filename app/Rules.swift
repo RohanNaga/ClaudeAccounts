@@ -197,17 +197,64 @@ extension String {
 }
 
 /// How a row with no saved Claude login gets one, said the same way in the row and in --dry-run.
-/// The app saves a row's login when Claude leaves that account and organization, so the one-time
-/// step is to open it in Claude: choose the organization from your name at the bottom of Claude's
-/// sidebar when Claude is already signed in to the account, else sign in to it first.
+/// The app saves a row's login once Claude has held that account and organization steadily
+/// (SaveRule), so the one-time step is to open it in Claude: choose the organization from your name
+/// at the bottom of Claude's sidebar when Claude is already signed in to the account, else sign in
+/// to it first. An organization Claude refuses each time it opens needs a new sign-in there.
 enum SetUpRule {
-    static func step(for row: AccountRecord, claudeAccount: String?) -> String {
+    /// How long a set-up waits for the person to sign in to Claude and hold the row's account.
+    static let signInWait: TimeInterval = 10 * 60
+
+    static func step(for row: AccountRecord, claudeAccount: String?, refused: Bool = false) -> String {
+        if refused {
+            return "Claude asks for a new sign-in to this organization each time. Choose it in Claude, sign in, "
+                + "and stay on it for a minute to save it"
+        }
         let signedIn = row.accountUuid != nil && row.accountUuid == claudeAccount
         let org = row.orgName == nil && row.orgLabel == nil ? "this organization"
             : row.organization == "Individual" ? "your individual organization" : row.organization
         return signedIn ? "choose \(org) once in Claude, from your name at the bottom of its sidebar"
                         : "click Set Up, then sign in to it in Claude"
     }
+
+    enum Verdict: Equatable { case waiting, confirmed(Identity), other(Identity?) }
+
+    /// Where a set-up of `row` stands, from Claude's log since it reopened at `started`: confirmed
+    /// once Claude has held the row's own account and organization steadily; ended without it once
+    /// Claude holds another account steadily or the wait runs out. Another organization of the same
+    /// account is a step on the way (the person still chooses the organization), not an end.
+    static func verdict(for row: AccountRecord, in rows: [AccountRecord], log: LogFollower, started: Date, now: Date) -> Verdict {
+        if let held = log.steady(at: now) {
+            if rows.row(for: held)?.id == row.id { return .confirmed(held) }
+            if held.account != row.accountUuid { return .other(held) }
+        }
+        return now.timeIntervalSince(started) >= signInWait ? .other(log.identity) : .waiting
+    }
+
+    /// The one sentence for a set-up that ended without Claude on the row: which account Claude is
+    /// on, and that the row is still not set up. Nothing was saved or moved.
+    static func notSetUp(_ row: AccountRecord, seen: Identity?, in rows: [AccountRecord]) -> String {
+        let on: String
+        if let seen, let known = rows.row(for: seen), known.id != row.id { on = "is signed in as \(known.label)" }
+        else if let seen, seen.account == row.accountUuid { on = "is on another organization of \(row.name)" }
+        else if seen != nil { on = "is signed in to an account this app doesn't know" }
+        else { on = "isn't signed in" }
+        return "Claude \(on), so \(row.label) is still not set up."
+    }
+}
+
+/// When the in-use row's Claude login is saved. Claude names an organization as soon as it opens
+/// it; an organization that wants a fresh sign-in is then refused (session_stale_relogin) and
+/// Claude falls back to the account's individual organization, 4 to 21 s later in Claude's log. A
+/// login saved inside that window is one the organization refuses, so a login is saved only once
+/// Claude has held its account and organization steadily, while it runs and again at switch-away.
+enum SaveRule {
+    /// Three times the slowest fall-back seen (21 s).
+    static let steadyHold: TimeInterval = 60
+
+    /// A saved login counts only if it was saved after Claude last refused its organization: an
+    /// older one is the sign-in Claude now calls too old.
+    static func counts(savedAt: Date, refusedAt: Date?) -> Bool { refusedAt.map { savedAt > $0 } ?? true }
 }
 
 // MARK: - Usage
@@ -481,6 +528,12 @@ struct LogFollower {
     private(set) var stoppedByLimit: Set<String> = []
     /// Chats whose turn was still running when Claude quit.
     private(set) var cutByQuit: Set<String> = []
+    /// When Claude named the identity it holds, from the line's time; named again after a refusal
+    /// of its organization, the hold starts over. Nil while it holds none.
+    private(set) var heldSince: Date?
+    /// When Claude last refused each organization's sign-in as too old, by organization id. Kept
+    /// across runs and sign-outs: it is about the organization's sign-in, not the run.
+    private(set) var refusedAt: [String: Date] = [:]
 
     /// Claude's own messages for a turn refused because the account is out of usage.
     static let outOfUsage = [
@@ -497,9 +550,16 @@ struct LogFollower {
                let account = Self.field(line, "accountId="), let org = Self.field(line, "orgId=") {
                 let named = Identity(account: account, org: org)
                 if named != identity { stoppedByLimit = []; cutByQuit = [] }
+                let refusedSinceHeld = heldSince.flatMap { since in refusedAt[org].map { $0 >= since } } ?? false
+                if named != identity || heldSince == nil || refusedSinceHeld { heldSince = Self.time(line) }
                 identity = named
+            } else if line.contains("session_stale_relogin"), let at = Self.time(line) {
+                // Claude names the organization it refuses, as orgId= or inside its cache key.
+                if let org = Self.field(line, "orgId=") { refusedAt[org] = at }
+                if let org = identity?.org, line.contains(org) { refusedAt[org] = at }
             } else if line.contains("Starting app {") || Self.signsOut(line) {
                 identity = nil
+                heldSince = nil
                 stoppedByLimit = []
                 cutByQuit = []
             } else if line.contains("[CCD CycleHealth] ") {
@@ -515,6 +575,26 @@ struct LogFollower {
             }
         }
     }
+
+    /// The identity whose login may be saved at `now`: Claude has held it for SaveRule.steadyHold
+    /// and has not refused its organization since it named it.
+    func steady(at now: Date) -> Identity? {
+        guard let identity, let since = heldSince, now.timeIntervalSince(since) >= SaveRule.steadyHold else { return nil }
+        if let refused = refusedAt[identity.org], refused >= since { return nil }
+        return identity
+    }
+
+    /// A line's time: Claude starts each line with its local "yyyy-MM-dd HH:mm:ss".
+    static func time<S: StringProtocol>(_ line: S) -> Date? {
+        timeFormat.date(from: String(line.prefix(19)))
+    }
+
+    private static let timeFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
 
     /// Who Claude says it is after reading `text`, starting from `start`.
     static func identity(after text: String, from start: Identity?) -> Identity? {

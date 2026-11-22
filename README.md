@@ -75,8 +75,12 @@ xattr -dr com.apple.quarantine "/Applications/Claude Accounts.app"
    Claude's sign-in page; paste the code it shows back into the app. Repeat for
    each account.
 2. For every account other than the one Claude is signed in to, click
-   **Set Up**. Claude reopens at its sign-in page; sign in as that account. This
-   saves the account's Claude login without signing the others out.
+   **Set Up**. Claude reopens at its sign-in page; sign in as that account. Once
+   Claude has stayed on it for a minute, the app saves its Claude login without
+   signing the others out, and brings over the chats that were open in the
+   previous row the way a switch does. If you end up signed in to another
+   account, nothing is saved or moved, Claude stays open, and the menu says which
+   account Claude is on.
 3. From then on, **Switch** on any row moves Claude, and your open chats, to
    that account.
 4. Auto-switch is on from the start: when Claude stops a chat because the
@@ -111,8 +115,8 @@ header's `···` menu turns the automatic part off.
 | `~/Library/Application Support/ClaudeAccounts` | Everything the app keeps: accounts, per-account Claude Code logins (each pinned to its organization by a `forceLoginOrgUUID` line in its own `settings.json`), saved Claude logins, backups, settings, the usage cache | Always |
 | Login keychain | One `Claude Code-credentials-<hash>` item per account, written by Claude Code | Adding or signing in to an account |
 | `api.anthropic.com/api/oauth/usage` | Each account's usage, about once a minute | Always; this is the only network traffic |
-| `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Only on **Switch** or **Set Up**, with Claude quit; the folder names in `claude-code-sessions` are also read to find an account's other organizations |
-| `~/Library/Logs/Claude/main.log` | Read only, to see which account Claude reports and which chats Claude stopped because that account is out of usage | Always |
+| `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Written only on **Switch** or **Set Up**, with Claude quit; the account in use's cookie rows and keys are also read (copied into its saved login) once Claude has stayed on it for a minute; the folder names in `claude-code-sessions` are also read to find an account's other organizations |
+| `~/Library/Logs/Claude/main.log` | Read only, to see which account Claude reports and since when, which organization sign-ins Claude refused as too old, and which chats Claude stopped because that account is out of usage | Always |
 | Claude's quit prompt, through Accessibility | Reads whether the prompt is open; presses **Quit anyway** | Only on an automatic or `--unattended` switch |
 | `claude://code/continue?session=…` and the chat's message box, through Accessibility | Opens each chat the quit or the limit stopped; types "resume" into that chat's own message box and presses its Send button, once; tries a chat that isn't running again every minute for 30 minutes while nobody uses the Mac | After every switch Claude confirms |
 
@@ -136,7 +140,10 @@ your open Code sessions along:
    changing anything.
 3. It saves the current account's login (its claude.ai cookie rows and three
    settings keys), but only if Claude's log and settings agree on who that
-   account is.
+   account is and Claude had stayed on it for a minute. An organization that
+   wants a new sign-in is refused by Claude a few seconds after it opens, and
+   Claude falls back to your individual organization; a login saved in that
+   window would be the refused one, so the row keeps its last saved login.
 4. It loads the target account's saved login.
 5. It moves each open session's record (not archived, not a scheduled run) from
    `claude-code-sessions/<account>/<org>` to the target's folder. The session
@@ -289,7 +296,10 @@ Code's `forceLoginOrgUUID` setting in that login's own folder.
 
 One step is Claude's own: choose the new organization once from your name at
 the bottom of Claude's sidebar. The app saves that organization's Claude login
-then, and from that point Switch and auto-switch can move to it.
+once Claude has stayed on it for a minute, and from then on Switch and
+auto-switch can move to it. If Claude asks for a new sign-in to that
+organization each time, its row says so: choose it in Claude, sign in, and stay
+on it for a minute.
 
 ## Command line
 

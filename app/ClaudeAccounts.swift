@@ -477,11 +477,17 @@ enum ClaudeApp {
         return text.range(of: "Starting app {", options: .backwards).map { String(text[$0.lowerBound...]) } ?? text
     }
 
-    /// Who Claude is signed in as now, or was when it last quit, from its own log.
-    static func currentIdentity() -> Identity? {
-        let older = readLines(logDir.appendingPathComponent("main1.log"), from: 0).text
-        return LogFollower.identity(after: readLines(log, from: 0).text, from: LogFollower.identity(after: older, from: nil))
+    /// Claude's last two log files read in order: who it is now (or was when it last quit), since
+    /// when, and the organizations whose sign-in it refused.
+    static func currentLog() -> LogFollower {
+        var follower = LogFollower()
+        follower.read(readLines(logDir.appendingPathComponent("main1.log"), from: 0).text)
+        follower.read(readLines(log, from: 0).text)
+        return follower
     }
+
+    /// Who Claude is signed in as now, or was when it last quit, from its own log.
+    static func currentIdentity() -> Identity? { currentLog().identity }
 
     // MARK: Sessions
 
@@ -547,10 +553,10 @@ enum LoginSlot {
     static let cookieSchemaVersion = "24"
 
     static func dir(_ acct: AccountRecord) -> URL { Paths.stateDir.appendingPathComponent("slots/\(acct.id)") }
-    static func exists(_ acct: AccountRecord) -> Bool {
-        FileManager.default.fileExists(atPath: dir(acct).appendingPathComponent("cookies.db").path)
-            && identity(acct) != nil
-    }
+
+    /// The row has a saved login Claude still accepts. `refused` is when Claude last refused each
+    /// organization's sign-in (LogFollower.refusedAt).
+    static func exists(_ acct: AccountRecord, refused: [String: Date]) -> Bool { identity(acct, refused: refused) != nil }
 
     /// `orgFolder` is the organization whose sessions Claude showed when this login was saved.
     struct Meta: Codable { var account: String?; var orgFolder: String?; var config: [String: String] }
@@ -561,9 +567,17 @@ enum LoginSlot {
     }
 
     /// Where the row's sessions go: set only when the saved login is the row's own account and
-    /// organization.
-    static func identity(_ acct: AccountRecord) -> Identity? {
+    /// organization, and was saved after Claude last refused that organization's sign-in.
+    static func identity(_ acct: AccountRecord, refused: [String: Date]) -> Identity? {
+        guard let id = savedIdentity(acct),
+              let savedAt = (try? dir(acct).appendingPathComponent("slot.json").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+              SaveRule.counts(savedAt: savedAt, refusedAt: refused[id.org]) else { return nil }
+        return id
+    }
+
+    private static func savedIdentity(_ acct: AccountRecord) -> Identity? {
         guard let uuid = acct.accountUuid, let meta = meta(acct), let org = meta.orgFolder,
+              FileManager.default.fileExists(atPath: dir(acct).appendingPathComponent("cookies.db").path),
               meta.config["lastKnownAccountUuid"] == uuid, (meta.account ?? uuid) == uuid,
               acct.orgUuid == nil || acct.orgUuid == org else { return nil }
         return Identity(account: uuid, org: org)
@@ -579,20 +593,35 @@ enum LoginSlot {
         await sqlite(db, "select value from meta where key='version';").out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Save the login Claude just quit with. `identity` is who Claude said it was, and the
-    /// settings must agree, so a login is never saved under the wrong account.
-    static func capture(_ acct: AccountRecord, as identity: Identity) async throws {
-        guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed }
+    /// Save the login Claude holds, at switch-away with Claude quit or, `whileRunning`, once Claude
+    /// has held it steadily (SaveRule). `identity` is who Claude says it is; the row must be that
+    /// account and organization (or the account's one unnamed row) and Claude's settings must
+    /// agree, so a login is never filed under another row. While Claude runs, its cookie file must
+    /// sit still through the copy, and Claude must still hold `identity` right before the write.
+    static func capture(_ acct: AccountRecord, as identity: Identity, whileRunning: Bool = false) async throws {
+        guard acct.accountUuid == identity.account, acct.orgUuid == nil || acct.orgUuid == identity.org else {
+            throw SwitchError.inconsistent
+        }
+        if !whileRunning { guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed } }
         guard ClaudeApp.savedAccount() == identity.account else { throw SwitchError.inconsistent }
         let fm = FileManager.default
         let slot = dir(acct)
         try fm.createDirectory(at: slot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let source = slot.appendingPathComponent("source.db")
         for f in [source, slot.appendingPathComponent("source.db-journal")] { try? fm.removeItem(at: f) }
+        func stamp() -> (size: UInt64, modified: Date)? {
+            guard let a = try? fm.attributesOfItem(atPath: ClaudeApp.cookies.path),
+                  let size = (a[.size] as? NSNumber)?.uint64Value, let modified = a[.modificationDate] as? Date else { return nil }
+            return (size, modified)
+        }
+        // Copied while Claude runs, the file must have sat still for 2 s and through the copy.
+        let before = stamp()
+        if whileRunning { guard let b = before, Date().timeIntervalSince(b.modified) >= 2 else { throw SwitchError.cookiesChanging } }
         try fm.copyItem(at: ClaudeApp.cookies, to: source)
         if fm.fileExists(atPath: ClaudeApp.cookiesJournal.path) {
             try fm.copyItem(at: ClaudeApp.cookiesJournal, to: slot.appendingPathComponent("source.db-journal"))
         }
+        if whileRunning { guard let a = stamp(), let b = before, a == b else { throw SwitchError.cookiesChanging } }
         defer { for f in [source, slot.appendingPathComponent("source.db-journal")] { try? fm.removeItem(at: f) } }
         guard await sqlite(source, "pragma quick_check;").out.trimmingCharacters(in: .whitespacesAndNewlines) == "ok" else {
             throw SwitchError.sqlite("Claude's cookie database failed its integrity check")
@@ -610,6 +639,11 @@ enum LoginSlot {
         var keys: [String: String] = [:]
         for k in configKeys { if let v = config[k] as? String { keys[k] = v } }
         let meta = try JSONEncoder().encode(Meta(account: identity.account, orgFolder: identity.org, config: keys))
+        if whileRunning {
+            guard ClaudeApp.currentIdentity() == identity, ClaudeApp.savedAccount() == identity.account else {
+                throw SwitchError.inconsistent
+            }
+        }
         _ = try fm.replaceItemAt(slot.appendingPathComponent("cookies.db"), withItemAt: fresh)
         try meta.write(to: slot.appendingPathComponent("slot.json"), options: .atomic)
         for f in ["cookies.db", "slot.json"] { try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: slot.appendingPathComponent(f).path) }
@@ -622,7 +656,7 @@ enum LoginSlot {
         var values: [String: String] = [:]
         var insert = ""
         if let acct {
-            guard identity(acct) != nil, let meta = meta(acct) else { throw SwitchError.noSlot(acct.label) }
+            guard savedIdentity(acct) != nil, let meta = meta(acct) else { throw SwitchError.noSlot(acct.label) }
             values = meta.config
             insert = "ATTACH \(quoted(dir(acct).appendingPathComponent("cookies.db"))) AS s; "
         }
@@ -640,7 +674,7 @@ enum LoginSlot {
 }
 
 enum SwitchError: LocalizedError {
-    case noSlot(String), notSignedIn, cookieSchemaChanged, sqlite(String), quitFailed, inconsistent
+    case noSlot(String), notSignedIn, cookieSchemaChanged, sqlite(String), quitFailed, inconsistent, cookiesChanging
     var errorDescription: String? {
         switch self {
         case .noSlot(let name): return "\(name) isn't set up in Claude yet; use Set Up on its row first."
@@ -649,6 +683,7 @@ enum SwitchError: LocalizedError {
         case .sqlite(let err): return "Could not update Claude's cookies: \(err.prefix(160))"
         case .quitFailed: return "Claude is running again, so nothing more was changed."
         case .inconsistent: return "Claude's settings name a different account than its log. Open and quit Claude once, then try again."
+        case .cookiesChanging: return "Claude was writing its cookies, so its login is saved on a later try."
         }
     }
 }
@@ -666,6 +701,27 @@ struct SwitchOutcome: Codable {
     var notResumed: [String] = []
     /// The row the message tells the person how to set up in Claude.
     var setsUp: String? = nil
+    /// Another switch started while this one's chats were being resumed; its outcome is the news.
+    var superseded = false
+
+    /// Fold the resume's reports into a confirmed switch's outcome.
+    mutating func add(_ reports: [ChatResumer.Report], answered: Bool) {
+        let running = reports.filter(\.result.runningAgain)
+        resumed = running.map(\.chat.title)
+        notResumed = reports.compactMap { r -> String? in
+            switch r.result {
+            case .notResumed(let why): return "\(r.chat.title) (\(why))"
+            case .draft: return "\(r.chat.title) (it has an unsent draft)"
+            case .running, .sent: return nil
+            }
+        }
+        superseded = reports.contains { $0.result == .notResumed(ChatResumer.superseded) }
+        if !reports.isEmpty {
+            message += " " + ResumeRule.summary(running: running.count, of: reports.count)
+        } else if answered {
+            message += " No stopped chat was found; check the ones that were working."
+        }
+    }
 
     /// The message, naming the stopped chats still not running and what they need: a new message,
     /// since Retry on the failed one starts the chat over.
@@ -676,17 +732,30 @@ struct SwitchOutcome: Codable {
     }
 }
 
+/// Whether a switch started from the menu has finished the switch itself and moved on to resuming.
+@MainActor final class SwitchPhase { var freed = false }
+
 /// One switch at a time across the menu and `--switch`, which are separate processes.
 struct SwitchLock {
     let fd: Int32
 
-    static func acquire() -> SwitchLock? {
+    /// `newGeneration` false takes the lock without overtaking a resume, for a save that switches nothing.
+    static func acquire(newGeneration: Bool = true) -> SwitchLock? {
         try? FileManager.default.createDirectory(at: Paths.stateDir, withIntermediateDirectories: true)
-        let fd = open(Paths.stateDir.appendingPathComponent(".switch.lock").path, O_CREAT | O_RDWR, 0o600)
+        let fd = open(url.path, O_CREAT | O_RDWR, 0o600)
         guard fd >= 0 else { return nil }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); return nil }
+        // A new generation for every switch, so a resume can tell that another one started.
+        guard newGeneration else { return SwitchLock(fd: fd) }
+        ftruncate(fd, 0)
+        _ = Data(UUID().uuidString.utf8).withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, 0) }
         return SwitchLock(fd: fd)
     }
+
+    static var url: URL { Paths.stateDir.appendingPathComponent(".switch.lock") }
+
+    /// The generation the last switch wrote when it took the lock.
+    static func generation() -> String { (try? String(contentsOf: url, encoding: .utf8)) ?? "" }
 
     func release() { flock(fd, LOCK_UN); close(fd) }
 }
@@ -721,17 +790,58 @@ enum SwitchEngine {
     /// sessions into the target's folder, reopen Claude, and keep the result only once Claude
     /// reports the target account; anything else is undone.
     /// `unattended` answers Claude's quit prompt with Quit anyway, for a switch with nobody at the Mac.
+    /// The lock covers the switch itself and is released before the stopped chats are resumed, so
+    /// another Switch works during the resume; `switched` hears the switch's own outcome then. A
+    /// resume that another switch overtakes stops and types nothing more (`ChatResumer.current`).
     static func run(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool = false,
-                    progress: @escaping Progress) async -> SwitchOutcome {
-        await locked(unattended: unattended) {
+                    progress: @escaping Progress, switched: @escaping (SwitchOutcome) async -> Void = { _ in }) async -> SwitchOutcome {
+        await lockedThenResume(unattended: unattended, progress: progress, switched: switched) {
             await switchLocked(to: target, accounts: accounts, unattended: unattended, progress: progress)
         }
     }
 
-    /// Quit Claude, save the current account's login, and reopen Claude at its sign-in page, so
-    /// another account can sign in without signing the current one out.
-    static func setUp(_ target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
-        await locked(unattended: false) { await setUpLocked(target, accounts: accounts, progress: progress) }
+    /// Run `body` under the lock, then, with the lock released, resume the chats it leaves.
+    private static func lockedThenResume(unattended: Bool, progress: @escaping Progress,
+                                         switched: @escaping (SwitchOutcome) async -> Void,
+                                         _ body: () async -> (outcome: SwitchOutcome, resume: PendingResume?)) async -> SwitchOutcome {
+        var pending: PendingResume?
+        var outcome = await locked(unattended: unattended) {
+            let done = await body()
+            pending = done.resume
+            return done.outcome
+        }
+        guard let pending else { return outcome }
+        await switched(outcome)
+        let reports = await pending.run(progress: progress)
+        outcome.add(reports, answered: pending.answered)
+        return outcome
+    }
+
+    /// Chats a confirmed switch moved that were working, to resume once the lock is released.
+    struct PendingResume {
+        let chats: [MovedChat]
+        let folder: URL
+        let reopenedAt: Double
+        let answered: Bool
+        /// The lock's generation when this switch held it; another switch changes it.
+        let generation: String
+
+        func run(progress: @escaping Progress) async -> [ChatResumer.Report] {
+            var resumer = ChatResume.resumer(in: folder, reopenedAt: reopenedAt, progress: progress)
+            resumer.current = { SwitchLock.generation() == generation }
+            return await resumer.run(chats)
+        }
+    }
+
+    /// Get Claude onto a row with no saved login, then save it and bring over the previous row's
+    /// chats the way a switch does. Another account needs a sign-in: Claude quits, the current
+    /// login is saved, and Claude reopens at its sign-in page, so no account is signed out. Another
+    /// organization of the account Claude is on needs only Claude's own organization switch.
+    static func setUp(_ target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress,
+                      switched: @escaping (SwitchOutcome) async -> Void = { _ in }) async -> SwitchOutcome {
+        await lockedThenResume(unattended: false, progress: progress, switched: switched) {
+            await setUpLocked(target, accounts: accounts, progress: progress)
+        }
     }
 
     private static func locked(unattended: Bool, _ body: () async -> SwitchOutcome) async -> SwitchOutcome {
@@ -746,19 +856,19 @@ enum SwitchEngine {
     }
 
     private static func switchLocked(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool,
-                                     progress: @escaping Progress) async -> SwitchOutcome {
-        guard let want = LoginSlot.identity(target) else {
-            return SwitchOutcome(ok: false, message: SwitchError.noSlot(target.label).localizedDescription)
+                                     progress: @escaping Progress) async -> (outcome: SwitchOutcome, resume: PendingResume?) {
+        guard let want = LoginSlot.identity(target, refused: ClaudeApp.currentLog().refusedAt) else {
+            return (SwitchOutcome(ok: false, message: SwitchError.noSlot(target.label).localizedDescription), nil)
         }
         if ClaudeApp.currentIdentity() == want {
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
-            return SwitchOutcome(ok: true, message: "Already using \(target.label).", confirmed: true)
+            return (SwitchOutcome(ok: true, message: "Already using \(target.label).", confirmed: true), nil)
         }
         let current: (acct: AccountRecord, id: Identity)?
-        let answered: Bool
+        let answered: Bool, steady: Bool
         switch await prepare(accounts: accounts, unattended: unattended, progress: progress) {
-        case .failure(let e): return e.outcome
-        case .success(let p): current = p.current; answered = p.answered
+        case .failure(let e): return (e.outcome, nil)
+        case .success(let p): current = p.current; answered = p.answered; steady = p.steady
         }
         // Claude has quit, so its log ends with the run that just finished: the chats it stopped
         // for usage and the ones whose turn the quit cut off are the chats that were working.
@@ -766,10 +876,11 @@ enum SwitchEngine {
         ended.read(ClaudeApp.currentRunText())
         guard var journal = startJournal(from: current?.id, to: want) else {
             await ClaudeApp.launch()
-            return SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed.")
+            return (SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed."), nil)
         }
         do {
-            if let current {
+            // A login Claude hasn't held steadily may be one its organization refuses; the row keeps its last one.
+            if let current, steady {
                 progress("Saving \(current.acct.label)…")
                 try await LoginSlot.capture(current.acct, as: current.id)
             }
@@ -778,10 +889,21 @@ enum SwitchEngine {
             if let current { try moveSessions(from: current.id, to: want, journal: &journal) }
         } catch {
             _ = await rollback(journal, unattended: unattended, progress: progress)
-            return SwitchOutcome(ok: false, message: "Switch failed and was undone: \(error.localizedDescription)")
+            return (SwitchOutcome(ok: false, message: "Switch failed and was undone: \(error.localizedDescription)"), nil)
         }
+        return await reopen(as: want, label: target.label, journal: journal, ended: ended, answered: answered,
+                            unattended: unattended, accounts: accounts, progress: progress) { n in
+            "Switched to \(target.label), with \(n) open session\(n == 1 ? "" : "s")."
+        }
+    }
 
-        progress("Opening Claude as \(target.label)…")
+    /// Reopen Claude as `want` once its files are written under `journal`, and keep the result only
+    /// once Claude reports it; anything else is undone. The chats that moved in and were working in
+    /// the run `ended` (stopped by a usage limit or cut off by the quit) are left to resume.
+    private static func reopen(as want: Identity, label: String, journal: SwitchJournal, ended: LogFollower, answered: Bool,
+                               unattended: Bool, accounts: [AccountRecord], progress: @escaping Progress,
+                               message: (Int) -> String) async -> (outcome: SwitchOutcome, resume: PendingResume?) {
+        progress("Opening Claude as \(label)…")
         let movedRecords = journal.moves.map { URL(fileURLWithPath: $0.to) }.filter { $0.deletingLastPathComponent().path == ClaudeApp.folder(want).path }
         let chats = movedRecords.compactMap(ChatResume.chat)
         let mark = ClaudeApp.logMark()
@@ -794,84 +916,147 @@ enum SwitchEngine {
                                               to: URL(fileURLWithPath: journal.backup).appendingPathComponent("switch.json"))
             pruneBackups()
             let working = ResumeRule.toResume(chats, stoppedByLimit: ended.stoppedByLimit, cutByQuit: ended.cutByQuit)
-            let reports = await ChatResume.run(working, in: ClaudeApp.folder(want), reopenedAt: reopenedAt, progress: progress)
-            let resumed = reports.filter(\.result.runningAgain)
-            let waiting = reports.compactMap { r -> String? in
-                switch r.result {
-                case .notResumed(let why): return "\(r.chat.title) (\(why))"
-                case .draft: return "\(r.chat.title) (it has an unsent draft)"
-                case .running, .sent: return nil
-                }
+            var outcome = SwitchOutcome(ok: true, message: message(chats.count), moved: chats.count, confirmed: true, backup: journal.backup)
+            guard !working.isEmpty else {
+                outcome.add([], answered: answered)
+                return (outcome, nil)
             }
-            var message = "Switched to \(target.label), with \(chats.count) open session\(chats.count == 1 ? "" : "s")."
-            if !reports.isEmpty {
-                message += " " + ResumeRule.summary(running: resumed.count, of: reports.count)
-            } else if answered {
-                message += " No stopped chat was found; check the ones that were working."
-            }
-            return SwitchOutcome(ok: true, message: message, moved: chats.count, confirmed: true, backup: journal.backup,
-                                 resumed: resumed.map(\.chat.title), notResumed: waiting)
+            return (outcome, PendingResume(chats: working, folder: ClaudeApp.folder(want), reopenedAt: reopenedAt,
+                                           answered: answered, generation: SwitchLock.generation()))
         case .signedOut:
             let undone = await rollback(journal, unattended: unattended, progress: progress)
-            return SwitchOutcome(ok: false, message: "The saved login of \(target.label) has expired, so "
-                                 + (undone ? "the switch was undone. Use Set Up on its row to sign in again."
-                                           : "Claude opened signed out. Quit Claude and click Switch to undo."))
+            return (SwitchOutcome(ok: false, message: "The saved login of \(label) has expired, so "
+                                  + (undone ? "the switch was undone. Use Set Up on its row to sign in again."
+                                            : "Claude opened signed out. Quit Claude and click Switch to undo.")), nil)
         case .other(let seen):
             let who = accounts.row(for: seen)?.label ?? (seen == nil ? "no account" : "another account")
-            let what = seen?.account == want.account ? "\(target.label) in another organization than its saved login"
-                                                     : "\(who) instead of \(target.label)"
+            let what = seen?.account == want.account ? "\(label) in another organization than its saved login"
+                                                     : "\(who) instead of \(label)"
             let undone = await rollback(journal, unattended: unattended, progress: progress)
-            return SwitchOutcome(ok: false, message: "Claude opened as \(what), so "
-                                 + (undone ? "the switch was undone." : "the switch needs undoing: quit Claude and click Switch."))
+            return (SwitchOutcome(ok: false, message: "Claude opened as \(what), so "
+                                  + (undone ? "the switch was undone." : "the switch needs undoing: quit Claude and click Switch.")), nil)
         }
     }
 
     /// The instruction for an organization Claude can open without a sign-in, said the same way
     /// after Set Up and after adding the organization.
     static func setUpStep(_ row: AccountRecord, claudeAccount: String?) -> String {
-        SetUpRule.step(for: row, claudeAccount: claudeAccount).capitalizedFirst + ". Claude Accounts saves it then, and Switch works for it after that."
+        SetUpRule.step(for: row, claudeAccount: claudeAccount).capitalizedFirst + ". Claude Accounts saves it once Claude stays on it for a minute, and Switch works for it after that."
     }
 
-    private static func setUpLocked(_ target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress) async -> SwitchOutcome {
-        // Another organization of the account Claude is signed in to needs no sign-in, only Claude's
-        // own organization switch; the next switch away from it saves that organization's login.
-        if let now = ClaudeApp.currentIdentity(), now.account == target.accountUuid {
-            return SwitchOutcome(ok: true, message: setUpStep(target, claudeAccount: now.account), setsUp: target.id)
-        }
-        let current: (acct: AccountRecord, id: Identity)?
-        switch await prepare(accounts: accounts, unattended: false, progress: progress) {
-        case .failure(let e): return e.outcome
-        case .success(let p): current = p.current
-        }
-        guard let journal = startJournal(from: current?.id, to: nil) else {
+    private static func setUpLocked(_ target: AccountRecord, accounts: [AccountRecord], progress: @escaping Progress)
+        async -> (outcome: SwitchOutcome, resume: PendingResume?) {
+        let start = ClaudeApp.currentLog()
+        // The row in use before the set-up, whose chats come along once Claude holds the target.
+        let previous: (acct: AccountRecord, id: Identity)?
+        // The run whose chats were working, and who Claude is when the wait for the target starts.
+        let ended: LogFollower, base: LogFollower
+        let answered: Bool
+        let mark: ClaudeApp.LogMark
+        let instruction: String
+        if let now = start.identity, now.account == target.accountUuid {
+            // Another organization of the account Claude is signed in to needs no sign-in, only
+            // Claude's own organization switch, so Claude stays open.
+            previous = accounts.row(for: now).map { ($0, now) }
+            ended = start
+            base = start
+            answered = false
+            mark = ClaudeApp.logMark()
+            instruction = SetUpRule.step(for: target, claudeAccount: now.account).capitalizedFirst
+        } else {
+            let ready: Prepared
+            switch await prepare(accounts: accounts, unattended: false, progress: progress) {
+            case .failure(let e): return (e.outcome, nil)
+            case .success(let p): ready = p
+            }
+            previous = ready.current
+            answered = ready.answered
+            var run = LogFollower()
+            run.read(ClaudeApp.currentRunText())
+            ended = run
+            base = LogFollower()
+            guard let journal = startJournal(from: previous?.id, to: nil) else {
+                await ClaudeApp.launch()
+                return (SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed."), nil)
+            }
+            do {
+                if let previous, ready.steady {
+                    progress("Saving \(previous.acct.label)…")
+                    try await LoginSlot.capture(previous.acct, as: previous.id)
+                }
+                try await LoginSlot.load(nil)
+            } catch {
+                _ = await rollback(journal, progress: progress)
+                return (SwitchOutcome(ok: false, message: "Set up failed and was undone: \(error.localizedDescription)"), nil)
+            }
+            SwitchJournal.clear()
+            mark = ClaudeApp.logMark()
             await ClaudeApp.launch()
-            return SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed.")
+            // Signed in to the account, Claude still opens its last organization, so name the one to choose.
+            instruction = "Sign in to Claude as \(target.label)" + (accounts.otherOrganizations(of: target).isEmpty ? ""
+                : ", then " + SetUpRule.step(for: target, claudeAccount: target.accountUuid))
+        }
+        let moving = previous.map { ClaudeApp.openSessionRecords(in: ClaudeApp.folder($0.id)).count } ?? 0
+        let bring = previous.map { moving > 0 ? " and brings over the sessions open in \($0.acct.label)" : "" } ?? ""
+        progress(instruction + ". Claude Accounts saves it once Claude stays on it for a minute\(bring).")
+
+        let started = Date()
+        var seen = base
+        var verdict = SetUpRule.Verdict.waiting
+        while verdict == .waiting {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            seen = base
+            seen.read(ClaudeApp.logText(since: mark))
+            verdict = SetUpRule.verdict(for: target, in: accounts, log: seen, started: started, now: Date())
+        }
+        // Not on the row: nothing is saved under it, nothing moves, and Claude is left as it is.
+        guard case .confirmed(let want) = verdict else {
+            return (SwitchOutcome(ok: false, message: SetUpRule.notSetUp(target, seen: seen.identity, in: accounts), setsUp: target.id), nil)
+        }
+        guard let previous, previous.id != want, moving > 0 else {
+            // Nothing to bring over, so the login is saved with Claude left open.
+            do {
+                try await LoginSlot.capture(target, as: want, whileRunning: true)
+                return (SwitchOutcome(ok: true, message: "Set up \(target.label).", confirmed: true), nil)
+            } catch {
+                return (SwitchOutcome(ok: false, message: "\(error.localizedDescription) Claude Accounts tries again while Claude stays on \(target.label).",
+                                      setsUp: target.id), nil)
+            }
+        }
+        // Bring the previous row's chats over the way a switch does: quit, save, move, reopen.
+        let ready: Prepared
+        switch await prepare(accounts: accounts, unattended: false, progress: progress) {
+        case .failure(let e): return (e.outcome, nil)
+        case .success(let p): ready = p
+        }
+        guard ready.current?.id == want, ready.steady else {
+            await ClaudeApp.launch()
+            return (SwitchOutcome(ok: false, message: SetUpRule.notSetUp(target, seen: ready.current?.id, in: accounts), setsUp: target.id), nil)
+        }
+        guard var journal = startJournal(from: previous.id, to: want) else {
+            await ClaudeApp.launch()
+            return (SwitchOutcome(ok: false, message: "Could not back up Claude's files, so the sessions open in \(previous.acct.label) stayed there."), nil)
         }
         do {
-            if let current {
-                progress("Saving \(current.acct.label)…")
-                try await LoginSlot.capture(current.acct, as: current.id)
-            }
-            try await LoginSlot.load(nil)
+            progress("Saving \(target.label)…")
+            try await LoginSlot.capture(target, as: want)
+            try moveSessions(from: previous.id, to: want, journal: &journal)
         } catch {
             _ = await rollback(journal, progress: progress)
-            return SwitchOutcome(ok: false, message: "Set up failed and was undone: \(error.localizedDescription)")
+            return (SwitchOutcome(ok: false, message: "Set up failed and was undone: \(error.localizedDescription)"), nil)
         }
-        // The sign-in itself happens in Claude; the next switch away from it saves the login.
-        SwitchJournal.clear()
-        await ClaudeApp.launch()
-        // Signed in to the account, Claude still opens its last organization, so name the one to choose.
-        let organization = accounts.otherOrganizations(of: target).isEmpty ? ""
-            : ", then " + SetUpRule.step(for: target, claudeAccount: target.accountUuid)
-        return SwitchOutcome(ok: true, message: "Sign in to Claude as \(target.label)\(organization). "
-                             + "Switch then brings over the sessions open in " + (current?.acct.label ?? "the previous account") + ".",
-                             setsUp: target.id)
+        return await reopen(as: want, label: target.label, journal: journal, ended: ended, answered: answered || ready.answered,
+                            unattended: false, accounts: accounts, progress: progress) { n in
+            "Set up \(target.label), with the \(n) open session\(n == 1 ? "" : "s") from \(previous.acct.label)."
+        }
     }
 
     /// Who Claude was when it quit, and whether its quit prompt was answered for nobody.
     struct Prepared {
         var current: (acct: AccountRecord, id: Identity)?
         var answered = false
+        /// Claude had held `current` steadily when it quit (SaveRule), so its login may be saved.
+        var steady = false
     }
 
     /// Resolve who Claude is, quit it, and check again once it has gone. Nothing is written here.
@@ -891,12 +1076,13 @@ enum SwitchEngine {
         case .failed: return .failure(OutcomeError("Claude didn't quit, so nothing was changed."))
         }
         // Read again after the quit: this is the state Claude's files were flushed in.
-        guard let id = ClaudeApp.currentIdentity() else { return .success(Prepared(current: nil, answered: answered)) }
+        let log = ClaudeApp.currentLog()
+        guard let id = log.identity else { return .success(Prepared(current: nil, answered: answered)) }
         guard id == before, ClaudeApp.savedAccount() == id.account, let acct = accounts.row(for: id) else {
             await ClaudeApp.launch()
             return .failure(OutcomeError(SwitchError.inconsistent.localizedDescription))
         }
-        return .success(Prepared(current: (acct, id), answered: answered))
+        return .success(Prepared(current: (acct, id), answered: answered, steady: log.steady(at: Date()) == id))
     }
 
     struct OutcomeError: Error {
@@ -1050,10 +1236,6 @@ enum ChatResume {
             retrying: retrying)
     }
 
-    static func run(_ wanted: [MovedChat], in folder: URL, reopenedAt: Double,
-                    progress: @escaping SwitchEngine.Progress) async -> [ChatResumer.Report] {
-        await resumer(in: folder, reopenedAt: reopenedAt, progress: progress).run(wanted)
-    }
 }
 
 /// A macOS notification, for a switch nobody watched, posted by the app itself so it shows the
@@ -1143,7 +1325,7 @@ enum UsageCache {
     }
 
     /// The auto-switch rule's view of each row, from cached readings.
-    static func candidates(_ accounts: [AccountRecord], _ entries: [String: Entry]) -> [SwitchCandidate] {
+    static func candidates(_ accounts: [AccountRecord], _ entries: [String: Entry], refused: [String: Date]) -> [SwitchCandidate] {
         let outUntil = AutoSwitchLog.outUntil()
         return accounts.map { acct in
             let e = entries[acct.id]
@@ -1151,16 +1333,17 @@ enum UsageCache {
             return SwitchCandidate(acct, fiveHour: e?.fiveHour, weekly: e?.weekly,
                                    readAt: hasReading ? (e?.readAt ?? e?.polledAt) : nil,
                                    needsSignIn: e?.loginExpiresAt.map { $0.timeIntervalSinceNow < API.signInWarning } ?? false,
-                                   outUntil: outUntil[acct.id])
+                                   hasSavedLogin: LoginSlot.exists(acct, refused: refused), outUntil: outUntil[acct.id])
         }
     }
 }
 
 extension SwitchCandidate {
     /// A row with its unrounded meters and their resets.
-    init(_ acct: AccountRecord, fiveHour: UsageWindow?, weekly: UsageWindow?, readAt: Date?, needsSignIn: Bool, outUntil: Date?) {
+    init(_ acct: AccountRecord, fiveHour: UsageWindow?, weekly: UsageWindow?, readAt: Date?, needsSignIn: Bool,
+         hasSavedLogin: Bool, outUntil: Date?) {
         self.init(id: acct.id, name: acct.label, fiveHour: fiveHour?.utilization, weekly: weekly?.utilization,
-                  readAt: readAt, needsSignIn: needsSignIn, hasSavedLogin: LoginSlot.exists(acct),
+                  readAt: readAt, needsSignIn: needsSignIn, hasSavedLogin: hasSavedLogin,
                   fiveHourResetsAt: fiveHour?.resetsAt, weeklyResetsAt: weekly?.resetsAt, outUntil: outUntil)
     }
 }
@@ -1261,11 +1444,43 @@ final class Store: ObservableObject {
                 self?.checkAccessibility()
                 self?.refresh()
                 self?.considerAutoSwitch()
+                self?.saveSteadyLogin()
             }
         }
     }
 
     func isInUse(_ acct: AccountRecord) -> Bool { accounts.row(for: inUse)?.id == acct.id }
+
+    /// The row has a saved login Claude still accepts.
+    func hasSavedLogin(_ acct: AccountRecord) -> Bool { LoginSlot.exists(acct, refused: logWatcher.log.refusedAt) }
+
+    /// Claude has refused this row's organization's sign-in as too old.
+    func isRefused(_ acct: AccountRecord) -> Bool { acct.orgUuid.map { logWatcher.log.refusedAt[$0] != nil } ?? false }
+
+    /// The hold whose login was saved, so each steady hold is saved once.
+    private var savedHold: String?
+
+    /// Save the in-use row's login once Claude has held its account and organization steadily
+    /// (SaveRule), with Claude left open, so a row is saved without a switch away from it. Never
+    /// while a switch or set-up runs; the lock is taken without overtaking a resume.
+    private func saveSteadyLogin() {
+        let log = logWatcher.log
+        guard switching == nil, let held = log.steady(at: Date()), let since = log.heldSince,
+              let row = accounts.row(for: held) else { return }
+        let hold = "\(row.id) \(since.timeIntervalSince1970)"
+        guard savedHold != hold, SwitchJournal.load() == nil, let lock = SwitchLock.acquire(newGeneration: false) else { return }
+        savedHold = hold
+        Task {
+            defer { lock.release() }
+            do {
+                try await LoginSlot.capture(row, as: held, whileRunning: true)
+            } catch SwitchError.cookiesChanging {
+                self.savedHold = nil  // tried again on the next tick
+            } catch {}
+            self.objectWillChange.send()
+            self.endSetUpMessageIfDone()
+        }
+    }
 
     /// Opening the menu calls this; accounts that aren't due yet keep their cached reading.
     func refreshIfStale() { refresh() }
@@ -1378,7 +1593,7 @@ final class Store: ObservableObject {
             toldNowhereFor = nil
             AutoSwitchLog.started(now, leaving: current.id, outUntil: AutoSwitchRule.outUntil(leaving: current, now: now))
             flash(reason, for: 10)
-            runSwitch(notify: reason) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1) }
+            runSwitch(notify: reason) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1, switched: $2) }
         }
     }
 
@@ -1389,7 +1604,8 @@ final class Store: ObservableObject {
             var fiveHour: UsageWindow?, weekly: UsageWindow?, taken: Date?
             if case .ok(_, let fh, let wk, _) = states[acct.id] { fiveHour = fh; weekly = wk; taken = readAt[acct.id] }
             return SwitchCandidate(acct, fiveHour: fiveHour, weekly: weekly, readAt: taken,
-                                   needsSignIn: states[acct.id]?.needsSignIn ?? false, outUntil: outUntil[acct.id])
+                                   needsSignIn: states[acct.id]?.needsSignIn ?? false, hasSavedLogin: hasSavedLogin(acct),
+                                   outUntil: outUntil[acct.id])
         }
     }
 
@@ -1454,7 +1670,7 @@ final class Store: ObservableObject {
     private func endSetUpMessageIfDone() {
         guard let id = messageEndsWithSetUp else { return }
         guard let row = accounts.first(where: { $0.id == id }) else { return closeMessage() }
-        if isInUse(row) || LoginSlot.exists(row) { closeMessage() }
+        if hasSavedLogin(row) { closeMessage() }
     }
 
     func closeMessage() {
@@ -1519,21 +1735,35 @@ final class Store: ObservableObject {
 
     /// One click: quit Claude, save the current account's login, load the target's, move the
     /// open Code sessions into the target's folder, and reopen Claude as the target.
-    func switchTo(_ target: AccountRecord) { runSwitch { await SwitchEngine.run(to: target, accounts: $0, progress: $1) } }
+    func switchTo(_ target: AccountRecord) { runSwitch { await SwitchEngine.run(to: target, accounts: $0, progress: $1, switched: $2) } }
 
     /// Reopen Claude at its sign-in page for an account that has no saved Claude login yet.
-    func setUp(_ target: AccountRecord) { runSwitch { await SwitchEngine.setUp(target, accounts: $0, progress: $1) } }
+    func setUp(_ target: AccountRecord) { runSwitch { await SwitchEngine.setUp(target, accounts: $0, progress: $1, switched: $2) } }
 
     /// `notify` posts the outcome as a notification after that reason, for a switch auto-switch
-    /// started with nobody watching.
+    /// started with nobody watching. Switch is free again once the switch itself is done
+    /// (`switched`); the resume that follows shows its steps on the status line, and its outcome
+    /// is shown unless another switch overtook it.
     private func runSwitch(notify reason: String? = nil,
-                           _ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress) async -> SwitchOutcome) {
+                           _ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress,
+                                              @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome) {
         guard switching == nil else { return }
         switching = "Starting…"
         let all = accounts
+        let phase = SwitchPhase()
         Task {
-            let outcome = await body(all) { step in Task { @MainActor in self.switching = step } }
-            self.switching = nil
+            let outcome = await body(all, { step in
+                Task { @MainActor in if phase.freed { self.keep(step) } else { self.switching = step } }
+            }, { switched in
+                await MainActor.run {
+                    phase.freed = true
+                    self.switching = nil
+                    self.keep(switched.message)
+                    self.inUse = self.logWatcher.poll()
+                }
+            })
+            if !phase.freed { self.switching = nil }
+            guard !outcome.superseded else { return }
             self.show(outcome)
             self.inUse = self.logWatcher.poll()
             if let reason {
@@ -2166,7 +2396,7 @@ struct MenuContent: View {
             .padding(.horizontal, 10).padding(.top, 6).padding(.bottom, 4)
 
             if let step = store.switching {
-                HStack(spacing: 6) { ProgressView().controlSize(.mini); Text(step).font(.caption) }
+                HStack(spacing: 6) { ProgressView().controlSize(.mini); Text(step).font(.caption).fixedSize(horizontal: false, vertical: true) }
                     .padding(.horizontal, 10).padding(.bottom, 4)
             }
             if let msg = store.message {
@@ -2247,10 +2477,11 @@ struct MenuContent: View {
     private func row(_ acct: AccountRecord, in group: [AccountRecord], next: String?, organizationTitle: String? = nil) -> some View {
         AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct), next: acct.id == next,
                    sameAccountInUse: !store.isInUse(acct) && acct.accountUuid != nil && acct.accountUuid == store.inUse?.account,
-                   canSwitch: LoginSlot.exists(acct),
+                   canSwitch: store.hasSavedLogin(acct),
                    // The status line already says it once Set Up was clicked.
-                   setUpStep: LoginSlot.exists(acct) || store.isInUse(acct) || store.messageEndsWithSetUp == acct.id ? nil
-                       : SetUpRule.step(for: acct, claudeAccount: store.inUse?.account),
+                   setUpStep: store.hasSavedLogin(acct) || (store.isInUse(acct) && !store.isRefused(acct))
+                       || store.messageEndsWithSetUp == acct.id ? nil
+                       : SetUpRule.step(for: acct, claudeAccount: store.inUse?.account, refused: store.isRefused(acct)),
                    switchBusy: store.switching != nil,
                    onSwitch: { store.switchTo(acct) }, onSetUp: { store.setUp(acct) },
                    retryAt: store.retryAt[acct.id],
@@ -2604,9 +2835,8 @@ enum Entry {
     /// `--auto-switch`: the rule's inputs and answer, from Claude's log and the usage the menu
     /// last saved. Returns the row in use too, which a switch leaves out of usage.
     private static func printDecision(accounts: [AccountRecord]) -> (AutoSwitchRule.Decision, SwitchCandidate?) {
-        var log = LogFollower()
-        log.read(ClaudeApp.currentRunText())
-        let all = UsageCache.candidates(accounts.inMenuOrder, UsageCache.load())
+        let log = ClaudeApp.currentLog()
+        let all = UsageCache.candidates(accounts.inMenuOrder, UsageCache.load(), refused: log.refusedAt)
         let current = accounts.row(for: log.identity).flatMap { row in all.first { $0.id == row.id } }
         let now = Date()
         func describe(_ c: SwitchCandidate) -> String {
@@ -2618,7 +2848,8 @@ enum Entry {
         }
         func setUp(_ c: SwitchCandidate) -> String {
             guard !c.hasSavedLogin, let row = accounts.first(where: { $0.id == c.id }) else { return "" }
-            return ", not set up: " + SetUpRule.step(for: row, claudeAccount: log.identity?.account)
+            return ", not set up: " + SetUpRule.step(for: row, claudeAccount: log.identity?.account,
+                                                     refused: row.orgUuid.map { log.refusedAt[$0] != nil } ?? false)
         }
         print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
         print("In use:             \(current?.name ?? "an account this app doesn't know")")
@@ -2656,8 +2887,9 @@ enum Entry {
         print("Auto-switch:      \(AppSettings.load().autoSwitch ? "on, when Claude stops a chat at the usage limit" : "off")")
         print("Accessibility:    \(QuitPrompt.trusted ? "granted to this process" : "not granted to this process")")
         print("Notifications:    \(Notify.permission())")
+        let refused = ClaudeApp.currentLog().refusedAt
         for acct in accounts {
-            print("Saved login \(acct.label): \(LoginSlot.identity(acct).map { "organization \($0.org.prefix(8))" } ?? "none")")
+            print("Saved login \(acct.label): \(LoginSlot.identity(acct, refused: refused).map { "organization \($0.org.prefix(8))" } ?? "none")")
         }
         exit(0)
     }
@@ -2668,7 +2900,7 @@ enum Entry {
         var problems: [String] = []
         let current = ClaudeApp.currentIdentity()
         let currentAcct = accounts.row(for: current)
-        let want = LoginSlot.identity(target)
+        let want = LoginSlot.identity(target, refused: ClaudeApp.currentLog().refusedAt)
         print("Target:             \(target.label)")
         print("Target saved login: \(want.map { "organization \($0.org.prefix(8))" } ?? "none")")
         if want == nil { problems.append(SwitchError.noSlot(target.label).localizedDescription) }

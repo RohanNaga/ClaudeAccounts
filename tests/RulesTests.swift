@@ -19,6 +19,8 @@ struct RulesTests {
     static func main() {
         autoSwitch()
         claudeLog()
+        savingLogins()
+        settingUp()
         quitWatch()
         organizations()
         labels()
@@ -200,6 +202,90 @@ struct RulesTests {
               "a turn closed by the quit is cut off; another failure is not")
         check(LogFollower.identity(after: [start, signIn(accountA, orgA), "Navigated to /logout"].joined(separator: "\n"), from: nil) == nil,
               "a sign-out clears who Claude is")
+    }
+
+    // MARK: Saving a login
+
+    static let personalOrg = "dddddddd-0000-4000-8000-000000000004"
+
+    static func logLine(_ time: String, _ text: String) -> String { "2026-01-01 \(time) [info] \(text)" }
+
+    static func named(_ time: String, _ account: String, _ org: String) -> String {
+        logLine(time, "[LocalSessionManager] Initialization succeeded \u{2014} accountId=\(account), orgId=\(org), existingSessions=0")
+    }
+
+    static func refused(_ time: String, _ account: String, _ org: String) -> [String] {
+        [logLine(time, "[oauth-v2] fresh exchange failed for orgId=\(org) (session_stale_relogin)"),
+         logLine(time, "[oauth-v2] short-circuiting fresh /authorize on latched session_stale_relogin for cacheKey=acct:\(account)|\(org):x")]
+    }
+
+    static func clock(_ time: String) -> Date { LogFollower.time("2026-01-01 \(time)")! }
+
+    /// An organization that wants a fresh sign-in: Claude names it, refuses it, and falls back to
+    /// the account's individual organization a few seconds later. Its login is never saved, and a
+    /// login saved before the refusal no longer counts; the individual organization is saved once
+    /// Claude has held it for a minute.
+    static func savingLogins() {
+        let org = Identity(account: accountA, org: orgA), personal = Identity(account: accountA, org: personalOrg)
+        let start = logLine("10:00:00", "Starting app {")
+        let opening = follow([start, named("10:00:05", accountA, orgA)] + refused("10:00:06", accountA, orgA))
+        check(opening.identity == org, "Claude still names the refused organization until it falls back")
+        check(opening.steady(at: clock("10:00:09")) == nil && opening.steady(at: clock("10:30:00")) == nil,
+              "a refused organization is never held steadily, however long Claude names it")
+        let fellBack = follow([start, named("10:00:05", accountA, orgA)] + refused("10:00:06", accountA, orgA)
+                              + [named("10:00:10", accountA, personalOrg)])
+        check(fellBack.steady(at: clock("10:01:09")) == nil, "the individual organization is not saved before a minute")
+        check(fellBack.steady(at: clock("10:01:10")) == personal, "the individual organization is saved once held for a minute")
+        check(SaveRule.steadyHold == 60, "the hold is 60 s, three times the slowest fall-back seen")
+        check(!SaveRule.counts(savedAt: clock("10:00:05"), refusedAt: fellBack.refusedAt[orgA]),
+              "a login saved before Claude refused its organization doesn't count")
+        check(SaveRule.counts(savedAt: clock("10:05:00"), refusedAt: fellBack.refusedAt[orgA])
+              && SaveRule.counts(savedAt: clock("10:05:00"), refusedAt: fellBack.refusedAt[personalOrg]),
+              "a login saved after the refusal counts, and an organization never refused counts")
+        let signedInAgain = follow([start, named("10:00:05", accountA, orgA)] + refused("10:00:06", accountA, orgA)
+                                   + [named("10:00:10", accountA, personalOrg), named("10:20:00", accountA, orgA)])
+        check(signedInAgain.steady(at: clock("10:20:59")) == nil && signedInAgain.steady(at: clock("10:21:00")) == org,
+              "after a new sign-in the organization is saved once Claude holds it for a minute")
+        let renamed = follow([start, named("10:00:05", accountA, orgA), named("10:00:30", accountA, orgA)])
+        check(renamed.steady(at: clock("10:01:05")) == org, "Claude naming the same organization again keeps its hold")
+        check(follow([start, named("10:00:05", accountA, orgA), "2026-01-01 10:00:20 [info] Navigated to /logout"])
+                .steady(at: clock("10:05:00")) == nil, "a sign-out ends the hold")
+    }
+
+    /// Set Up confirms only once Claude holds the row's own account and organization steadily;
+    /// another account held steadily, or the wait running out, ends it without the row.
+    static func settingUp() {
+        let accountC = "eeeeeeee-0000-4000-8000-000000000005", orgB = "ffffffff-0000-4000-8000-000000000006"
+        let orgB2 = "ffffffff-0000-4000-8000-000000000007"
+        let rows = [record("p", account: accountA, org: orgA, name: "Personal"),
+                    record("t", account: accountB, org: orgB, name: "Work", orgName: "Labs"),
+                    record("t2", account: accountB, org: orgB2, name: "Work", orgName: "Research")].labelled()
+        let target = rows[1], started = clock("10:00:00")
+        let start = logLine("10:00:00", "Starting app {")
+        func verdict(_ lines: [String], at time: String) -> SetUpRule.Verdict {
+            SetUpRule.verdict(for: target, in: rows, log: follow([start] + lines), started: started, now: clock(time))
+        }
+        check(verdict([], at: "10:05:00") == .waiting, "it waits while the person signs in")
+        check(verdict([named("10:01:00", accountB, orgB)], at: "10:01:59") == .waiting, "the row's account is not confirmed before a minute")
+        check(verdict([named("10:01:00", accountB, orgB)], at: "10:02:00") == .confirmed(Identity(account: accountB, org: orgB)),
+              "the row's own account and organization held for a minute confirm it")
+        check(verdict([named("10:01:00", accountB, orgB)] + refused("10:01:01", accountB, orgB)
+                      + [named("10:01:05", accountB, orgB2)], at: "10:03:00") == .waiting,
+              "an organization Claude refuses is not confirmed, and the account's other organization is a step on the way")
+        let other = Identity(account: accountA, org: orgA)
+        check(verdict([named("10:01:00", accountA, orgA)], at: "10:02:00") == .other(other),
+              "another account held for a minute ends the set-up without the row")
+        check(verdict([named("10:01:00", accountB, orgB2)], at: "10:10:00") == .other(Identity(account: accountB, org: orgB2)),
+              "the wait running out on another organization ends it")
+        check(SetUpRule.signInWait == 600, "the wait for a sign-in is ten minutes")
+        check(SetUpRule.notSetUp(target, seen: other, in: rows) == "Claude is signed in as Personal, so Work \u{00B7} Labs is still not set up.",
+              "the message names the account Claude is on: got \(SetUpRule.notSetUp(target, seen: other, in: rows))")
+        check(SetUpRule.notSetUp(target, seen: Identity(account: accountC, org: orgA), in: rows)
+                == "Claude is signed in to an account this app doesn't know, so Work \u{00B7} Labs is still not set up.",
+              "an account the app doesn't know is said so")
+        check(SetUpRule.notSetUp(target, seen: nil, in: rows) == "Claude isn't signed in, so Work \u{00B7} Labs is still not set up.",
+              "no sign-in is said so")
+        check(!SetUpRule.notSetUp(target, seen: other, in: rows).contains("@"), "no email in the message")
     }
 
     // MARK: Quit watch
