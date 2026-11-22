@@ -1848,15 +1848,14 @@ let accountColors: [(name: String, hex: String)] = [
 ]
 let presetColors = accountColors.map(\.hex)
 
-/// A small capsule in a row's action slot: "In use", or "Out" for a row at its limit.
+/// The capsule in the action slot of the row in use.
 struct Badge: View {
     let text: String
-    var tint: Color = .accentColor
 
     var body: some View {
         Text(text).font(.caption.weight(.semibold))
             .padding(.horizontal, 8).frame(height: 20)
-            .background(Capsule().fill(tint.opacity(0.18)))
+            .background(Capsule().fill(Color.accentColor.opacity(0.18)))
     }
 }
 
@@ -2029,12 +2028,6 @@ struct AccountRow: View {
     @State private var confirmingRemove = false
     @State private var renaming = false
 
-    /// The meter holding this row at its limit, if any, and its name for the reason shown.
-    private var limit: (window: UsageWindow, name: String)? {
-        guard case .ok(_, let fh, let wk, _) = state, let full = MeterRule.limiting(fiveHour: fh, weekly: wk) else { return nil }
-        return (full, full == wk ? "weekly" : "5-hour")
-    }
-
     /// "Login expires in 5 h" inside the warning window, nil otherwise.
     private var expiryWarning: String? {
         guard case .ok(_, _, _, let expires?) = state, expires.timeIntervalSinceNow < API.signInWarning else { return nil }
@@ -2061,18 +2054,14 @@ struct AccountRow: View {
                 Spacer()
                 // One fixed box for both, so "In use" and Switch share a center line and right edge.
                 Group {
-                    if inUse {
+                    switch RowAction.pick(inUse: inUse, hasSavedLogin: canSwitch) {
+                    case .inUse:
                         Badge(text: "In use")
-                    } else if canSwitch, let limit {
-                        // Switching to an account at its limit would only stop the next chat.
-                        Badge(text: "Out", tint: .secondary)
-                            .help("Out of usage until its \(limit.name) limit resets \(limit.window.resetText)")
-                            .accessibilityLabel("Out of usage")
-                    } else if canSwitch {
+                    case .switchTo:
                         Button("Switch", action: onSwitch).controlSize(.small).disabled(switchBusy)
                             .help(organizationEntry ? "Quit Claude, switch it to this organization, and bring your open sessions along"
                                                     : "Quit Claude, sign it in as this account, and bring your open sessions along")
-                    } else {
+                    case .setUp:
                         Button("Set Up", action: onSetUp).controlSize(.small).disabled(switchBusy)
                             .help(sameAccountInUse
                                   ? "Shows how to save this organization: choose it once in Claude's own account menu"
