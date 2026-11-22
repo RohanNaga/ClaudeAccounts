@@ -21,11 +21,12 @@ name, each with its own usage, and either one can be switched to; click the
 name to fold them away. The account's own individual organization shows as
 **Individual**. **Rename…** on an organization's `···` menu names that
 organization, and the `···` beside the account's name renames the account. A
-row that isn't set up yet says how. An account that is out of usage shows
-**Out** in place of Switch until its limit resets.
+row that isn't set up yet says how. Every other row has a Switch button, even
+for an account that is out of usage: its red meter and reset time say so, and
+the choice is yours. Only the automatic switch skips accounts that are out.
 
 <p align="center">
-  <img src="docs/menu.png" width="355" alt="The ClaudeAccounts menu: an account with two organizations, the one in use marked, the row auto-switch goes to next marked Next, an account out of usage, and Switch on the others, each with its usage">
+  <img src="docs/menu.png" width="355" alt="The ClaudeAccounts menu: an account with two organizations, the one in use marked, the row auto-switch goes to next marked Next, and Switch on every other row, including an account out of usage, each with its usage">
 </p>
 
 > ClaudeAccounts is an independent project. It is not made, endorsed or
