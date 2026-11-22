@@ -37,16 +37,28 @@ final class Fixture: NSObject, NSApplicationDelegate {
         alert.informativeText = "Claude is working in 2 sessions. Quitting now will interrupt that work."
         let titles = other ? ["OK", "Cancel"] : ["Quit anyway", "Wait for Claude", "Cancel"]
         for title in titles { alert.addButton(withTitle: title) }
-        func report(_ response: NSApplication.ModalResponse) {
-            let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
-            print("pressed: \(titles.indices.contains(index) ? titles[index] : "unknown")")
-            exit(0)
-        }
         if asSheet {
-            alert.beginSheetModal(for: window, completionHandler: report)
+            alert.beginSheetModal(for: window) { response in
+                let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+                self.report(titles.indices.contains(index) ? titles[index] : "unknown")
+            }
         } else {
-            report(alert.runModal())
+            // The alert's own window, shown without a modal session so the fixture never takes
+            // keyboard focus from whatever else is running on this Mac.
+            for button in alert.buttons {
+                button.target = self
+                button.action = #selector(pressed(_:))
+            }
+            alert.layout()
+            alert.window.orderFrontRegardless()
         }
+    }
+
+    @objc func pressed(_ sender: NSButton) { report(sender.title) }
+
+    func report(_ title: String) {
+        print("pressed: \(title)")
+        exit(0)
     }
 }
 

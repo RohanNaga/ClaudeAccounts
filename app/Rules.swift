@@ -13,8 +13,8 @@ struct Identity: Equatable, Codable, Sendable {
     let org: String
 }
 
-/// One row in the menu: one Claude login for one account in one organization (workspace).
-/// An account that belongs to two organizations has two rows, one per workspace.
+/// One row in the menu: one Claude login for one account in one organization.
+/// An account that belongs to two organizations has two rows, one per organization.
 struct AccountRecord: Codable, Identifiable, Equatable {
     let id: String
     var name: String
@@ -24,7 +24,7 @@ struct AccountRecord: Codable, Identifiable, Equatable {
     let email: String?
     let accountUuid: String?
     var orgName: String?
-    /// The workspace this row stands for. Older rows lack it until it is filled in on load.
+    /// The organization this row stands for. Older rows lack it until it is filled in on load.
     var orgUuid: String?
 
     var configURL: URL { URL(fileURLWithPath: (configDir as NSString).expandingTildeInPath) }
@@ -34,8 +34,8 @@ struct AccountRecord: Codable, Identifiable, Equatable {
 }
 
 extension Array where Element == AccountRecord {
-    /// The row a Claude identity belongs to: the row for that account and workspace, else the
-    /// account's only row that names no workspace yet.
+    /// The row a Claude identity belongs to: the row for that account and organization, else the
+    /// account's only row that names no organization yet.
     func row(for id: Identity?) -> AccountRecord? {
         guard let id else { return nil }
         if let exact = first(where: { $0.accountUuid == id.account && $0.orgUuid == id.org }) { return exact }
@@ -43,10 +43,37 @@ extension Array where Element == AccountRecord {
         return unnamed.count == 1 ? unnamed[0] : nil
     }
 
-    /// Rows for the same account in other workspaces than `row`.
-    func otherWorkspaces(of row: AccountRecord) -> [AccountRecord] {
+    /// Rows for the same account in other organizations than `row`.
+    func otherOrganizations(of row: AccountRecord) -> [AccountRecord] {
         filter { $0.id != row.id && $0.accountUuid != nil && $0.accountUuid == row.accountUuid }
     }
+
+    /// The rows grouped by account, in the order each account first appears, so the menu shows
+    /// one entry per account with its organizations beneath. A row with no account id stands alone.
+    func groupedByAccount() -> [[AccountRecord]] {
+        var groups: [[AccountRecord]] = []
+        for row in self {
+            if let uuid = row.accountUuid, let i = groups.firstIndex(where: { $0.first?.accountUuid == uuid }) {
+                groups[i].append(row)
+            } else {
+                groups.append([row])
+            }
+        }
+        return groups
+    }
+
+    /// The organizations of `account` that Claude has opened (`opened`, with how many chats
+    /// each holds) but no row stands for yet, most used first.
+    func organizationsToAdd(account: String, opened: [(org: String, chats: Int)]) -> [String] {
+        let added = Set(filter { $0.accountUuid == account }.compactMap(\.orgUuid))
+        return opened.filter { !added.contains($0.org) }.sorted { $0.chats > $1.chats }.map(\.org)
+    }
+}
+
+/// The label for a new row: the email, with the organization added when the account already
+/// has a row, so its two organizations read apart.
+func rowName(email: String?, orgName: String?, accountAlreadyAdded: Bool, fallback: String) -> String {
+    [email ?? fallback, accountAlreadyAdded ? orgName : nil].compactMap { $0 }.joined(separator: " · ")
 }
 
 // MARK: - Auto-switch
@@ -65,49 +92,53 @@ struct SwitchCandidate: Equatable {
 
     /// The fuller of the two meters: whichever runs out first stops the chats.
     var used: Int { Swift.max(fiveHour ?? 0, weekly ?? 0) }
+
+    /// At its limit on either meter: Claude stops every chat on this account until it resets.
+    var out: Bool { used >= AutoSwitchRule.limit }
 }
 
 enum AutoSwitchRule {
-    /// Switch before the meter reaches 100 %: a chat that hits the limit fails its turn, and
-    /// Claude's retry of a failed turn forks the chat's transcript and leaves its subagents behind.
-    static let defaultThreshold = 90
-    static let thresholds = [80, 90, 95]
-    /// No second automatic switch this soon after the last attempt, whatever its outcome, so a
-    /// failed or bouncing switch never quits Claude over and over.
-    static let coolDown: TimeInterval = 30 * 60
+    /// On without touching anything; the header menu turns it off.
+    static let onByDefault = true
+    /// A meter at 100 percent is the limit: the account is out of usage.
+    static let limit = 100
+    /// No second automatic try this soon after the last one, whatever its outcome, so a failed
+    /// switch never quits Claude over and over. Switching back can't flap: the account left
+    /// behind is out, and an account that is out is never a target.
+    static let coolDown: TimeInterval = 10 * 60
     /// A reading older than this is not trusted to start or choose a switch.
     static let freshness: TimeInterval = 15 * 60
 
     enum Decision: Equatable {
         case stay(String)
         case switchTo(id: String, reason: String)
+        /// The account in use is out and no other account has room; worth telling the person once.
+        case nowhere(String)
     }
 
-    /// Whether to switch now, and to which row. `threshold` nil means auto-switch is off.
-    static func decide(current: SwitchCandidate?, others: [SwitchCandidate], threshold: Int?,
+    /// Whether to switch now, and to which row: once the account in use is out of usage, to the
+    /// set-up account with the most room left.
+    static func decide(current: SwitchCandidate?, others: [SwitchCandidate], enabled: Bool,
                        claudeRunning: Bool, lastAttempt: Date?, now: Date) -> Decision {
-        guard let threshold else { return .stay("Auto-switch is off.") }
+        guard enabled else { return .stay("Auto-switch is off.") }
         guard claudeRunning else { return .stay("Claude isn't running.") }
         guard let current else { return .stay("Claude isn't using an account this app knows.") }
         guard fresh(current, now) else { return .stay("No recent usage reading for \(current.name).") }
-        guard current.used >= threshold else {
-            return .stay("\(current.name) is at \(current.used)%, under \(threshold)%.")
-        }
+        guard current.out else { return .stay("\(current.name) is at \(current.used)%; it switches when it runs out.") }
         if let lastAttempt, now.timeIntervalSince(lastAttempt) < coolDown {
-            let until = lastAttempt.addingTimeInterval(coolDown)
-            return .stay("\(current.name) is at \(current.used)%, but the last switch was under \(Int(coolDown / 60)) minutes ago; next try after \(clock(until)).")
+            return .stay("\(current.name) is out, but the last try was under \(Int(coolDown / 60)) minutes ago; next try after \(clock(lastAttempt.addingTimeInterval(coolDown))).")
         }
         let eligible = others.filter {
-            $0.id != current.id && $0.hasSavedLogin && !$0.needsSignIn && fresh($0, now) && $0.used < threshold
+            $0.id != current.id && $0.hasSavedLogin && !$0.needsSignIn && fresh($0, now) && !$0.out
         }
         guard let best = eligible.min(by: { a, b in
             if a.used != b.used { return a.used < b.used }
             if (a.weekly ?? 0) != (b.weekly ?? 0) { return (a.weekly ?? 0) < (b.weekly ?? 0) }
             return a.name < b.name
         }) else {
-            return .stay("\(current.name) is at \(current.used)%, and no other set-up account is under \(threshold)%.")
+            return .nowhere("\(current.name) is out of usage, and no other set-up account has room. Chats wait until a limit resets.")
         }
-        return .switchTo(id: best.id, reason: "\(current.name) reached \(current.used)%; \(best.name) is at \(best.used)%.")
+        return .switchTo(id: best.id, reason: "\(current.name) is out of usage; \(best.name) is at \(best.used)%.")
     }
 
     private static func fresh(_ c: SwitchCandidate, _ now: Date) -> Bool {
@@ -118,6 +149,32 @@ enum AutoSwitchRule {
         let f = DateFormatter()
         f.dateFormat = "HH:mm"
         return f.string(from: date)
+    }
+}
+
+/// Which chats Claude stopped at a usage limit, read from its log. Such a chat's turn already
+/// ended with the limit error, so no quit cuts it off and Claude doesn't resume it at its next
+/// launch; it waits for a new message. Retrying the failed message instead rewinds the chat
+/// and starts its transcript over under a new id, without its subagents.
+enum LimitLog {
+    /// Sessions whose last outcome in `text` (one run of Claude's log) is a usage-limit error.
+    static func stoppedSessions(in text: String) -> Set<String> {
+        var stopped = Set<String>()
+        for line in text.split(separator: "\n") where line.contains("[CCD CycleHealth]") {
+            if let id = session(after: "[CCD CycleHealth] ", in: line), line.contains(" api_error ("),
+               line.contains("You've hit your"), line.contains("limit") {
+                stopped.insert(id)
+            } else if let id = session(after: "[CCD CycleHealth] healthy cycle for ", in: line) {
+                stopped.remove(id)
+            }
+        }
+        return stopped
+    }
+
+    private static func session<S: StringProtocol>(after marker: String, in line: S) -> String? {
+        guard let r = line.range(of: marker) else { return nil }
+        let id = line[r.upperBound...].prefix { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+        return id.hasPrefix("local_") ? String(id) : nil
     }
 }
 
