@@ -200,14 +200,14 @@ extension String {
 /// The app saves a row's login once Claude has held that account and organization steadily
 /// (SaveRule), so the one-time step is to open it in Claude: choose the organization from your name
 /// at the bottom of Claude's sidebar when Claude is already signed in to the account, else sign in
-/// to it first. An organization Claude refuses each time it opens needs a new sign-in there.
+/// to it first. An organization Claude refused needs a new sign-in there.
 enum SetUpRule {
     /// How long a set-up waits for the person to sign in to Claude and hold the row's account.
     static let signInWait: TimeInterval = 10 * 60
 
     static func step(for row: AccountRecord, claudeAccount: String?, refused: Bool = false) -> String {
         if refused {
-            return "Claude asks for a new sign-in to this organization each time. Choose it in Claude, sign in, "
+            return "Claude asked for a new sign-in to this organization. Choose it in Claude, sign in, "
                 + "and stay on it for a minute to save it"
         }
         let signedIn = row.accountUuid != nil && row.accountUuid == claudeAccount
@@ -426,6 +426,18 @@ struct SwitchCandidate: Equatable {
 
     /// Out of usage: a meter at its limit, or a switch left this row and its reset hasn't come yet.
     func isOut(at now: Date) -> Bool { atLimit || (outUntil.map { now < $0 } ?? false) }
+
+    /// How --dry-run describes the row: its meters and the reading's age, then whether it is out,
+    /// how to set it up when it has no saved login, and whether it needs a sign-in. `setUpStep` is
+    /// SetUpRule's step for the row.
+    func summary(at now: Date, setUpStep: String) -> String {
+        let setUp = hasSavedLogin ? "" : ", not set up: " + setUpStep
+        guard let read = readAt else { return "no reading" + setUp }
+        let age = Swift.max(Int(now.timeIntervalSince(read) / 60), 0)
+        return (fiveHour.map { "5-hour \(AutoSwitchRule.percent($0)), " } ?? "no 5-hour limit, ")
+            + "weekly \(AutoSwitchRule.percent(weekly ?? 0)), read \(age) min ago"
+            + (isOut(at: now) ? ", out" : "") + setUp + (needsSignIn ? ", needs sign-in" : "")
+    }
 }
 
 /// What a menu row offers on its right. The row in use says so; every other row with a saved

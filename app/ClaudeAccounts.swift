@@ -2089,43 +2089,24 @@ struct Badge: View {
     }
 }
 
-/// Design step only: the three card looks the menu is rendered in for the pick. One survives.
-enum CardLook: String, CaseIterable {
-    /// One card per account, its organizations as rows inside it.
-    case account
-    /// One card per row, washed in the account's color.
-    case row
-    /// One card per row, neutral, colored only by its state: in use, out, not set up.
-    case state
-
-    nonisolated(unsafe) static var current: CardLook = .account
-}
-
-/// A meter at its limit means the row is out.
-extension AccountState {
-    var out: Bool {
-        guard case .ok(_, let fh, let wk, _) = self else { return false }
-        return max(fh?.utilization ?? 0, wk?.utilization ?? 0) >= AutoSwitchRule.limit
-    }
-}
-
-/// The surface a card sits on. Fill and edge are system colors over the menu's vibrancy, so they
+/// The card an account sits on. Fill and edge are system colors over the menu's vibrancy, so they
 /// follow light, dark and increased contrast; increased contrast draws the edge in the label color.
 struct Card<Content: View>: View {
     var fill: AnyShapeStyle = AnyShapeStyle(Color(nsColor: .quaternarySystemFill))
-    /// An edge that says something (in use, out); nil draws the quiet hairline.
+    /// The in-use account's accent edge; nil draws the quiet outline.
     var edge: Color? = nil
-    var dashed = false
     @ViewBuilder let content: Content
     @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
-        let quiet = contrast == .increased ? Color.primary.opacity(0.55) : Color(nsColor: .separatorColor)
+        // The separator color is too faint to outline a card over the menu's vibrancy; the tertiary
+        // label color is the next system gray, lighter in dark mode and darker in light.
+        let quiet = contrast == .increased ? Color.primary.opacity(0.55) : Color(nsColor: .tertiaryLabelColor)
         content
             .background(shape.fill(fill))
             .overlay(shape.strokeBorder(edge ?? quiet,
-                                        style: StrokeStyle(lineWidth: edge == nil ? 1 : 1.5, dash: dashed ? [4, 3] : [])))
+                                        lineWidth: edge == nil ? 1 : 1.5))
             .clipShape(shape)
     }
 }
@@ -2133,13 +2114,6 @@ struct Card<Content: View>: View {
 struct Meter: View {
     let label: String
     let window: UsageWindow?
-    /// A gray bar that turns red only at the limit, for the look where state carries the color.
-    var quiet = false
-
-    private func barColor(_ pct: Int) -> Color {
-        guard quiet else { return severity(pct) }
-        return pct >= Int(AutoSwitchRule.limit) ? .red : Color(nsColor: .tertiaryLabelColor)
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2152,7 +2126,7 @@ struct Meter: View {
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.secondary.opacity(0.2))
                     if let w = window {
-                        Capsule().fill(barColor(w.pct))
+                        Capsule().fill(severity(w.pct))
                             .frame(width: geo.size.width * CGFloat(min(max(w.pct, 0), 100)) / 100)
                     }
                 }
@@ -2317,24 +2291,15 @@ struct AccountRow: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 // An organization entry lines up under its account's dot instead of repeating it.
-                // A card washed in the account's color needs no dot.
-                if look != .row {
-                    Circle().fill(organizationEntry ? Color.clear : Color(hex: account.color)).frame(width: 9, height: 9)
-                }
+                Circle().fill(organizationEntry ? Color.clear : Color(hex: account.color)).frame(width: 9, height: 9)
                 if renaming {
                     RenameField(current: organizationTitle ?? account.name, renaming: $renaming, onCommit: onRename)
                 } else {
-                    // No account header in the row look, so each card names its account first.
-                    let title = look == .row && organizationEntry
-                        ? Text(account.name).fontWeight(.semibold) + Text(" · \(organizationTitle!)")
-                        : Text(organizationTitle ?? account.name).fontWeight(organizationEntry ? .regular : .semibold)
-                    title.lineLimit(1).truncationMode(.middle)
+                    Text(organizationTitle ?? account.name)
+                        .fontWeight(organizationEntry ? .regular : .semibold).lineLimit(1).truncationMode(.middle)
                         .help(account.label)
                     if case .ok(let plan?, _, _, _) = state {
                         Text(plan.capitalized).font(.caption).foregroundStyle(.secondary)
-                    }
-                    if look == .state, !inUse, state?.out == true {
-                        Text("Out").font(.caption.weight(.semibold)).foregroundStyle(.red)
                     }
                     if next { NextMark() }
                 }
@@ -2374,8 +2339,8 @@ struct AccountRow: View {
             }
             switch state {
             case .ok(_, let fh, let wk, _):
-                if MeterRule.showsFiveHour(fiveHour: fh, weekly: wk) { Meter(label: "5-hour", window: fh, quiet: look == .state) }
-                Meter(label: "Weekly", window: wk, quiet: look == .state)
+                if MeterRule.showsFiveHour(fiveHour: fh, weekly: wk) { Meter(label: "5-hour", window: fh) }
+                Meter(label: "Weekly", window: wk)
                 if let warning = expiryWarning { signInPrompt(warning) }
                 if let until = retryAt, until > Date() {
                     Text("Rate-limited by the usage service · retrying at \(until.formatted(date: .omitted, time: .shortened))")
@@ -2406,13 +2371,11 @@ struct AccountRow: View {
             }
         }
         .padding(10)
-        // Inside an account's card, the organization in use is lit; the other looks light the whole card.
+        // Inside an account's card, the organization in use is lit; a one-row card lights itself.
         .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(look == .account && inUse && organizationEntry ? Color.accentColor.opacity(0.12) : .clear)
+            .fill(inUse && organizationEntry ? Color.accentColor.opacity(0.12) : .clear)
             .padding(3))
     }
-
-    private var look: CardLook { CardLook.current }
 
     private func signInPrompt(_ reason: String) -> some View {
         HStack {
@@ -2428,8 +2391,6 @@ struct MenuContent: View {
     @ObservedObject var store: Store
     @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2504,13 +2465,7 @@ struct MenuContent: View {
             let groups = store.accounts.groupedByAccount()
             let next = store.nextRow
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(groups, id: \.[0].id) { group in
-                    switch CardLook.current {
-                    case .account: accountCard(group, next: next)
-                    case .row: rowCards(group, next: next)
-                    case .state: stateCards(group, next: next)
-                    }
-                }
+                ForEach(groups, id: \.[0].id) { group in accountCard(group, next: next) }
             }
             .padding(.top, 2)
         }
@@ -2564,7 +2519,7 @@ struct MenuContent: View {
         store.settings.showsOrganizations(of: group[0].accountUuid ?? group[0].id)
     }
 
-    /// Look (a): one card per account. Its organizations are rows inside, split by hairlines; the
+    /// One card per account. Its organizations are rows inside, split by hairlines; the
     /// card of the account in use has an accent edge and its organization in use is lit.
     private func accountCard(_ group: [AccountRecord], next: String?) -> some View {
         let inUse = group.contains(where: store.isInUse)
@@ -2581,39 +2536,6 @@ struct MenuContent: View {
                             Divider().padding(.leading, 27)
                             row(acct, in: group, next: next, organizationTitle: acct.organization)
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Look (b): one card per row, washed in its account's color, with no account header; the row
-    /// in use has a full-strength edge.
-    private func rowCards(_ group: [AccountRecord], next: String?) -> some View {
-        ForEach(group) { acct in
-            let color = Color(hex: acct.color)
-            Card(fill: AnyShapeStyle(color.opacity(colorScheme == .dark ? 0.24 : 0.13)),
-                 edge: store.isInUse(acct) ? color : color.opacity(contrast == .increased ? 0.9 : 0.35)) {
-                row(acct, in: group, next: next, organizationTitle: group.count > 1 ? acct.organization : nil)
-            }
-        }
-    }
-
-    /// Look (c): the account header as today, then one neutral card per row whose fill and edge say
-    /// its state: accent in use, red when out, a dashed outline when not set up.
-    private func stateCards(_ group: [AccountRecord], next: String?) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if group.count > 1 { header(group, next: next).padding(.horizontal, 10).padding(.top, 4) }
-            if group.count == 1 || shown(group) {
-                ForEach(group) { acct in
-                    let inUse = store.isInUse(acct)
-                    let out = !inUse && store.states[acct.id]?.out == true
-                    let notSetUp = !inUse && !store.hasSavedLogin(acct)
-                    Card(fill: AnyShapeStyle(inUse ? Color.accentColor.opacity(0.14) : out ? Color.red.opacity(0.10)
-                                             : notSetUp ? Color.clear : Color(nsColor: .quaternarySystemFill)),
-                         edge: inUse ? .accentColor : out ? .red.opacity(contrast == .increased ? 1 : 0.6) : nil,
-                         dashed: notSetUp) {
-                        row(acct, in: group, next: next, organizationTitle: group.count > 1 ? acct.organization : nil)
                     }
                 }
             }
@@ -2964,16 +2886,10 @@ enum Entry {
         let current = accounts.row(for: log.identity).flatMap { row in all.first { $0.id == row.id } }
         let now = Date()
         func describe(_ c: SwitchCandidate) -> String {
-            guard let read = c.readAt else { return "no reading" }
-            let age = max(Int(now.timeIntervalSince(read) / 60), 0)
-            return (c.fiveHour.map { "5-hour \(AutoSwitchRule.percent($0)), " } ?? "no 5-hour limit, ")
-                + "weekly \(AutoSwitchRule.percent(c.weekly ?? 0)), read \(age) min ago"
-                + (c.isOut(at: now) ? ", out" : "") + setUp(c) + (c.needsSignIn ? ", needs sign-in" : "")
-        }
-        func setUp(_ c: SwitchCandidate) -> String {
-            guard !c.hasSavedLogin, let row = accounts.first(where: { $0.id == c.id }) else { return "" }
-            return ", not set up: " + SetUpRule.step(for: row, claudeAccount: log.identity?.account,
-                                                     refused: row.orgUuid.map { log.refusedAt[$0] != nil } ?? false)
+            let row = accounts.first { $0.id == c.id }
+            return c.summary(at: now, setUpStep: row.map {
+                SetUpRule.step(for: $0, claudeAccount: log.identity?.account, refused: $0.orgUuid.map { log.refusedAt[$0] != nil } ?? false)
+            } ?? "")
         }
         print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
         print("In use:             \(current?.name ?? "an account this app doesn't know")")
