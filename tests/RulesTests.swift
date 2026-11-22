@@ -1,5 +1,5 @@
-// Tests for app/Rules.swift: the auto-switch rule, the quit watch, organization matching and the
-// resume step. Run with ./test.sh; it needs only swiftc, like the app.
+// Tests for app/Rules.swift: the auto-switch rule, reading Claude's log, the quit watch,
+// organization matching and the resume step. Run with ./test.sh; it needs only swiftc, like the app.
 
 import Foundation
 
@@ -18,7 +18,7 @@ struct RulesTests {
 
     static func main() {
         autoSwitch()
-        limitLog()
+        claudeLog()
         quitWatch()
         organizations()
         resume()
@@ -30,15 +30,16 @@ struct RulesTests {
 
     static let now = Date(timeIntervalSince1970: 1_800_000_000)
 
-    static func row(_ id: String, _ fiveHour: Int?, _ weekly: Int?, readMinutesAgo: Double = 1,
-                    needsSignIn: Bool = false, saved: Bool = true) -> SwitchCandidate {
+    static func row(_ id: String, _ fiveHour: Double?, _ weekly: Double?, readMinutesAgo: Double = 1,
+                    needsSignIn: Bool = false, saved: Bool = true, outUntil: Date? = nil) -> SwitchCandidate {
         SwitchCandidate(id: id, name: id, fiveHour: fiveHour, weekly: weekly,
-                        readAt: now.addingTimeInterval(-readMinutesAgo * 60), needsSignIn: needsSignIn, hasSavedLogin: saved)
+                        readAt: now.addingTimeInterval(-readMinutesAgo * 60), needsSignIn: needsSignIn, hasSavedLogin: saved,
+                        outUntil: outUntil)
     }
 
-    static func decide(_ current: SwitchCandidate?, _ others: [SwitchCandidate], enabled: Bool = true,
+    static func decide(_ current: SwitchCandidate?, _ others: [SwitchCandidate], stopped: Bool = true, enabled: Bool = true,
                        running: Bool = true, lastAttemptMinutesAgo: Double? = nil) -> AutoSwitchRule.Decision {
-        AutoSwitchRule.decide(current: current, others: others, enabled: enabled, claudeRunning: running,
+        AutoSwitchRule.decide(current: current, others: others, enabled: enabled, limitStopped: stopped, claudeRunning: running,
                               lastAttempt: lastAttemptMinutesAgo.map { now.addingTimeInterval(-$0 * 60) }, now: now)
     }
 
@@ -53,65 +54,134 @@ struct RulesTests {
     }
 
     static func autoSwitch() {
-        let out = row("out", 40, 100)
+        let busy = row("busy", 40, 70)
         let roomy = row("roomy", 5, 20)
         let work = row("work", 30, 10)
 
-        // The default: switch once the account in use is out, not before.
+        // The one trigger is Claude stopping a chat for usage; the meters never start a switch.
         check(AutoSwitchRule.onByDefault, "auto-switch is on without touching anything")
-        check(picked(decide(row("busy", 40, 99), [roomy])) == nil, "at 99 percent, no switch")
-        check(picked(decide(row("busy", 99, 99), [roomy])) == nil, "99 on both meters is still not out")
-        check(picked(decide(out, [out, roomy, work])) == "roomy", "at the weekly limit, switch to the most room")
-        check(picked(decide(row("busy", 100, 10), [work])) == "work", "the 5-hour limit alone also switches")
-        check(picked(decide(row("busy", 103, 10), [work])) == "work", "a reading over 100 counts as out")
-        check(picked(decide(out, [out, roomy], enabled: false)) == nil, "off never switches")
-        check(picked(decide(out, [roomy], running: false)) == nil, "no switch while Claude isn't running")
+        check(picked(decide(busy, [busy, roomy, work])) == "roomy", "Claude stopped a chat: switch to the most room")
+        check(picked(decide(busy, [roomy], stopped: false)) == nil, "no stop in Claude's log, no switch")
+        check(picked(decide(row("busy", 100, 100), [roomy], stopped: false)) == nil, "both meters at 100 with no stop: no switch")
+        check(picked(decide(row("busy", 103, 40), [roomy], stopped: false)) == nil, "a meter over 100 with no stop: no switch")
+        check(picked(decide(row("busy", 2, 3), [roomy])) == "roomy", "a stop switches whatever the meters of the account in use read")
+        check(picked(decide(busy, [roomy], enabled: false)) == nil, "off never switches")
+        check(picked(decide(busy, [roomy], running: false)) == nil, "no switch while Claude isn't running")
         check(picked(decide(nil, [roomy])) == nil, "no switch when Claude's account is unknown")
-        check(picked(decide(out, [out, out])) == nil, "never switches to the account in use")
+        check(picked(decide(busy, [busy, busy])) == nil, "never switches to the account in use")
 
         // Every other account is out too: stay, and say so.
-        let allOut = decide(out, [out, row("a", 0, 100), row("b", 100, 0)])
+        let allOut = decide(busy, [busy, row("a", 0, 100), row("b", 100, 0)])
         check(picked(allOut) == nil && nowhere(allOut), "every other account out: no switch, and a notice")
-        check(!nowhere(decide(row("busy", 40, 99), [row("a", 0, 100)])), "no notice before the account in use is out")
+        check(!nowhere(decide(busy, [row("a", 0, 100)], stopped: false)), "no notice before Claude stops a chat")
 
-        check(picked(decide(out, [row("a", 0, 100), work])) == "work", "never to an account that is out")
-        check(picked(decide(out, [row("a", 10, 99)])) == "a", "an account just under its limit still has room")
-        check(picked(decide(out, [row("a", 0, 0, needsSignIn: true), work])) == "work", "skips a login at its deadline")
-        check(picked(decide(out, [row("a", 0, 0, saved: false), work])) == "work", "skips an account that isn't set up")
-        check(picked(decide(out, [row("a", 0, 0, readMinutesAgo: 20), work])) == "work", "skips a stale reading")
-        check(nowhere(decide(out, [row("a", 0, 0, readMinutesAgo: 20)])), "only stale targets: a notice, no switch")
-        check(picked(decide(row("busy", 40, 100, readMinutesAgo: 20), [work])) == nil, "a stale reading never starts a switch")
-        check(picked(decide(out, [row("a", nil, nil), row("b", 1, 1)])) == "a", "a window not started yet counts as nothing used")
+        // Out is decided on the unrounded meter.
+        check(picked(decide(busy, [row("a", 0, 100), work])) == "work", "never to an account that is out")
+        check(picked(decide(busy, [row("a", 10, 99.6)])) == "a", "99.6 percent, which shows as 100, still has room")
+        check(picked(decide(busy, [row("a", 10, 100.0)])) == nil, "exactly 100 percent is out")
+        check(AutoSwitchRule.percent(99.6) == "99%", "a reason never shows an account short of its limit as 100 percent")
+
+        check(picked(decide(busy, [row("a", 0, 0, needsSignIn: true), work])) == "work", "skips a login at its deadline")
+        check(picked(decide(busy, [row("a", 0, 0, saved: false), work])) == "work", "skips an account that isn't set up")
+        check(picked(decide(busy, [row("a", 0, 0, readMinutesAgo: 20), work])) == "work", "skips a stale reading")
+        check(nowhere(decide(busy, [row("a", 0, 0, readMinutesAgo: 20)])), "only stale targets: a notice, no switch")
+        check(picked(decide(row("busy", 40, 70, readMinutesAgo: 600), [work])) == "work",
+              "a stale reading of the account in use doesn't hold back a stop")
+        check(picked(decide(busy, [row("a", nil, nil), row("b", 1, 1)])) == "a", "a window not started yet counts as nothing used")
         let never = SwitchCandidate(id: "x", name: "x", fiveHour: nil, weekly: nil, readAt: nil, needsSignIn: false, hasSavedLogin: true)
-        check(picked(decide(out, [never])) == nil, "an account never read is not a target")
+        check(picked(decide(busy, [never])) == nil, "an account never read is not a target")
 
-        check(picked(decide(out, [row("b", 20, 20), row("a", 20, 5)])) == "a", "a tie goes to less weekly use")
-        check(picked(decide(out, [row("b", 20, 20), row("a", 20, 20)])) == "a", "then to the name")
+        check(picked(decide(busy, [row("b", 20, 20), row("a", 20, 5)])) == "a", "a tie goes to less weekly use")
+        check(picked(decide(busy, [row("b", 20, 20), row("a", 20, 20)])) == "a", "then to the name")
 
-        check(picked(decide(out, [roomy], lastAttemptMinutesAgo: 5)) == nil, "no second try inside the cool-down")
-        check(picked(decide(out, [roomy], lastAttemptMinutesAgo: 11)) == "roomy", "tries again after the cool-down")
-        // No flapping: right after a switch, the account left behind is out, so it is never picked.
-        check(picked(decide(row("roomy", 100, 20), [row("out", 40, 100)], lastAttemptMinutesAgo: 60)) == nil,
-              "never switches back to the account it left")
+        check(picked(decide(busy, [roomy], lastAttemptMinutesAgo: 5)) == nil, "no second try inside the cool-down")
+        check(picked(decide(busy, [roomy], lastAttemptMinutesAgo: 11)) == "roomy", "tries again after the cool-down")
+
+        // No flap: the account a switch left counts as out until its reset, whatever its meters read.
+        let leftAt = now.addingTimeInterval(-60)
+        var left = row("left", 40, 97)
+        left.fiveHourResetsAt = now.addingTimeInterval(2 * 3600)
+        left.weeklyResetsAt = now.addingTimeInterval(3 * 86400)
+        let until = AutoSwitchRule.outUntil(leaving: left, now: leftAt)
+        check(until == left.weeklyResetsAt, "the account left is out until its fuller meter resets")
+        check(picked(decide(row("roomy", 10, 10), [row("left", 40, 60, outUntil: until)])) == nil,
+              "never switches back to the account it left, though its meter shows room")
+        check(picked(decide(row("roomy", 10, 10), [row("left", 40, 60, outUntil: now.addingTimeInterval(-1))])) == "left",
+              "after its reset it is a target again")
+        var fiveHourFull = row("left", 99, 30)
+        fiveHourFull.fiveHourResetsAt = now.addingTimeInterval(3600)
+        fiveHourFull.weeklyResetsAt = now.addingTimeInterval(86400)
+        check(AutoSwitchRule.outUntil(leaving: fiveHourFull, now: now) == fiveHourFull.fiveHourResetsAt,
+              "a full 5-hour meter means out until the 5-hour reset")
+        check(AutoSwitchRule.outUntil(leaving: row("left", 10, 10), now: now) == now.addingTimeInterval(AutoSwitchRule.outWithoutReset),
+              "with no reset ahead, out for the configured fallback")
+        check(AutoSwitchRule.outWithoutReset == 5 * 3600 && AutoSwitchRule.coolDown == 10 * 60 && AutoSwitchRule.freshness == 15 * 60,
+              "the fallback is 5 hours, the cool-down 10 minutes, a reading fresh for 15 minutes")
     }
 
-    // MARK: Limit log
+    // MARK: Claude's log
 
-    static func limitLog() {
-        let log = """
-        2026-01-01 10:00:00 [info] Starting app {
-        2026-01-01 10:01:00 [warn] [CCD CycleHealth] local_aaa-1 api_error (success): You've hit your weekly limit · resets 8pm
-        2026-01-01 10:01:00 [info] [CCD CycleHealth] unhealthy cycle for local_aaa-1 (0s, hadFirstResponse=true, reason=api_error)
-        2026-01-01 10:02:00 [warn] [CCD CycleHealth] local_bbb-2 api_error (success): You've hit your 5-hour limit · resets 3pm
-        2026-01-01 10:03:00 [info] [CCD CycleHealth] healthy cycle for local_bbb-2 (12s, hadFirstResponse=true)
-        2026-01-01 10:04:00 [warn] [CCD CycleHealth] local_ccc-3 api_error (success): Overloaded
-        2026-01-01 10:05:00 [info] [CCD CycleHealth] healthy cycle for local_ddd-4 (3s, hadFirstResponse=true)
-        """
-        let stopped = LimitLog.stoppedSessions(in: log)
-        check(stopped.contains("local_aaa-1"), "a chat whose last turn hit the limit is listed")
-        check(!stopped.contains("local_bbb-2"), "a chat that ran fine after its limit is not")
-        check(!stopped.contains("local_ccc-3"), "another API error is not a limit")
-        check(stopped.count == 1, "nothing else is listed")
+    static let accountA = "aaaaaaaa-0000-4000-8000-000000000001"
+    static let accountB = "bbbbbbbb-0000-4000-8000-000000000002"
+    static let orgA = "cccccccc-0000-4000-8000-000000000003"
+
+    static func signIn(_ account: String, _ org: String) -> String {
+        "2026-01-01 09:59:00 [info] [LocalSessionManager] Initialization succeeded accountId=\(account) orgId=\(org)"
+    }
+
+    static func stopped(_ id: String, _ message: String = "You've hit your weekly limit \u{00B7} resets 8pm") -> String {
+        "2026-01-01 10:01:00 [warn] [CCD CycleHealth] \(id) api_error (success): \(message)"
+    }
+
+    static func follow(_ lines: [String]) -> LogFollower {
+        var f = LogFollower()
+        f.read(lines.joined(separator: "\n"))
+        return f
+    }
+
+    static func claudeLog() {
+        let start = "2026-01-01 09:58:00 [info] Starting app {"
+        let a = Identity(account: accountA, org: orgA)
+
+        // A stop logged for the account in use is the trigger.
+        let inUse = follow([start, signIn(accountA, orgA), stopped("local_aaa-1")])
+        check(inUse.identity == a && inUse.stoppedByLimit == ["local_aaa-1"], "a limit line for the account in use is a stop")
+
+        // Only stops that belong to the account Claude named above them count.
+        check(follow([start, stopped("local_aaa-1"), signIn(accountA, orgA)]).stoppedByLimit.isEmpty,
+              "a limit line from before the account was confirmed is not a stop")
+        let moved = follow([start, signIn(accountB, orgA), stopped("local_bbb-1"), signIn(accountA, orgA)])
+        check(moved.identity == a && moved.stoppedByLimit.isEmpty, "a limit line for another account is not a stop")
+        check(follow([start, signIn(accountA, orgA), stopped("local_aaa-1"), start]).stoppedByLimit.isEmpty,
+              "a new run of Claude starts over")
+        check(follow([start, signIn(accountA, orgA), stopped("local_aaa-1"), signIn(accountA, orgA)]).stoppedByLimit == ["local_aaa-1"],
+              "Claude naming the same account again keeps its stops")
+
+        // Which lines are a stop for usage.
+        let mixed = follow([
+            start, signIn(accountA, orgA),
+            stopped("local_aaa-1"),
+            "2026-01-01 10:01:00 [info] [CCD CycleHealth] unhealthy cycle for local_aaa-1 (0s, hadFirstResponse=true, reason=api_error)",
+            stopped("local_bbb-2", "You've hit your 5-hour limit \u{00B7} resets 3pm"),
+            "2026-01-01 10:03:00 [info] [CCD CycleHealth] healthy cycle for local_bbb-2 (12s, hadFirstResponse=true)",
+            stopped("local_ccc-3", "Overloaded"),
+            stopped("local_ddd-4", "Your org is out of usage \u{00B7} contact your admin"),
+        ])
+        check(mixed.stoppedByLimit == ["local_aaa-1", "local_ddd-4"],
+              "a usage stop counts, one that ran fine since doesn't, another API error doesn't, Claude's other out-of-usage messages do")
+        check(mixed.cutByQuit.isEmpty, "a usage stop is not a turn cut off by the quit")
+
+        // The turns still running when Claude quit.
+        let quit = follow([
+            start, signIn(accountA, orgA),
+            stopped("local_aaa-1"),
+            "2026-01-01 10:09:00 [info] [CCD CycleHealth] unhealthy cycle for local_run-1 (40s, hadFirstResponse=true, reason=app_quit)",
+            "2026-01-01 10:09:00 [info] [CCD CycleHealth] unhealthy cycle for local_net-2 (3s, hadFirstResponse=false, reason=no_response)",
+        ])
+        check(quit.cutByQuit == ["local_run-1"] && quit.stoppedByLimit == ["local_aaa-1"],
+              "a turn closed by the quit is cut off; another failure is not")
+        check(LogFollower.identity(after: [start, signIn(accountA, orgA), "Navigated to /logout"].joined(separator: "\n"), from: nil) == nil,
+              "a sign-out clears who Claude is")
     }
 
     // MARK: Quit watch
@@ -220,7 +290,7 @@ struct RulesTests {
               "a first row is just the email")
 
         // Auto-switch treats each account-and-organization pair as its own target.
-        let outPersonal = row("a", 10, 100)
+        let outPersonal = row("a", 10, 60)
         check(picked(decide(outPersonal, [outPersonal, row("b", 30, 40), row("c", 60, 60)])) == "b",
               "the account's other organization is a target, by the same most-room rule")
         check(picked(decide(outPersonal, [outPersonal, row("b", 30, 40), row("c", 5, 5)])) == "c",
@@ -245,10 +315,19 @@ struct RulesTests {
             MovedChat(id: "new", title: "new", interrupted: true, lastActivity: 5),
             MovedChat(id: "limit", title: "limit", interrupted: false, lastActivity: 7),
         ]
-        let wanted = ResumeRule.toResume(chats, limited: ["limit", "gone"])
+        let wanted = ResumeRule.toResume(chats, stoppedByLimit: ["limit", "gone"], cutByQuit: [])
         check(wanted.map(\.id) == ["limit", "new", "old"],
-              "chats a quit cut off or a limit stopped, each once, most recent first; an idle chat the limit didn't stop is left alone")
-        check(ResumeRule.toResume(chats, limited: []).map(\.id) == ["new", "old"], "with no limit in the log, only the cut-off chats")
+              "chats a quit cut off or a limit stopped, each once, most recent first; an idle chat is left alone")
+        check(ResumeRule.toResume(chats, stoppedByLimit: [], cutByQuit: []).map(\.id) == ["new", "old"],
+              "with no stop in the log, only the chats Claude marked")
+        let working = [
+            MovedChat(id: "limit", title: "limit", interrupted: false, lastActivity: 4),
+            MovedChat(id: "running", title: "running", interrupted: false, lastActivity: 3),
+            MovedChat(id: "marked", title: "marked", interrupted: true, lastActivity: 2),
+            MovedChat(id: "idle", title: "idle", interrupted: false, lastActivity: 9),
+        ]
+        check(ResumeRule.toResume(working, stoppedByLimit: ["limit"], cutByQuit: ["running"]).map(\.id) == ["limit", "running", "marked"],
+              "the chats that were working are exactly the ones stopped for usage plus the ones the quit cut off")
         check(ResumeRule.message == "resume", "the message is \"resume\"")
         check(ResumeRule.resumed(markStillSet: false, lastActivity: 0, reopenedAt: 100), "a cleared mark means it resumed")
         check(!ResumeRule.resumed(markStillSet: true, lastActivity: 50, reopenedAt: 100), "a mark and no activity means it waits")
