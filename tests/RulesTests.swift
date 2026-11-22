@@ -487,16 +487,19 @@ struct RulesTests {
         check(row("ultra", nil, 100).isOut(at: now) && !row("ultra", nil, 99.6).isOut(at: now), "and its weekly meter alone makes it out")
         check(picked(decide(row("busy", 40, 70), [row("ultra", nil, 100), row("max", 35, 5)])) == "max", "never to it when its weekly is full")
 
-        // A row at its limit offers no Switch; the reason is the meter that frees up last.
-        let soon = Date().addingTimeInterval(3600), later = Date().addingTimeInterval(3 * 86400)
-        let fullFive = UsageWindow(utilization: 100, resetsAt: soon), fullWeek = UsageWindow(utilization: 100.2, resetsAt: later)
-        check(MeterRule.limiting(fiveHour: fullFive, weekly: UsageWindow(utilization: 60, resetsAt: later)) == fullFive, "a full 5-hour meter holds it")
-        check(MeterRule.limiting(fiveHour: fullFive, weekly: fullWeek) == fullWeek, "both full: the one that resets last")
-        check(MeterRule.limiting(fiveHour: nil, weekly: fullWeek) == fullWeek, "a full weekly meter with no 5-hour window")
-        check(MeterRule.limiting(fiveHour: UsageWindow(utilization: 99.6, resetsAt: soon), weekly: nil) == nil, "99.6 percent still has room")
-        check((MeterRule.limiting(fiveHour: nil, weekly: fullWeek) != nil) == row("x", nil, 100.2).atLimit
-              && (MeterRule.limiting(fiveHour: fullFive, weekly: nil) != nil) == row("x", 100, nil).atLimit,
-              "the menu and auto-switch agree on a meter at its limit")
+        // A row at its limit still offers Switch: the manual switch is the person's call, and only
+        // auto-switch skips it.
+        let full = row("full", 100, 100.2)
+        check(full.isOut(at: now) && RowAction.pick(inUse: false, hasSavedLogin: full.hasSavedLogin) == .switchTo,
+              "a row at 100 percent offers Switch, not a badge")
+        check(RowAction.pick(inUse: false, hasSavedLogin: row("left", 10, 10, outUntil: now.addingTimeInterval(3600)).hasSavedLogin) == .switchTo,
+              "so does a row a switch just left")
+        check(RowAction.pick(inUse: true, hasSavedLogin: true) == .inUse && RowAction.pick(inUse: false, hasSavedLogin: false) == .setUp
+              && RowAction.pick(inUse: true, hasSavedLogin: false) == .inUse,
+              "the row in use says In use; a row with no saved login offers Set Up")
+        check(picked(decide(row("busy", 40, 100), [row("busy", 40, 100), full, row("room", 5, 5)])) == "room",
+              "auto-switch still skips the full row it would otherwise reach first")
+        check(nowhere(decide(row("busy", 40, 100), [row("busy", 40, 100), full])), "and with only full rows left it stays and says so")
     }
 
     // MARK: Settings

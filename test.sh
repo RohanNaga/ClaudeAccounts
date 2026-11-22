@@ -22,6 +22,15 @@ if ! grep -q 'Text(msg).*fixedSize(horizontal: false, vertical: true)' <<<"$stat
 fi
 echo "Status line wraps: ok"
 
+# A manual switch is the person's call: a row's action comes from RowAction (tested above), which
+# never reads usage, and the switch itself never checks whether the target is out.
+section() { awk -v start="$1" '$0 ~ start {f=1; print; next} f && /^(enum|struct|final class|class|extension) / {exit} f' "$ROOT/app/ClaudeAccounts.swift"; }
+if ! grep -q 'RowAction.pick' <<<"$(section '^struct AccountRow')" \
+   || grep -qE 'isOut|atLimit|MeterRule|AutoSwitchRule' <<<"$(section '^enum SwitchEngine')"; then
+  echo "FAIL: a row's action must come from RowAction, and a manual switch must not check the target's usage"; exit 1
+fi
+echo "Manual switch to any row: ok"
+
 swiftc -module-cache-path "$OUT" -o "$OUT/prompt-fixture" "$ROOT/tests/PromptFixture.swift"
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/prompt-test" \
   "$ROOT/app/QuitPrompt.swift" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/PromptTest.swift"

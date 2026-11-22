@@ -291,13 +291,6 @@ enum MeterRule {
     /// signal, so the meter still shows rather than hide a real limit.
     static func showsFiveHour(fiveHour: UsageWindow?, weekly: UsageWindow?) -> Bool { fiveHour != nil || weekly == nil }
 
-    /// The meter that holds an account at its limit, and of two the one that resets last; nil
-    /// while every meter it has has room. Compared unrounded, like `SwitchCandidate.atLimit`.
-    static func limiting(fiveHour: UsageWindow?, weekly: UsageWindow?) -> UsageWindow? {
-        [fiveHour, weekly].compactMap { $0 }.filter { $0.utilization >= AutoSwitchRule.limit }
-            .max { ($0.resetsAt ?? .distantPast) < ($1.resetsAt ?? .distantPast) }
-    }
-
     /// The window the menu bar gauge follows: the chosen limit, or the weekly one for an account
     /// without a 5-hour window.
     static func gauge(_ metric: UsageMetric, fiveHour: UsageWindow?, weekly: UsageWindow?) -> UsageWindow? {
@@ -380,11 +373,23 @@ struct SwitchCandidate: Equatable {
     /// The fuller of the meters it has.
     var used: Double { Swift.max(fiveHour ?? 0, weekly ?? 0) }
 
-    /// A meter it has is at its limit, compared unrounded. The menu offers no Switch to such a row.
+    /// A meter it has is at its limit, compared unrounded. Auto-switch skips such a row; the menu
+    /// still offers Switch on it.
     var atLimit: Bool { used >= AutoSwitchRule.limit }
 
     /// Out of usage: a meter at its limit, or a switch left this row and its reset hasn't come yet.
     func isOut(at now: Date) -> Bool { atLimit || (outUntil.map { now < $0 } ?? false) }
+}
+
+/// What a menu row offers on its right. The row in use says so; every other row with a saved
+/// login offers Switch, whatever its meters read, because a manual switch is the person's call;
+/// a row without one offers Set Up.
+enum RowAction: Equatable {
+    case inUse, switchTo, setUp
+
+    static func pick(inUse: Bool, hasSavedLogin: Bool) -> RowAction {
+        inUse ? .inUse : hasSavedLogin ? .switchTo : .setUp
+    }
 }
 
 enum AutoSwitchRule {
