@@ -96,6 +96,29 @@ extension Array where Element == AccountRecord {
         return groups
     }
 
+    /// The rows as the menu lists them: each account where it first appears, its organizations
+    /// beneath it. This is also the order auto-switch tries them in.
+    var inMenuOrder: [AccountRecord] { groupedByAccount().flatMap { $0 } }
+
+    /// The rows after moving `row` one place up (`step` -1) or down (`step` 1) in the menu, or nil
+    /// when it is already at that end. An organization entry moves among its account's
+    /// organizations; any other row moves its whole account past the neighbouring account. The
+    /// account keeps its name whichever organization comes first.
+    func moved(_ row: AccountRecord, by step: Int, organization: Bool) -> [AccountRecord]? {
+        var groups = groupedByAccount()
+        guard let g = groups.firstIndex(where: { $0.contains { $0.id == row.id } }) else { return nil }
+        if organization {
+            guard let i = groups[g].firstIndex(where: { $0.id == row.id }), groups[g].indices.contains(i + step) else { return nil }
+            let account = accountName(for: row)
+            for k in groups[g].indices { groups[g][k].name = account }
+            groups[g].swapAt(i, i + step)
+        } else {
+            guard groups.indices.contains(g + step) else { return nil }
+            groups.swapAt(g, g + step)
+        }
+        return groups.flatMap { $0 }.labelled()
+    }
+
     /// The organizations of `account` that Claude has opened (`opened`, with how many chats
     /// each holds) but no row stands for yet, most used first.
     func organizationsToAdd(account: String, opened: [(org: String, chats: Int)]) -> [String] {
@@ -387,9 +410,9 @@ enum AutoSwitchRule {
 
     /// Whether to switch now, and to which row. The one trigger is Claude itself: it stopped a
     /// chat of the account in use because that account is out of usage (`limitStopped`, from
-    /// Claude's log). The meters never start a switch; they choose the target, the set-up
-    /// account with the most room, and rule out any account that is out.
-    static func decide(current: SwitchCandidate?, others: [SwitchCandidate], enabled: Bool, limitStopped: Bool,
+    /// Claude's log). The meters never start a switch; the target is `next(after:in:now:)`.
+    /// `rows` are every row in menu order.
+    static func decide(current: SwitchCandidate?, rows: [SwitchCandidate], enabled: Bool, limitStopped: Bool,
                        claudeRunning: Bool, lastAttempt: Date?, now: Date) -> Decision {
         guard enabled else { return .stay("Auto-switch is off.") }
         guard let current else { return .stay("Claude isn't using an account this app knows.") }
@@ -398,17 +421,20 @@ enum AutoSwitchRule {
         if let lastAttempt, now.timeIntervalSince(lastAttempt) < coolDown {
             return .stay("\(current.name) is out, but the last try was under \(Int(coolDown / 60)) minutes ago; next try after \(clock(lastAttempt.addingTimeInterval(coolDown))).")
         }
-        let eligible = others.filter {
-            $0.id != current.id && $0.hasSavedLogin && !$0.needsSignIn && fresh($0, now) && !$0.isOut(at: now)
-        }
-        guard let best = eligible.min(by: { a, b in
-            if a.used != b.used { return a.used < b.used }
-            if (a.weekly ?? 0) != (b.weekly ?? 0) { return (a.weekly ?? 0) < (b.weekly ?? 0) }
-            return a.name < b.name
-        }) else {
+        guard let target = next(after: current, in: rows, now: now) else {
             return .nowhere("Claude stopped a chat because \(current.name) is out of usage, and no other set-up account has room. Chats wait until a limit resets.")
         }
-        return .switchTo(id: best.id, reason: "Claude stopped a chat because \(current.name) is out of usage; \(best.name) is at \(percent(best.used)).")
+        return .switchTo(id: target.id, reason: "Claude stopped a chat because \(current.name) is out of usage; \(target.name) is next in the menu with room.")
+    }
+
+    /// The row the next automatic switch goes to: going down the menu from the row in use, the
+    /// first one that is set up, signed in, freshly read and not out, wrapping round to the top.
+    /// Never the row in use. `rows` are every row in menu order, so the person's order decides.
+    static func next(after current: SwitchCandidate, in rows: [SwitchCandidate], now: Date) -> SwitchCandidate? {
+        let start = rows.firstIndex { $0.id == current.id }.map { $0 + 1 } ?? 0
+        return (rows[start...] + rows[..<start]).first {
+            $0.id != current.id && $0.hasSavedLogin && !$0.needsSignIn && fresh($0, now) && !$0.isOut(at: now)
+        }
     }
 
     /// Until when the row a switch leaves counts as out: the reset of its fuller meter, else of
