@@ -11,8 +11,9 @@ A macOS menu bar app for people with more than one Claude account, like a work
 plan, a school plan and a personal one. It shows the 5-hour and weekly usage of
 every account at once. One click switches the Claude desktop app to another
 account, and your open Claude Code chats come with you: same history, same
-worktrees. When the account in use runs out of usage, it switches by itself to
-the account with the most room left. An account that belongs to two
+worktrees. When Claude stops a chat because the account in use is out of usage,
+it switches by itself to the account with the most room left. An account that
+belongs to two
 organizations, like a personal plan and a team, shows both, each with its own
 usage, and either one can be switched to.
 
@@ -70,9 +71,9 @@ xattr -dr com.apple.quarantine "/Applications/Claude Accounts.app"
    saves the account's Claude login without signing the others out.
 3. From then on, **Switch** on any row moves Claude, and your open chats, to
    that account.
-4. Auto-switch is on from the start: when the account in use runs out, the app
-   quits Claude, reopens it on the account with the most room, and sends
-   "resume" to each chat that had stopped. Click **Allow…** in the menu, then
+4. Auto-switch is on from the start: when Claude stops a chat because the
+   account in use is out of usage, the app quits Claude, reopens it on the
+   account with the most room, and sends "resume" to each chat that was working. Click **Allow…** in the menu, then
    turn on **Claude Accounts** under System Settings › Privacy & Security ›
    Accessibility, so an automatic switch can answer Claude's quit prompt and
    type that message (see [Auto-switch](#auto-switch)).
@@ -103,7 +104,7 @@ header's `···` menu turns the automatic part off.
 | Login keychain | One `Claude Code-credentials-<hash>` item per account, written by Claude Code | Adding or signing in to an account |
 | `api.anthropic.com/api/oauth/usage` | Each account's usage, about once a minute | Always; this is the only network traffic |
 | `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Only on **Switch** or **Set Up**, with Claude quit; the folder names in `claude-code-sessions` are also read to find an account's other organizations |
-| `~/Library/Logs/Claude/main.log` | Read only, to see which account Claude reports | Always |
+| `~/Library/Logs/Claude/main.log` | Read only, to see which account Claude reports and which chats Claude stopped because that account is out of usage | Always |
 | Claude's quit prompt, through Accessibility | Reads whether the prompt is open; presses **Quit anyway** | Only on an automatic or `--unattended` switch |
 | `claude://code/continue?session=…` and the chat's message box, through Accessibility | Opens each chat the quit or the limit stopped; types "resume" into that chat's own message box and presses its Send button, once | After every switch Claude confirms |
 
@@ -147,22 +148,27 @@ it and `switch.json` listing what moved; the last ten are kept.
 ## Auto-switch
 
 Auto-switch is on unless you turn off **Auto-Switch When Out** in the header's
-`···` menu. About once a minute it checks the account in use. When either its
-5-hour or its weekly meter reaches 100 percent, it quits Claude and reopens it
-on the set-up account with the most room left, as if you had clicked Switch,
-then sends one "resume" message to each chat that had stopped (see
-[After the switch](#after-the-switch)). An
+`···` menu. It switches when Claude itself says the account in use is out:
+Claude stops a chat with "You've hit your … limit" or another of its
+out-of-usage messages and writes that to its log. The app reads Claude's log
+every 15 seconds. The usage meters never start a switch, at any value, so the
+account is used up to the last request Claude accepts.
+
+On that stop, the app quits Claude and reopens it on the set-up account with the
+most room left, as if you had clicked Switch, then sends one "resume" message
+to each chat that was working (see [After the switch](#after-the-switch)). An
 account's other organization counts as an account here: if it has the most
 room, auto-switch picks it.
 
 It never switches:
 
-- before the account in use is out; at 99 percent it waits;
-- to an account that is out itself, isn't set up, has no reading from the last
-  15 minutes, or shows **Sign in again**;
+- before Claude has stopped a chat of the account in use for usage;
+- to an account that is out itself (a meter at 100 percent), isn't set up, has
+  no reading from the last 15 minutes, or shows **Sign in again**;
+- back to the account it left, until that account's usage resets, whatever its
+  meter shows by then;
 - within 10 minutes of its last try, whatever happened then, so a failed switch
-  can't keep quitting Claude. It can't bounce back either: the account it left
-  is out, and an account that is out is never a target;
+  can't keep quitting Claude;
 - while Claude isn't running, or while another switch runs.
 
 When every other account is out too, it stays put and posts one notification
@@ -178,21 +184,25 @@ changes until someone answers. macOS ties the
 permission to the app's signature, so after installing a new version you may
 need to allow it again.
 
-Each automatic switch posts a notification with its outcome. The notification
-shows on the Mac only.
+Each automatic switch posts a notification that says which account Claude
+stopped at its limit and how the switch went. The notification shows on the Mac
+only.
 
 ## After the switch
 
-Once Claude confirms the new account, the app gets every chat that had stopped
+Once Claude confirms the new account, the app gets every chat that was working
 running again, the way you would by hand: it sends each one a new message,
-"resume". A chat stops in one of two ways:
+"resume". A chat that was idle is left alone. A working chat stopped in one of
+two ways:
 
 - **Stopped by the limit.** When the account runs out, Claude ends each
-  working chat's turn with "You've hit your … limit". The app reads these from
-  Claude's log before it quits Claude.
-- **Cut off by the quit.** Claude marks a chat still mid-reply when it quits,
-  and resumes such chats itself after it reopens. The app gives Claude 45
-  seconds for that first.
+  working chat's turn with "You've hit your … limit".
+- **Cut off by the quit.** A chat still mid-reply or running a command when the
+  app quits Claude. Claude may mark such a chat and resume it itself after it
+  reopens; the app gives Claude 45 seconds for that first.
+
+The app reads both from Claude's log of the run that just ended, after Claude
+has quit.
 
 Then, one chat at a time, most recently active first:
 
@@ -252,7 +262,7 @@ The binary is at `Claude Accounts.app/Contents/MacOS/ClaudeAccounts`.
 |---|---|
 | `--status` | Prints what a switch would act on |
 | `--switch <name>` | Runs a switch to the row named by id, label, email or the email's first part |
-| `--auto-switch` | Runs the Auto-Switch rule once on the usage the menu last read: if the account in use is out, switches to the set-up account with the most room |
+| `--auto-switch` | Runs the Auto-Switch rule once: if Claude's log shows it stopped a chat of the account in use for usage, switches to the set-up account with the most room, judged on the usage the menu last read |
 | `--unattended` | With `--switch`, answers Claude's quit prompt with Quit anyway (implied by `--auto-switch`) |
 | `--dry-run` | Prints every check and what would happen, and changes nothing |
 | `--detach` | Starts the command in its own session and returns; output goes to `--log <file>`, by default `last-switch.log` in the app's state folder |
@@ -288,9 +298,10 @@ command from a terminal outside Claude.
 - Archived sessions and scheduled-task runs stay with the account they belong to.
 - The quit prompt is found by its **Quit anyway** button, so a Claude update
   that renames it makes an automatic switch wait for a person instead.
-- Chats that the limit stopped are found from Claude's log line for that
-  error; if the log changes, they aren't listed in the notification, and they
-  still wait for a message.
+- Auto-switch starts only from Claude's log line for a chat stopped for usage,
+  and the chats to resume come from Claude's log lines too. If an update
+  changes those lines, auto-switch doesn't switch and the chats wait for a
+  message; Switch by hand still works.
 
 ## Build from source
 

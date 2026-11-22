@@ -309,8 +309,33 @@ struct AppSettings: Codable, Equatable {
 // MARK: - Usage
 
 struct UsageWindow: Equatable, Codable {
-    let pct: Int
+    /// Percent used as the usage service reports it, unrounded; "out" is decided on this.
+    let utilization: Double
     let resetsAt: Date?
+
+    /// Rounded, for display only.
+    var pct: Int { Int(utilization.rounded()) }
+
+    private enum CodingKeys: String, CodingKey { case utilization, pct, resetsAt }
+
+    init(utilization: Double, resetsAt: Date?) {
+        self.utilization = utilization
+        self.resetsAt = resetsAt
+    }
+
+    /// A cache written before the unrounded value was kept has only `pct`.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        utilization = try c.decodeIfPresent(Double.self, forKey: .utilization) ?? Double(c.decode(Int.self, forKey: .pct))
+        resetsAt = try c.decodeIfPresent(Date.self, forKey: .resetsAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(utilization, forKey: .utilization)
+        try c.encode(pct, forKey: .pct)
+        try c.encodeIfPresent(resetsAt, forKey: .resetsAt)
+    }
 
     /// Relative and absolute together: "in 2 h 05 m · 13:10" today, "in 2 days · Sep 27, 13:00"
     /// further out, and "No reset pending" for a window that hasn't started.
@@ -337,7 +362,7 @@ struct UsageWindow: Equatable, Codable {
 
     init?(_ raw: Any?) {
         guard let dict = raw as? [String: Any], let util = dict["utilization"] as? Double else { return nil }
-        pct = Int(util.rounded())
+        utilization = util
         resetsAt = (dict["resets_at"] as? String).flatMap(Self.parseDate)
     }
 
@@ -552,32 +577,6 @@ enum ClaudeApp {
         return (rotated.map { readLines($0, from: mark.offset).text } ?? "") + readLines(log, from: 0).text
     }
 
-    /// Who Claude says it is after reading `text`, starting from `start`. The Code tab's session
-    /// manager logs the account and organization whose sessions it loads at every launch and
-    /// every account change; a sign-out or a restart clears it until the next such line.
-    static func identity(after text: String, from start: Identity?) -> Identity? {
-        var current = start
-        for line in text.split(separator: "\n") {
-            if line.contains("[LocalSessionManager] Initialization succeeded"),
-               let account = field(line, "accountId="), let org = field(line, "orgId=") {
-                current = Identity(account: account, org: org)
-            } else if line.contains("Starting app {") || signsOut(line) {
-                current = nil
-            }
-        }
-        return current
-    }
-
-    static func signsOut<S: StringProtocol>(_ line: S) -> Bool {
-        line.contains("Navigated to /logout") || line.contains("loggedOut: false → true")
-    }
-
-    private static func field<S: StringProtocol>(_ line: S, _ key: String) -> String? {
-        guard let r = line.range(of: key) else { return nil }
-        let value = line[r.upperBound...].prefix { $0.isHexDigit || $0 == "-" }
-        return value.count == 36 ? String(value) : nil
-    }
-
     /// The log of Claude's current run (or its last one, once it has quit), across a rotation.
     static func currentRunText() -> String {
         let text = readLines(logDir.appendingPathComponent("main1.log"), from: 0).text + readLines(log, from: 0).text
@@ -587,7 +586,7 @@ enum ClaudeApp {
     /// Who Claude is signed in as now, or was when it last quit, from its own log.
     static func currentIdentity() -> Identity? {
         let older = readLines(logDir.appendingPathComponent("main1.log"), from: 0).text
-        return identity(after: readLines(log, from: 0).text, from: identity(after: older, from: nil))
+        return LogFollower.identity(after: readLines(log, from: 0).text, from: LogFollower.identity(after: older, from: nil))
     }
 
     // MARK: Sessions
@@ -623,22 +622,26 @@ enum ClaudeApp {
     static func lastActivity(_ url: URL) -> Double { (record(url)?["lastActivityAt"] as? Double) ?? 0 }
 }
 
-/// Follows Claude's log, reading only what is new, so the menu shows the account Claude reports.
-final class IdentityWatcher {
+/// Follows Claude's log, reading only what is new: the account Claude reports, for the menu, and
+/// the chats of that account Claude stopped for usage, for auto-switch.
+final class LogWatcher {
     private var mark: ClaudeApp.LogMark?
-    private(set) var identity: Identity?
+    private(set) var log = LogFollower()
 
     func poll() -> Identity? {
         let now = ClaudeApp.logMark()
         if let mark, mark.inode == now.inode, mark.offset <= now.offset {
             let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: mark.offset)
-            identity = ClaudeApp.identity(after: text, from: identity)
+            log.read(text)
             self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
         } else {
-            identity = ClaudeApp.currentIdentity()
-            self.mark = ClaudeApp.LogMark(inode: now.inode, offset: ClaudeApp.readLines(ClaudeApp.log, from: 0).end)
+            log = LogFollower()
+            log.read(ClaudeApp.readLines(ClaudeApp.logDir.appendingPathComponent("main1.log"), from: 0).text)
+            let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: 0)
+            log.read(text)
+            self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
         }
-        return identity
+        return log.identity
     }
 }
 
@@ -847,15 +850,16 @@ enum SwitchEngine {
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
             return SwitchOutcome(ok: true, message: "Already using \(target.name).", confirmed: true)
         }
-        // Read before the quit: these are the chats whose last turn ended at a usage limit.
-        let limited = LimitLog.stoppedSessions(in: ClaudeApp.currentRunText())
-
         let current: (acct: AccountRecord, id: Identity)?
         let answered: Bool
         switch await prepare(accounts: accounts, unattended: unattended, progress: progress) {
         case .failure(let e): return e.outcome
         case .success(let p): current = p.current; answered = p.answered
         }
+        // Claude has quit, so its log ends with the run that just finished: the chats it stopped
+        // for usage and the ones whose turn the quit cut off are the chats that were working.
+        var ended = LogFollower()
+        ended.read(ClaudeApp.currentRunText())
         guard var journal = startJournal(from: current?.id, to: want) else {
             await ClaudeApp.launch()
             return SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed.")
@@ -885,8 +889,8 @@ enum SwitchEngine {
             try? FileManager.default.moveItem(at: SwitchJournal.url,
                                               to: URL(fileURLWithPath: journal.backup).appendingPathComponent("switch.json"))
             pruneBackups()
-            let reports = await ChatResume.run(ResumeRule.toResume(chats, limited: limited), in: ClaudeApp.folder(want),
-                                               reopenedAt: reopenedAt, progress: progress)
+            let working = ResumeRule.toResume(chats, stoppedByLimit: ended.stoppedByLimit, cutByQuit: ended.cutByQuit)
+            let reports = await ChatResume.run(working, in: ClaudeApp.folder(want), reopenedAt: reopenedAt, progress: progress)
             let resumed = reports.filter { $0.result == .running || $0.result == .sent }
             let waiting = reports.compactMap { r -> String? in
                 if case .notResumed(let why) = r.result { return "\(r.chat.title) (\(why))" }
@@ -896,7 +900,7 @@ enum SwitchEngine {
             if !reports.isEmpty {
                 message += " \(resumed.count) of \(reports.count) stopped chat\(reports.count == 1 ? "" : "s") running again."
             } else if answered {
-                message += " No chat was marked as stopped; check the ones that were working."
+                message += " No stopped chat was found; check the ones that were working."
             }
             return SwitchOutcome(ok: true, message: message, moved: chats.count, confirmed: true, backup: journal.backup,
                                  resumed: resumed.map(\.chat.title), notResumed: waiting)
@@ -1045,8 +1049,8 @@ enum SwitchEngine {
             let text = ClaudeApp.logText(since: mark)
             guard let start = text.range(of: "Starting app {") else { continue }
             let run = text[start.upperBound...]
-            if run.split(separator: "\n").contains(where: ClaudeApp.signsOut) { return .signedOut }
-            let now = ClaudeApp.identity(after: String(run), from: nil)
+            if run.split(separator: "\n").contains(where: LogFollower.signsOut) { return .signedOut }
+            let now = LogFollower.identity(after: String(run), from: nil)
             if now != seen { seen = now; seenSince = Date() }
             let held = Date().timeIntervalSince(seenSince)
             if now == want, held >= 4 { return .confirmed }
@@ -1090,9 +1094,10 @@ enum SwitchEngine {
 
 // MARK: - After a switch
 
-/// Gets the chats a quit or a usage limit stopped running again after a switch, through
-/// ChatResumer: Claude resumes the ones a quit cut off by itself, and each chat still idle gets a
-/// new message, "resume", typed into its own message box. Never Retry: retrying the failed
+/// Gets the chats that were working, which a usage limit or the quit stopped, running again after
+/// a switch, through ChatResumer: Claude resumes the ones it marked as cut off by the quit by
+/// itself, and each chat still idle gets a new message, "resume", typed into its own message
+/// box. Never Retry: retrying the failed
 /// message rewinds the chat and starts its transcript over without its subagents.
 enum ChatResume {
     /// A moved session record as the resume step needs it.
@@ -1111,7 +1116,7 @@ enum ChatResume {
             running: { chat in
                 let obj = ClaudeApp.record(folder.appendingPathComponent(chat.id + ".json"))
                 let lastActivity = (obj?["lastActivityAt"] as? Double) ?? 0
-                // A chat a limit stopped has no mark to clear; only new activity shows it ran.
+                // A chat without Claude's mark has nothing to clear; only new activity shows it ran.
                 return chat.interrupted
                     ? ResumeRule.resumed(markStillSet: obj?["interruptedByQuitAt"] is NSNumber, lastActivity: lastActivity, reopenedAt: reopenedAt)
                     : lastActivity > reopenedAt
@@ -1129,10 +1134,11 @@ enum Notify {
                                env: nil, cwd: nil, timeout: 10)
     }
 
-    /// The outcome of an unattended switch, naming the stopped chats it couldn't get running. The
-    /// message they need has to be a new one: Retry on the failed message starts the chat over.
-    static func outcome(_ outcome: SwitchOutcome) {
-        var body = outcome.message
+    /// The outcome of an unattended switch, after `reason` when auto-switch started it, naming the
+    /// stopped chats it couldn't get running. The message they need has to be a new one: Retry on
+    /// the failed message starts the chat over.
+    static func outcome(_ outcome: SwitchOutcome, reason: String? = nil) {
+        var body = [reason, outcome.message].compactMap { $0 }.joined(separator: " ")
         let waiting = outcome.notResumed
         if !waiting.isEmpty {
             let more = waiting.count > 3 ? " and \(waiting.count - 3) more" : ""
@@ -1172,31 +1178,65 @@ enum UsageCache {
 
     /// The auto-switch rule's view of each row, from cached readings.
     static func candidates(_ accounts: [AccountRecord], _ entries: [String: Entry]) -> [SwitchCandidate] {
-        accounts.map { acct in
+        let outUntil = AutoSwitchLog.outUntil()
+        return accounts.map { acct in
             let e = entries[acct.id]
             let hasReading = e?.fiveHour != nil || e?.weekly != nil || e?.plan != nil
-            return SwitchCandidate(id: acct.id, name: acct.name, fiveHour: e?.fiveHour?.pct, weekly: e?.weekly?.pct,
+            return SwitchCandidate(acct, fiveHour: e?.fiveHour, weekly: e?.weekly,
                                    readAt: hasReading ? (e?.readAt ?? e?.polledAt) : nil,
                                    needsSignIn: e?.loginExpiresAt.map { $0.timeIntervalSinceNow < API.signInWarning } ?? false,
-                                   hasSavedLogin: LoginSlot.exists(acct))
+                                   outUntil: outUntil[acct.id])
         }
     }
 }
 
-/// When auto-switch last tried, shared by the menu and the command line so the cool-down holds
-/// across both and across relaunches.
+extension SwitchCandidate {
+    /// A row with its unrounded meters and their resets.
+    init(_ acct: AccountRecord, fiveHour: UsageWindow?, weekly: UsageWindow?, readAt: Date?, needsSignIn: Bool, outUntil: Date?) {
+        self.init(id: acct.id, name: acct.name, fiveHour: fiveHour?.utilization, weekly: weekly?.utilization,
+                  readAt: readAt, needsSignIn: needsSignIn, hasSavedLogin: LoginSlot.exists(acct),
+                  fiveHourResetsAt: fiveHour?.resetsAt, weeklyResetsAt: weekly?.resetsAt, outUntil: outUntil)
+    }
+}
+
+/// When auto-switch last tried and which rows it left out of usage, shared by the menu and the
+/// command line so the cool-down and that memory hold across both and across relaunches.
 enum AutoSwitchLog {
-    private struct File: Codable { var lastAttempt: Date; var outcome: String? }
+    private struct File: Codable {
+        var lastAttempt: Date
+        var outcome: String?
+        /// Rows a switch left because Claude stopped a chat at their limit, each until its reset.
+        var outUntil: [String: Date]?
+    }
     private static var url: URL { Paths.stateDir.appendingPathComponent("auto-switch.json") }
 
-    static func lastAttempt() -> Date? {
+    private static func load() -> File? {
         guard let data = try? Data(contentsOf: url) else { return nil }
-        return (try? JSONDecoder().decode(File.self, from: data))?.lastAttempt
+        return try? JSONDecoder().decode(File.self, from: data)
     }
 
-    static func record(_ date: Date, outcome: String? = nil) {
-        guard let data = try? JSONEncoder().encode(File(lastAttempt: date, outcome: outcome)) else { return }
+    private static func save(_ file: File) {
+        guard let data = try? JSONEncoder().encode(file) else { return }
         try? data.write(to: url, options: .atomic)
+    }
+
+    static func lastAttempt() -> Date? { load()?.lastAttempt }
+
+    /// Rows still counted as out, by id.
+    static func outUntil(now: Date = Date()) -> [String: Date] { (load()?.outUntil ?? [:]).filter { $0.value > now } }
+
+    /// An automatic switch starts at `date`, leaving `row` out of usage until `until`.
+    static func started(_ date: Date, leaving row: String, outUntil until: Date) {
+        var out = outUntil(now: date)
+        out[row] = until
+        save(File(lastAttempt: date, outcome: nil, outUntil: out))
+    }
+
+    /// The automatic switch that started last ended with `outcome`.
+    static func finished(_ outcome: String) {
+        guard var file = load() else { return }
+        file.outcome = outcome
+        save(file)
     }
 }
 
@@ -1225,7 +1265,7 @@ final class Store: ObservableObject {
     @Published var accessibilityGranted = QuitPrompt.trusted
 
     private var timer: Timer?
-    private let identityWatcher = IdentityWatcher()
+    private let logWatcher = LogWatcher()
     private var polledAt: [String: Date] = [:]
     /// When each row's shown reading was taken.
     private var readAt: [String: Date] = [:]
@@ -1264,7 +1304,7 @@ final class Store: ObservableObject {
     func refresh(forcing forcedId: String? = nil, manual: Bool = false) {
         guard !loading else { return }
         accounts = AccountStore.load()
-        inUse = identityWatcher.poll()
+        inUse = logWatcher.poll()
         let now = Date()
         let due = accounts.filter { acct in
             if let until = retryAt[acct.id], until > now { return false }
@@ -1337,26 +1377,30 @@ final class Store: ObservableObject {
 
     // MARK: Auto-switch
 
-    /// Run the auto-switch rule on the readings on screen, and switch with nobody at the Mac
-    /// when it says so. The attempt is logged before it starts, so the cool-down holds even if
-    /// this app quits partway.
+    /// Run the auto-switch rule, and switch with nobody at the Mac when it says so. Claude's log
+    /// is read first, so a chat Claude stops for usage is acted on at the next tick. The attempt
+    /// is logged before it starts, so the cool-down holds even if this app quits partway.
     func considerAutoSwitch() {
         guard settings.autoSwitch, switching == nil else { return }
+        inUse = logWatcher.poll()
+        let now = Date()
+        let outUntil = AutoSwitchLog.outUntil(now: now)
         let all = accounts.map { acct in
-            var fiveHour: Int?, weekly: Int?, taken: Date?
-            if case .ok(_, let fh, let wk, _) = states[acct.id] { fiveHour = fh?.pct; weekly = wk?.pct; taken = readAt[acct.id] }
-            return SwitchCandidate(id: acct.id, name: acct.name, fiveHour: fiveHour, weekly: weekly, readAt: taken,
-                                   needsSignIn: states[acct.id]?.needsSignIn ?? false, hasSavedLogin: LoginSlot.exists(acct))
+            var fiveHour: UsageWindow?, weekly: UsageWindow?, taken: Date?
+            if case .ok(_, let fh, let wk, _) = states[acct.id] { fiveHour = fh; weekly = wk; taken = readAt[acct.id] }
+            return SwitchCandidate(acct, fiveHour: fiveHour, weekly: weekly, readAt: taken,
+                                   needsSignIn: states[acct.id]?.needsSignIn ?? false, outUntil: outUntil[acct.id])
         }
         let current = accounts.row(for: inUse).flatMap { row in all.first { $0.id == row.id } }
-        // Only look for Claude's process once the account in use is out; `ps` is the reliable check.
-        let out = current?.out ?? false
-        let decision = AutoSwitchRule.decide(current: current, others: all, enabled: true,
-                                             claudeRunning: out && !ClaudeApp.pids().isEmpty,
-                                             lastAttempt: AutoSwitchLog.lastAttempt(), now: Date())
+        // The log's stops belong to the account it names, which is `inUse`.
+        let stopped = !logWatcher.log.stoppedByLimit.isEmpty
+        // Only look for Claude's process once Claude has stopped a chat; `ps` is the reliable check.
+        let decision = AutoSwitchRule.decide(current: current, others: all, enabled: true, limitStopped: stopped,
+                                             claudeRunning: stopped && !ClaudeApp.pids().isEmpty,
+                                             lastAttempt: AutoSwitchLog.lastAttempt(), now: now)
         switch decision {
         case .stay:
-            if !out { toldNowhereFor = nil }
+            if !stopped { toldNowhereFor = nil }
         case .nowhere(let why):
             // Once per account running out, not on every tick while it stays out.
             guard toldNowhereFor != current?.id else { return }
@@ -1364,11 +1408,11 @@ final class Store: ObservableObject {
             flash(why, for: 10)
             Notify.post("Claude Accounts didn't switch", why)
         case .switchTo(let id, let reason):
-            guard let target = accounts.first(where: { $0.id == id }) else { return }
+            guard let target = accounts.first(where: { $0.id == id }), let current else { return }
             toldNowhereFor = nil
-            AutoSwitchLog.record(Date())
+            AutoSwitchLog.started(now, leaving: current.id, outUntil: AutoSwitchRule.outUntil(leaving: current, now: now))
             flash(reason, for: 10)
-            runSwitch(notify: true) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1) }
+            runSwitch(notify: reason) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1) }
         }
     }
 
@@ -1427,8 +1471,9 @@ final class Store: ObservableObject {
     /// Reopen Claude at its sign-in page for an account that has no saved Claude login yet.
     func setUp(_ target: AccountRecord) { runSwitch { await SwitchEngine.setUp(target, accounts: $0, progress: $1) } }
 
-    /// `notify` posts the outcome as a notification, for a switch nobody watched.
-    private func runSwitch(notify: Bool = false,
+    /// `notify` posts the outcome as a notification after that reason, for a switch auto-switch
+    /// started with nobody watching.
+    private func runSwitch(notify reason: String? = nil,
                            _ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress) async -> SwitchOutcome) {
         guard switching == nil else { return }
         switching = "Starting…"
@@ -1437,10 +1482,10 @@ final class Store: ObservableObject {
             let outcome = await body(all) { step in Task { @MainActor in self.switching = step } }
             self.switching = nil
             self.flash(outcome.message, for: 10)
-            self.inUse = self.identityWatcher.poll()
-            if notify {
-                AutoSwitchLog.record(AutoSwitchLog.lastAttempt() ?? Date(), outcome: outcome.message)
-                Notify.outcome(outcome)
+            self.inUse = self.logWatcher.poll()
+            if let reason {
+                AutoSwitchLog.finished(outcome.message)
+                Notify.outcome(outcome, reason: reason)
             }
         }
     }
@@ -1941,6 +1986,7 @@ struct MenuContent: View {
                     Divider()
                     Toggle("Auto-Switch When Out", isOn: Binding(get: { store.settings.autoSwitch },
                                                                 set: { store.setAutoSwitch($0) }))
+                        .help("When Claude stops a chat because the account in use is out of usage, quit Claude, reopen it on the account with the most room, and send \u{201C}resume\u{201D} to the chats that were working")
                     Toggle("Open at Login", isOn: Binding(get: { store.openAtLogin }, set: { _ in store.toggleOpenAtLogin() }))
                     Divider()
                     Button("Quit Claude Accounts") { NSApp.terminate(nil) }.keyboardShortcut("q")
@@ -1958,7 +2004,7 @@ struct MenuContent: View {
             }
             if store.settings.autoSwitch, !store.accessibilityGranted {
                 HStack {
-                    Text("Allow Accessibility so auto-switch can answer Claude's quit prompt and resume stopped chats.")
+                    Text("Auto-switch moves Claude to another account when Claude stops a chat at the usage limit. Allow Accessibility so it can answer Claude's quit prompt and send \u{201C}resume\u{201D} to the chats that were working.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Spacer()
                     Button("Allow…") { store.setAutoSwitch(true) }.controlSize(.small)
@@ -2231,8 +2277,9 @@ private func drawWarning(centeredAt mid: NSPoint) {
 /// - `--status` prints what a switch would act on.
 /// - `--switch <account>` runs the menu's switch. The account can be named by id, label, email,
 ///   or the email's first part.
-/// - `--auto-switch` runs the menu's Auto-Switch rule once on the usage the menu last read:
-///   if the account in use is out, it switches to the set-up account with the most room.
+/// - `--auto-switch` runs the menu's Auto-Switch rule once: if Claude's log shows it stopped a
+///   chat of the account in use for usage, it switches to the set-up account with the most room,
+///   judged on the usage the menu last read.
 /// - `--unattended` (implied by `--auto-switch`) answers Claude's quit prompt with Quit anyway.
 /// - `--dry-run` prints every check and what would happen, and changes nothing.
 /// - `--detach` starts the same command in its own session, so it outlives Claude quitting even
@@ -2258,11 +2305,16 @@ enum Entry {
         let unattended = auto || args.contains("--unattended")
 
         let target: AccountRecord
+        var autoReason: String?
         if auto {
-            let decision = printDecision(accounts: accounts)
+            let (decision, current) = printDecision(accounts: accounts)
             switch decision {
-            case .switchTo(let id, _) where accounts.contains { $0.id == id }:
+            case .switchTo(let id, let reason) where accounts.contains { $0.id == id }:
                 target = accounts.first { $0.id == id }!
+                autoReason = reason
+                if !dryRun, let current {
+                    AutoSwitchLog.started(Date(), leaving: current.id, outUntil: AutoSwitchRule.outUntil(leaving: current, now: Date()))
+                }
             case .nowhere(let why):
                 if dryRun { exit(0) }
                 Notify.post("Claude Accounts didn't switch", why)
@@ -2286,7 +2338,6 @@ enum Entry {
             target = match
         }
         if dryRun { printPlan(to: target, accounts: accounts, unattended: unattended) }
-        if auto { AutoSwitchLog.record(Date()) }
         final class Box: @unchecked Sendable { var outcome = SwitchOutcome(ok: false, message: "did not run") }
         let box = Box(), done = DispatchSemaphore(value: 0)
         Task.detached {
@@ -2296,8 +2347,8 @@ enum Entry {
             done.signal()
         }
         done.wait()
-        if auto { AutoSwitchLog.record(AutoSwitchLog.lastAttempt() ?? Date(), outcome: box.outcome.message) }
-        if unattended { Notify.outcome(box.outcome) }
+        if auto { AutoSwitchLog.finished(box.outcome.message) }
+        if unattended { Notify.outcome(box.outcome, reason: autoReason) }
         finish(box.outcome, save: true)
     }
 
@@ -2334,30 +2385,35 @@ enum Entry {
         exit(0)
     }
 
-    /// `--auto-switch`: the rule's inputs and answer, read from the usage the menu last saved.
-    private static func printDecision(accounts: [AccountRecord]) -> AutoSwitchRule.Decision {
-        let entries = UsageCache.load()
-        let all = UsageCache.candidates(accounts, entries)
-        let current = accounts.row(for: ClaudeApp.currentIdentity()).flatMap { row in all.first { $0.id == row.id } }
+    /// `--auto-switch`: the rule's inputs and answer, from Claude's log and the usage the menu
+    /// last saved. Returns the row in use too, which a switch leaves out of usage.
+    private static func printDecision(accounts: [AccountRecord]) -> (AutoSwitchRule.Decision, SwitchCandidate?) {
+        var log = LogFollower()
+        log.read(ClaudeApp.currentRunText())
+        let all = UsageCache.candidates(accounts, UsageCache.load())
+        let current = accounts.row(for: log.identity).flatMap { row in all.first { $0.id == row.id } }
+        let now = Date()
         func describe(_ c: SwitchCandidate) -> String {
             guard let read = c.readAt else { return "no reading" }
-            let age = max(Int(Date().timeIntervalSince(read) / 60), 0)
-            return "\(c.used)% (5-hour \(c.fiveHour ?? 0)%, weekly \(c.weekly ?? 0)%), read \(age) min ago"
-                + (c.hasSavedLogin ? "" : ", not set up") + (c.needsSignIn ? ", needs sign-in" : "")
+            let age = max(Int(now.timeIntervalSince(read) / 60), 0)
+            return "5-hour \(AutoSwitchRule.percent(c.fiveHour ?? 0)), weekly \(AutoSwitchRule.percent(c.weekly ?? 0)), read \(age) min ago"
+                + (c.isOut(at: now) ? ", out" : "") + (c.hasSavedLogin ? "" : ", not set up") + (c.needsSignIn ? ", needs sign-in" : "")
         }
         print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
         print("In use:             \(current.map { "\($0.name): \(describe($0))" } ?? "an account this app doesn't know")")
+        print("Stopped for usage:  \(log.stoppedByLimit.count) chat\(log.stoppedByLimit.count == 1 ? "" : "s") in Claude's log")
         for c in all where c.id != current?.id { print("Other:              \(c.name): \(describe(c))") }
         let last = AutoSwitchLog.lastAttempt()
         print("Last auto attempt:  \(last.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "never")")
-        let decision = AutoSwitchRule.decide(current: current, others: all, enabled: true,
-                                             claudeRunning: !ClaudeApp.pids().isEmpty, lastAttempt: last, now: Date())
+        let stopped = !log.stoppedByLimit.isEmpty
+        let decision = AutoSwitchRule.decide(current: current, others: all, enabled: true, limitStopped: stopped,
+                                             claudeRunning: stopped && !ClaudeApp.pids().isEmpty, lastAttempt: last, now: now)
         switch decision {
         case .stay(let why): print("Decision:           stay. \(why)")
         case .nowhere(let why): print("Decision:           stay and notify. \(why)")
         case .switchTo(let id, let why): print("Decision:           switch to \(accounts.first { $0.id == id }?.name ?? id). \(why)")
         }
-        return decision
+        return (decision, current)
     }
 
     /// `--status`: what a switch would act on, read-only.
@@ -2369,7 +2425,7 @@ enum Entry {
         print("Claude reports:   \(id.map { "\(accounts.row(for: $0)?.name ?? "an unknown account") (organization \($0.org.prefix(8)))" } ?? "signed out")")
         print("Claude settings:  \(name(ClaudeApp.savedAccount()))")
         print("Interrupted switch: \(SwitchJournal.load() == nil ? "none" : "yes")")
-        print("Auto-switch:      \(AppSettings.load().autoSwitch ? "on, when the account in use runs out" : "off")")
+        print("Auto-switch:      \(AppSettings.load().autoSwitch ? "on, when Claude stops a chat at the usage limit" : "off")")
         print("Accessibility:    \(QuitPrompt.trusted ? "granted to this process" : "not granted to this process")")
         for acct in accounts {
             print("Saved login \(acct.name): \(LoginSlot.identity(acct).map { "organization \($0.org.prefix(8))" } ?? "none")")
@@ -2395,14 +2451,15 @@ enum Entry {
         print("Claude processes:   \(ClaudeApp.pids().count)")
         let records = current.map { ClaudeApp.openSessionRecords(in: ClaudeApp.folder($0)) } ?? []
         print("Open sessions:      \(records.count) would move to \(target.name)")
-        let limited = LimitLog.stoppedSessions(in: ClaudeApp.currentRunText())
-        let stopped = records.compactMap(ChatResume.chat).filter { limited.contains($0.id) }.count
-        print("Stopped at a limit: \(stopped) chat\(stopped == 1 ? "" : "s"), sent \u{201C}\(ResumeRule.message)\u{201D} after the switch")
+        var log = LogFollower()
+        log.read(ClaudeApp.currentRunText())
+        let stopped = records.compactMap(ChatResume.chat).filter { log.stoppedByLimit.contains($0.id) }.count
+        print("Stopped for usage:  \(stopped) chat\(stopped == 1 ? "" : "s"), sent \u{201C}\(ResumeRule.message)\u{201D} after the switch")
         if unattended {
             print("Quit prompt:        " + (QuitPrompt.trusted
                 ? "answered with \(QuitPrompt.quitAnyway) through Accessibility"
                 : "waits for a person: this process has no Accessibility access"))
-            print("After the switch:   each chat the quit or a limit stopped runs again: Claude resumes it, or it is sent \u{201C}\(ResumeRule.message)\u{201D}")
+            print("After the switch:   each chat that was working, stopped by the limit or cut off by the quit, runs again: Claude resumes it, or it is sent \u{201C}\(ResumeRule.message)\u{201D}")
         } else {
             print("Quit prompt:        waits for a person while it is open")
         }

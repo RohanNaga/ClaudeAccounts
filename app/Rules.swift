@@ -1,7 +1,7 @@
 // The decisions behind switching, kept free of AppKit, files and the network so the tests in
-// tests/RulesTests.swift drive them directly: which account a Claude identity belongs to, when
-// auto-switch moves and to which account, how a quit request is followed to its end, and which
-// stopped chats get a new message after a switch.
+// tests/RulesTests.swift drive them directly: which account a Claude identity belongs to, what
+// Claude's log says, when auto-switch moves and to which account, how a quit request is followed
+// to its end, and which stopped chats get a new message after a switch.
 
 import Foundation
 
@@ -82,32 +82,40 @@ func rowName(email: String?, orgName: String?, accountAlreadyAdded: Bool, fallba
 struct SwitchCandidate: Equatable {
     let id: String
     let name: String
-    /// Percent used; nil when the window hasn't started, which counts as nothing used.
-    let fiveHour: Int?
-    let weekly: Int?
+    /// Percent used, unrounded; nil when the window hasn't started, which counts as nothing used.
+    let fiveHour: Double?
+    let weekly: Double?
     /// When this reading was taken; nil when there is no reading at all.
     let readAt: Date?
     let needsSignIn: Bool
     let hasSavedLogin: Bool
+    /// When each meter of this reading resets.
+    var fiveHourResetsAt: Date? = nil
+    var weeklyResetsAt: Date? = nil
+    /// Until when a switch away from this row counts it as out, whatever its meters read.
+    var outUntil: Date? = nil
 
-    /// The fuller of the two meters: whichever runs out first stops the chats.
-    var used: Int { Swift.max(fiveHour ?? 0, weekly ?? 0) }
+    /// The fuller of the two meters.
+    var used: Double { Swift.max(fiveHour ?? 0, weekly ?? 0) }
 
-    /// At its limit on either meter: Claude stops every chat on this account until it resets.
-    var out: Bool { used >= AutoSwitchRule.limit }
+    /// Out of usage: a meter at its limit, compared unrounded, or a switch left this row and its
+    /// reset hasn't come yet.
+    func isOut(at now: Date) -> Bool { used >= AutoSwitchRule.limit || (outUntil.map { now < $0 } ?? false) }
 }
 
 enum AutoSwitchRule {
     /// On without touching anything; the header menu turns it off.
     static let onByDefault = true
-    /// A meter at 100 percent is the limit: the account is out of usage.
-    static let limit = 100
+    /// A meter at 100 percent is the limit.
+    static let limit: Double = 100
     /// No second automatic try this soon after the last one, whatever its outcome, so a failed
-    /// switch never quits Claude over and over. Switching back can't flap: the account left
-    /// behind is out, and an account that is out is never a target.
+    /// switch never quits Claude over and over.
     static let coolDown: TimeInterval = 10 * 60
-    /// A reading older than this is not trusted to start or choose a switch.
+    /// A reading older than this is not trusted to choose a target.
     static let freshness: TimeInterval = 15 * 60
+    /// How long the row a switch leaves counts as out when its reading shows no reset ahead: the
+    /// length of the shorter usage window.
+    static let outWithoutReset: TimeInterval = 5 * 3600
 
     enum Decision: Equatable {
         case stay(String)
@@ -116,34 +124,47 @@ enum AutoSwitchRule {
         case nowhere(String)
     }
 
-    /// Whether to switch now, and to which row: once the account in use is out of usage, to the
-    /// set-up account with the most room left.
-    static func decide(current: SwitchCandidate?, others: [SwitchCandidate], enabled: Bool,
+    /// Whether to switch now, and to which row. The one trigger is Claude itself: it stopped a
+    /// chat of the account in use because that account is out of usage (`limitStopped`, from
+    /// Claude's log). The meters never start a switch; they choose the target, the set-up
+    /// account with the most room, and rule out any account that is out.
+    static func decide(current: SwitchCandidate?, others: [SwitchCandidate], enabled: Bool, limitStopped: Bool,
                        claudeRunning: Bool, lastAttempt: Date?, now: Date) -> Decision {
         guard enabled else { return .stay("Auto-switch is off.") }
-        guard claudeRunning else { return .stay("Claude isn't running.") }
         guard let current else { return .stay("Claude isn't using an account this app knows.") }
-        guard fresh(current, now) else { return .stay("No recent usage reading for \(current.name).") }
-        guard current.out else { return .stay("\(current.name) is at \(current.used)%; it switches when it runs out.") }
+        guard limitStopped else { return .stay("Claude hasn't stopped a chat of \(current.name) at its usage limit.") }
+        guard claudeRunning else { return .stay("Claude isn't running.") }
         if let lastAttempt, now.timeIntervalSince(lastAttempt) < coolDown {
             return .stay("\(current.name) is out, but the last try was under \(Int(coolDown / 60)) minutes ago; next try after \(clock(lastAttempt.addingTimeInterval(coolDown))).")
         }
         let eligible = others.filter {
-            $0.id != current.id && $0.hasSavedLogin && !$0.needsSignIn && fresh($0, now) && !$0.out
+            $0.id != current.id && $0.hasSavedLogin && !$0.needsSignIn && fresh($0, now) && !$0.isOut(at: now)
         }
         guard let best = eligible.min(by: { a, b in
             if a.used != b.used { return a.used < b.used }
             if (a.weekly ?? 0) != (b.weekly ?? 0) { return (a.weekly ?? 0) < (b.weekly ?? 0) }
             return a.name < b.name
         }) else {
-            return .nowhere("\(current.name) is out of usage, and no other set-up account has room. Chats wait until a limit resets.")
+            return .nowhere("Claude stopped a chat at \(current.name)'s usage limit, and no other set-up account has room. Chats wait until a limit resets.")
         }
-        return .switchTo(id: best.id, reason: "\(current.name) is out of usage; \(best.name) is at \(best.used)%.")
+        return .switchTo(id: best.id, reason: "Claude stopped a chat at \(current.name)'s usage limit; \(best.name) is at \(percent(best.used)).")
+    }
+
+    /// Until when the row a switch leaves counts as out: the reset of its fuller meter, else of
+    /// the other one, else `outWithoutReset` from now. A reading that hasn't caught up with the
+    /// limit can't send a later switch back to it before then.
+    static func outUntil(leaving row: SwitchCandidate, now: Date) -> Date {
+        let ahead = [(row.fiveHour ?? 0, row.fiveHourResetsAt), (row.weekly ?? 0, row.weeklyResetsAt)]
+            .compactMap { used, reset in reset.flatMap { $0 > now ? (used, $0) : nil } }
+        return ahead.max { $0.0 < $1.0 }?.1 ?? now.addingTimeInterval(outWithoutReset)
     }
 
     private static func fresh(_ c: SwitchCandidate, _ now: Date) -> Bool {
         c.readAt.map { now.timeIntervalSince($0) <= freshness } ?? false
     }
+
+    /// Rounded down, so an account short of its limit never reads as 100 percent.
+    static func percent(_ used: Double) -> String { "\(Int(used.rounded(.down)))%" }
 
     private static func clock(_ date: Date) -> String {
         let f = DateFormatter()
@@ -152,23 +173,72 @@ enum AutoSwitchRule {
     }
 }
 
-/// Which chats Claude stopped at a usage limit, read from its log. Such a chat's turn already
-/// ended with the limit error, so no quit cuts it off and Claude doesn't resume it at its next
-/// launch; it waits for a new message. Retrying the failed message instead rewinds the chat
-/// and starts its transcript over under a new id, without its subagents.
-enum LimitLog {
-    /// Sessions whose last outcome in `text` (one run of Claude's log) is a usage-limit error.
-    static func stoppedSessions(in text: String) -> Set<String> {
-        var stopped = Set<String>()
-        for line in text.split(separator: "\n") where line.contains("[CCD CycleHealth]") {
-            if let id = session(after: "[CCD CycleHealth] ", in: line), line.contains(" api_error ("),
-               line.contains("You've hit your"), line.contains("limit") {
-                stopped.insert(id)
-            } else if let id = session(after: "[CCD CycleHealth] healthy cycle for ", in: line) {
-                stopped.remove(id)
+// MARK: - Claude's log
+
+/// Claude's own log, read in order as it grows: the account and organization whose chats Claude
+/// shows, and which of those chats it stopped for usage or cut off by quitting. A new run, a
+/// sign-out or another account starts both sets over, so each entry belongs to the account
+/// Claude named above it.
+struct LogFollower {
+    /// Who Claude says it is: the Code tab logs the account and organization whose chats it loads
+    /// at every launch and every account change; a restart or a sign-out clears it until then.
+    private(set) var identity: Identity?
+    /// Chats whose last turn Claude ended because the account is out of usage. Such a chat is
+    /// idle and Claude doesn't resume it; it waits for a new message. Retrying the failed message
+    /// instead rewinds the chat and starts its transcript over under a new id, without its subagents.
+    private(set) var stoppedByLimit: Set<String> = []
+    /// Chats whose turn was still running when Claude quit.
+    private(set) var cutByQuit: Set<String> = []
+
+    /// Claude's own messages for a turn refused because the account is out of usage.
+    static let outOfUsage = [
+        "You've hit your", "You've reached your", "You're out of usage credits", "You're out of extra usage",
+        "Your org is out of usage", "Your seat type doesn't include", "Your usage allocation has been disabled",
+        "Your group's usage limit is set to $0", "requires usage credits",
+    ]
+
+    init(identity: Identity? = nil) { self.identity = identity }
+
+    mutating func read(_ text: String) {
+        for line in text.split(separator: "\n") {
+            if line.contains("[LocalSessionManager] Initialization succeeded"),
+               let account = Self.field(line, "accountId="), let org = Self.field(line, "orgId=") {
+                let named = Identity(account: account, org: org)
+                if named != identity { stoppedByLimit = []; cutByQuit = [] }
+                identity = named
+            } else if line.contains("Starting app {") || Self.signsOut(line) {
+                identity = nil
+                stoppedByLimit = []
+                cutByQuit = []
+            } else if line.contains("[CCD CycleHealth] ") {
+                if let id = Self.session(after: "[CCD CycleHealth] healthy cycle for ", in: line) {
+                    stoppedByLimit.remove(id)
+                    cutByQuit.remove(id)
+                } else if let id = Self.session(after: "[CCD CycleHealth] unhealthy cycle for ", in: line) {
+                    if line.contains("reason=app_quit") { cutByQuit.insert(id) }
+                } else if let id = Self.session(after: "[CCD CycleHealth] ", in: line), line.contains(" api_error ("),
+                          Self.outOfUsage.contains(where: { line.contains($0) }) {
+                    stoppedByLimit.insert(id)
+                }
             }
         }
-        return stopped
+    }
+
+    /// Who Claude says it is after reading `text`, starting from `start`.
+    static func identity(after text: String, from start: Identity?) -> Identity? {
+        var follower = LogFollower(identity: start)
+        follower.read(text)
+        return follower.identity
+    }
+
+    static func signsOut<S: StringProtocol>(_ line: S) -> Bool {
+        line.contains("Navigated to /logout") || line.contains("loggedOut: false \u{2192} true")
+    }
+
+    private static func field<S: StringProtocol>(_ line: S, _ key: String) -> String? {
+        guard let r = line.range(of: key) else { return nil }
+        let value = line[r.upperBound...].prefix { $0.isHexDigit || $0 == "-" }
+        return value.count == 36 ? String(value) : nil
     }
 
     private static func session<S: StringProtocol>(after marker: String, in line: S) -> String? {
@@ -316,12 +386,16 @@ enum ResumeRule {
         case done(Result)
     }
 
-    /// The chats to get running again: every moved chat a quit cut off or a usage limit stopped,
-    /// each once, most recently active first. A chat neither stopped is left alone.
-    static func toResume(_ chats: [MovedChat], limited: Set<String>) -> [MovedChat] {
+    /// The chats to get running again: every moved chat that was working when the switch began,
+    /// which is each one Claude stopped for usage (`stoppedByLimit`) and each one whose turn the
+    /// quit cut off (Claude's mark, or `cutByQuit` from its log). Each once, most recently active
+    /// first. A chat that was idle is left alone.
+    static func toResume(_ chats: [MovedChat], stoppedByLimit: Set<String>, cutByQuit: Set<String>) -> [MovedChat] {
         var seen = Set<String>()
-        return chats.filter { ($0.interrupted || limited.contains($0.id)) && seen.insert($0.id).inserted }
-            .sorted { $0.lastActivity > $1.lastActivity }
+        return chats.filter { chat in
+            (chat.interrupted || cutByQuit.contains(chat.id) || stoppedByLimit.contains(chat.id)) && seen.insert(chat.id).inserted
+        }
+        .sorted { $0.lastActivity > $1.lastActivity }
     }
 
     /// A chat a quit cut off has resumed once Claude cleared its mark or it ran after Claude reopened.
