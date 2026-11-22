@@ -15,6 +15,13 @@ swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/rules-tests" \
   "$ROOT/app/Rules.swift" "$ROOT/tests/RulesTests.swift"
 "$OUT/rules-tests"
 
+# The menu's status line wraps to every line it needs: a cut-off instruction can't be followed.
+status=$(grep -A4 'if let msg = store.message {' "$ROOT/app/ClaudeAccounts.swift")
+if ! grep -q 'Text(msg).*fixedSize(horizontal: false, vertical: true)' <<<"$status" || grep -qE 'lineLimit|truncationMode' <<<"$status"; then
+  echo "FAIL: the menu's status line must wrap (fixedSize vertical, no lineLimit or truncation)"; exit 1
+fi
+echo "Status line wraps: ok"
+
 swiftc -module-cache-path "$OUT" -o "$OUT/prompt-fixture" "$ROOT/tests/PromptFixture.swift"
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/prompt-test" \
   "$ROOT/app/QuitPrompt.swift" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/PromptTest.swift"

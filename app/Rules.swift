@@ -18,6 +18,7 @@ struct Identity: Equatable, Codable, Sendable {
 /// An account that belongs to two organizations has two rows, one per organization.
 struct AccountRecord: Codable, Identifiable, Equatable {
     let id: String
+    /// The account's name, the same on every row of the account.
     var name: String
     var color: String
     var configDir: String
@@ -27,11 +28,35 @@ struct AccountRecord: Codable, Identifiable, Equatable {
     var orgName: String?
     /// The organization this row stands for. Older rows lack it until it is filled in on load.
     var orgUuid: String?
+    /// A name someone gave this row's organization; nil shows the organization's own name.
+    var orgLabel: String? = nil
+    /// What the app calls this row: the account's name, then " · " and the organization when the
+    /// account has more than one row. Set on load, never saved.
+    var label = ""
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, color, configDir, keychainService, email, accountUuid, orgName, orgUuid, orgLabel
+    }
 
     var configURL: URL { URL(fileURLWithPath: (configDir as NSString).expandingTildeInPath) }
 
-    /// The organization's name as the app shows it; nil when Claude named it after an email.
-    var organization: String? { shownName(orgName) }
+    /// The organization's name as the app shows it: the name someone gave it, else its own name,
+    /// with "Individual" for the one Claude names after the account's email.
+    var organization: String { shownName(orgLabel) ?? defaultOrganizationName(orgName) }
+}
+
+/// Claude names an account's own individual organization "<email>'s Organization"; the app calls
+/// it "Individual". A team organization keeps its name.
+func defaultOrganizationName(_ orgName: String?) -> String {
+    guard let orgName, !orgName.isEmpty else { return "Organization" }
+    if orgName.contains("@") || orgName.hasSuffix("'s Organization") || orgName.hasSuffix("\u{2019}s Organization") { return "Individual" }
+    return orgName
+}
+
+/// An organization name that can name an account, which a team's name can and "Individual" can't.
+func teamName(_ orgName: String?) -> String? {
+    let name = defaultOrganizationName(orgName)
+    return name == "Individual" || name == "Organization" ? nil : name
 }
 
 /// A name the app may show, or nil when it holds an email address or part of one. Claude names a
@@ -78,24 +103,54 @@ extension Array where Element == AccountRecord {
         return opened.filter { !added.contains($0.org) }.sorted { $0.chats > $1.chats }.map(\.org)
     }
 
-    /// The label a row gets when it has none of its own: never an email. An account's first row
-    /// is named after its organization, else "Account N"; each further organization of the
-    /// account is "<the account's label> · <organization>", so its rows read apart.
-    func defaultLabel(for row: AccountRecord) -> String {
+    /// The name of the account `row` belongs to, never an email: the name its first row was
+    /// given, else its first organization's team name, else "Account N".
+    func accountName(for row: AccountRecord) -> String {
         let groups = groupedByAccount()
-        guard let g = groups.firstIndex(where: { $0.contains { $0.id == row.id } }),
-              let k = groups[g].firstIndex(where: { $0.id == row.id }) else { return row.name }
-        guard k > 0 else { return row.organization ?? "Account \(g + 1)" }
+        guard let g = groups.firstIndex(where: { $0.contains { $0.id == row.id } }) else {
+            return shownName(row.name) ?? teamName(row.orgName) ?? "Account \(groups.count + 1)"
+        }
         let first = groups[g][0]
-        return (shownName(first.name) ?? defaultLabel(for: first)) + " · " + (row.organization ?? "Organization \(k + 1)")
+        return shownName(first.name) ?? teamName(first.orgName) ?? "Account \(g + 1)"
     }
 
-    /// The rows with every label that shows an email replaced by its default label. Labels used
-    /// to default to the email, so this runs on load; the next save keeps the new labels.
-    func relabeled() -> [AccountRecord] {
+    /// The rows with their labels set: an account with one row is called by its name, and each
+    /// row of an account with several is "<account> · <organization>". Names used to default to
+    /// the email, so a name with one becomes the account's name; every other saved name is kept.
+    func labelled() -> [AccountRecord] {
         var rows = self
-        for i in rows.indices where shownName(rows[i].name) == nil { rows[i].name = rows.defaultLabel(for: rows[i]) }
+        for group in groupedByAccount() {
+            let account = rows.accountName(for: group[0])
+            for (k, member) in group.enumerated() {
+                guard let i = rows.firstIndex(where: { $0.id == member.id }) else { continue }
+                // Before organizations had names of their own, a further row's name was its whole label;
+                // one that isn't the old "<account> · <organization>" default was chosen for that organization.
+                if k > 0, rows[i].orgLabel == nil, let saved = shownName(rows[i].name), saved != account,
+                   !saved.hasSuffix(" · " + (rows[i].orgName ?? "")) { rows[i].orgLabel = saved }
+                if shownName(rows[i].name) == nil { rows[i].name = account }
+                rows[i].label = group.count > 1 ? "\(account) · \(rows[i].organization)" : account
+            }
+        }
         return rows
+    }
+
+    /// The rows after renaming `row`: an organization entry renames only its organization, and
+    /// anything else renames the account on every one of its rows. An empty name, or one with an
+    /// email in it, puts the default name back.
+    func renamed(_ row: AccountRecord, to text: String, organization: Bool) -> [AccountRecord] {
+        var rows = self
+        let name = shownName(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        if organization {
+            guard let i = rows.firstIndex(where: { $0.id == row.id }) else { return rows }
+            rows[i].orgLabel = name == defaultOrganizationName(rows[i].orgName) ? nil : name
+            rows[i].name = rows.accountName(for: rows[i])
+        } else {
+            let ids = Set(rows.filter { $0.id == row.id || ($0.accountUuid != nil && $0.accountUuid == row.accountUuid) }.map(\.id))
+            for i in rows.indices where ids.contains(rows[i].id) { rows[i].name = "" }
+            let fallback = rows.accountName(for: row)
+            for i in rows.indices where ids.contains(rows[i].id) { rows[i].name = name ?? fallback }
+        }
+        return rows.labelled()
     }
 }
 
@@ -110,6 +165,25 @@ enum AccountsFile {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         return try enc.encode(File(accounts: accounts))
+    }
+}
+
+extension String {
+    /// The text with its first letter in upper case, to start a sentence with a phrase.
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
+}
+
+/// How a row with no saved Claude login gets one, said the same way in the row and in --dry-run.
+/// The app saves a row's login when Claude leaves that account and organization, so the one-time
+/// step is to open it in Claude: choose the organization from your name at the bottom of Claude's
+/// sidebar when Claude is already signed in to the account, else sign in to it first.
+enum SetUpRule {
+    static func step(for row: AccountRecord, claudeAccount: String?) -> String {
+        let signedIn = row.accountUuid != nil && row.accountUuid == claudeAccount
+        let org = row.orgName == nil && row.orgLabel == nil ? "this organization"
+            : row.organization == "Individual" ? "your individual organization" : row.organization
+        return signedIn ? "choose \(org) once in Claude, from your name at the bottom of its sidebar"
+                        : "click Set Up, then sign in to it in Claude"
     }
 }
 
@@ -332,9 +406,9 @@ enum AutoSwitchRule {
             if (a.weekly ?? 0) != (b.weekly ?? 0) { return (a.weekly ?? 0) < (b.weekly ?? 0) }
             return a.name < b.name
         }) else {
-            return .nowhere("Claude stopped a chat at \(current.name)'s usage limit, and no other set-up account has room. Chats wait until a limit resets.")
+            return .nowhere("Claude stopped a chat because \(current.name) is out of usage, and no other set-up account has room. Chats wait until a limit resets.")
         }
-        return .switchTo(id: best.id, reason: "Claude stopped a chat at \(current.name)'s usage limit; \(best.name) is at \(percent(best.used)).")
+        return .switchTo(id: best.id, reason: "Claude stopped a chat because \(current.name) is out of usage; \(best.name) is at \(percent(best.used)).")
     }
 
     /// Until when the row a switch leaves counts as out: the reset of its fuller meter, else of

@@ -312,27 +312,53 @@ struct RulesTests {
             AccountRecord(id: id, name: name, color: "#000000", configDir: "~/x", keychainService: "k", email: "me@example.com",
                           accountUuid: account, orgName: orgName, orgUuid: id)
         }
-        // Labels used to default to the email; on load they become the default label.
+        // Names used to default to the email; on load an account gets its team's name or Account N.
         let old = [named("a", "me@example.com", account: "acct", orgName: "Northwind Labs"),
                    named("b", "me@example.com · Northwind Research", account: "acct", orgName: "Northwind Research"),
                    named("c", "you@example.com", account: "other", orgName: "you@example.com's Organization")]
-        check(old.relabeled().map(\.name) == ["Northwind Labs", "Northwind Labs · Northwind Research", "Account 2"],
-              "an email label becomes the organization's name, the account's label and its organization, or Account N")
-        let renamed = [named("a", "Work", account: "acct", orgName: "Northwind Labs"),
-                       named("b", "me@example.com · Northwind Research", account: "acct", orgName: "Northwind Research")]
-        check(renamed.relabeled().map(\.name) == ["Work", "Work · Northwind Research"],
-              "a label someone chose is kept, and a second organization reads as that label and its organization")
-        let personal = [named("a", "Work", account: "acct", orgName: "Northwind Labs"),
-                        named("b", "me@example.com", account: "acct", orgName: "me@example.com's Organization")]
-        check(personal.relabeled().map(\.name) == ["Work", "Work · Organization 2"],
-              "an organization Claude named after the email is never shown by that name")
-        check(personal[1].organization == nil && personal[0].organization == "Northwind Labs", "an organization's name with an email is not shown")
+        check(old.labelled().map(\.label) == ["Northwind Labs · Northwind Labs", "Northwind Labs · Northwind Research", "Account 2"],
+              "an email name becomes the team's name or Account N, and each row of an account with several reads <account> · <organization>")
+        let work = [named("a", "Work", account: "acct", orgName: "Northwind Labs"),
+                    named("b", "me@example.com · Northwind Research", account: "acct", orgName: "Northwind Research"),
+                    named("c", "Side", account: "other", orgName: "you@example.com\u{2019}s Organization")]
+        check(work.labelled().map(\.label) == ["Work · Northwind Labs", "Work · Northwind Research", "Side"],
+              "a name someone chose is kept, and an account with one organization is called by its name alone")
+        check(work[2].organization == "Individual" && work[0].organization == "Northwind Labs",
+              "Claude's name for an account's own organization shows as Individual; a team keeps its name")
+
+        // Renaming acts on the row that was clicked.
+        let org = work.labelled().renamed(work[0], to: "Labs", organization: true)
+        check(org.map(\.label) == ["Work · Labs", "Work · Northwind Research", "Side"] && org.map(\.name) == ["Work", "Work", "Side"],
+              "renaming an organization row names that organization and leaves the account's name alone")
+        let acct = org.renamed(org[1], to: "Day job", organization: false)
+        check(acct.map(\.label) == ["Day job · Labs", "Day job · Northwind Research", "Side"],
+              "renaming the account renames it on every row and keeps the organizations' names")
+        check(acct.renamed(acct[0], to: "", organization: true)[0].label == "Day job · Northwind Labs",
+              "Reset Name gives an organization its own name back")
+        check(acct.renamed(acct[0], to: " ", organization: false).map(\.label) == ["Northwind Labs · Labs", "Northwind Labs · Northwind Research", "Side"],
+              "Reset Name gives an account its default name back")
+        check(acct.renamed(acct[2], to: "me@example.com", organization: false)[2].label == "Account 2", "a name with an email is never kept")
+        check(acct.renamed(acct[0], to: "Northwind Labs", organization: true)[0].orgLabel == nil, "naming an organization its own name saves nothing")
+
+        // A new row: a known account keeps its name; a new one gets its team's name or Account N.
         let added = named("d", "", account: "acct", orgName: "Northwind Support")
-        check((renamed.relabeled() + [added]).defaultLabel(for: added) == "Work · Northwind Support", "a new organization of a known account")
-        check([named("e", "", account: "new", orgName: nil)].defaultLabel(for: named("e", "", account: "new", orgName: nil)) == "Account 1",
-              "a new account with no organization name is Account N")
-        check((old + personal).relabeled().allSatisfy { !$0.name.contains("@") }, "no label shows an email or part of one")
+        check((acct + [added]).accountName(for: added) == "Day job", "a new organization of a known account joins it under its name")
+        let single = (work + [named("e", "", account: "new", orgName: "them@example.com's Organization")])
+        check(single.accountName(for: single[3]) == "Account 3", "a new account with only an individual organization is Account N")
+        let gained = (work + [named("f", "", account: "other", orgName: "Northwind Labs")]).labelled()
+        check(gained.map(\.label)[2...] == ["Side · Individual", "Side · Northwind Labs"], "an account that gains an organization shows both, by pair")
+        check([old, work, acct].allSatisfy { $0.labelled().allSatisfy { !$0.label.contains("@") && !$0.name.contains("@") } }, "no label shows an email or part of one")
         check(shownName("me@example.com") == nil && shownName("Work") == "Work" && shownName("") == nil, "only a name without an email is shown")
+
+        // A row with no saved login says how to set it up.
+        check(SetUpRule.step(for: old[1], claudeAccount: "acct")
+              == "choose Northwind Research once in Claude, from your name at the bottom of its sidebar",
+              "an organization of the account Claude is signed in to is chosen once from Claude's sidebar")
+        check(SetUpRule.step(for: old[2], claudeAccount: "other") == "choose your individual organization once in Claude, from your name at the bottom of its sidebar",
+              "an organization Claude named after the email is named without it")
+        check(SetUpRule.step(for: old[1], claudeAccount: "other") == "click Set Up, then sign in to it in Claude",
+              "another account is signed in to first")
+        check("choose it".capitalizedFirst == "Choose it", "a phrase starts a sentence")
     }
 
     // MARK: Upgrade
@@ -363,17 +389,21 @@ struct RulesTests {
             ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["accounts"] as? [[String: String]] ?? []
         }
         guard (try? Data(saved.utf8).write(to: copy)) != nil, let onDisk = try? Data(contentsOf: copy),
-              let loaded = AccountsFile.decode(onDisk)?.relabeled(), let resaved = try? AccountsFile.encode(loaded) else {
+              let loaded = AccountsFile.decode(onDisk)?.labelled(), let resaved = try? AccountsFile.encode(loaded) else {
             return check(false, "the previous release's accounts file loads and saves")
         }
         let before = rows(onDisk), after = rows(resaved)
         check(after.count == 5 && after.map { $0["id"] } == before.map { $0["id"] }, "every row loads, in the saved order")
-        check(zip(before, after).allSatisfy { Set($0.keys) == Set($1.keys) }, "no saved field is dropped or added")
         check(zip(before, after).allSatisfy { old, new in old.allSatisfy { $0.key == "name" || new[$0.key] == $0.value } },
               "every login folder, keychain item, organization and color is kept as saved")
-        check(after.map { $0["name"] ?? "" } == ["Work", "Research team", "Work · Northwind Support", "Side project", "Account 3"],
-              "names someone chose are kept, for accounts and organization rows; only labels that show an email change")
-        check(AccountsFile.decode(resaved) == loaded, "saving again changes nothing further")
+        check(zip(before, after).allSatisfy { Set($1.keys).subtracting($0.keys).isSubset(of: ["orgLabel"]) && Set($0.keys).isSubset(of: $1.keys) }
+              && after.compactMap { $0["orgLabel"] } == ["Research team"],
+              "no saved field is dropped; a name chosen for a further organization row is kept as that organization's name")
+        check(after.map { $0["name"] ?? "" } == ["Work", "Research team", "Work", "Side project", "Account 3"],
+              "every name someone chose is kept; only names that show an email change")
+        check(loaded.map(\.label) == ["Work · Northwind Labs", "Work · Research team", "Work · Northwind Support", "Side project", "Account 3"],
+              "and the menu names each row by them")
+        check(AccountsFile.decode(resaved)?.labelled() == loaded, "saving again changes nothing further")
 
         var settings = AppSettings()
         settings.display = .gaugePercent

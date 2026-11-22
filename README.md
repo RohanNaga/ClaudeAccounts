@@ -17,8 +17,11 @@ it switches by itself to the account with the most room left. An account that
 belongs to two
 organizations, like a personal plan and a team, shows both under the account's
 name, each with its own usage, and either one can be switched to; click the
-name to fold them away. An account that is out of usage shows **Out** in place
-of Switch until its limit resets.
+name to fold them away. The account's own individual organization shows as
+**Individual**. **Rename…** on an organization's `···` menu names that
+organization, and the `···` beside the account's name renames the account. A
+row that isn't set up yet says how. An account that is out of usage shows
+**Out** in place of Switch until its limit resets.
 
 <p align="center">
   <img src="docs/menu.png" width="355" alt="The ClaudeAccounts menu: four accounts with 5-hour and weekly usage bars, the one in use marked, and a Switch button on the others">
