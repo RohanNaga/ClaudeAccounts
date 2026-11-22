@@ -666,6 +666,27 @@ struct SwitchOutcome: Codable {
     var notResumed: [String] = []
     /// The row the message tells the person how to set up in Claude.
     var setsUp: String? = nil
+    /// Another switch started while this one's chats were being resumed; its outcome is the news.
+    var superseded = false
+
+    /// Fold the resume's reports into a confirmed switch's outcome.
+    mutating func add(_ reports: [ChatResumer.Report], answered: Bool) {
+        let running = reports.filter(\.result.runningAgain)
+        resumed = running.map(\.chat.title)
+        notResumed = reports.compactMap { r -> String? in
+            switch r.result {
+            case .notResumed(let why): return "\(r.chat.title) (\(why))"
+            case .draft: return "\(r.chat.title) (it has an unsent draft)"
+            case .running, .sent: return nil
+            }
+        }
+        superseded = reports.contains { $0.result == .notResumed(ChatResumer.superseded) }
+        if !reports.isEmpty {
+            message += " " + ResumeRule.summary(running: running.count, of: reports.count)
+        } else if answered {
+            message += " No stopped chat was found; check the ones that were working."
+        }
+    }
 
     /// The message, naming the stopped chats still not running and what they need: a new message,
     /// since Retry on the failed one starts the chat over.
@@ -676,17 +697,28 @@ struct SwitchOutcome: Codable {
     }
 }
 
+/// Whether a switch started from the menu has finished the switch itself and moved on to resuming.
+@MainActor final class SwitchPhase { var freed = false }
+
 /// One switch at a time across the menu and `--switch`, which are separate processes.
 struct SwitchLock {
     let fd: Int32
 
     static func acquire() -> SwitchLock? {
         try? FileManager.default.createDirectory(at: Paths.stateDir, withIntermediateDirectories: true)
-        let fd = open(Paths.stateDir.appendingPathComponent(".switch.lock").path, O_CREAT | O_RDWR, 0o600)
+        let fd = open(url.path, O_CREAT | O_RDWR, 0o600)
         guard fd >= 0 else { return nil }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); return nil }
+        // A new generation for every switch, so a resume can tell that another one started.
+        ftruncate(fd, 0)
+        _ = Data(UUID().uuidString.utf8).withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, 0) }
         return SwitchLock(fd: fd)
     }
+
+    static var url: URL { Paths.stateDir.appendingPathComponent(".switch.lock") }
+
+    /// The generation the last switch wrote when it took the lock.
+    static func generation() -> String { (try? String(contentsOf: url, encoding: .utf8)) ?? "" }
 
     func release() { flock(fd, LOCK_UN); close(fd) }
 }
@@ -721,10 +753,37 @@ enum SwitchEngine {
     /// sessions into the target's folder, reopen Claude, and keep the result only once Claude
     /// reports the target account; anything else is undone.
     /// `unattended` answers Claude's quit prompt with Quit anyway, for a switch with nobody at the Mac.
+    /// The lock covers the switch itself and is released before the stopped chats are resumed, so
+    /// another Switch works during the resume; `switched` hears the switch's own outcome then. A
+    /// resume that another switch overtakes stops and types nothing more (`ChatResumer.current`).
     static func run(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool = false,
-                    progress: @escaping Progress) async -> SwitchOutcome {
-        await locked(unattended: unattended) {
-            await switchLocked(to: target, accounts: accounts, unattended: unattended, progress: progress)
+                    progress: @escaping Progress, switched: @escaping (SwitchOutcome) async -> Void = { _ in }) async -> SwitchOutcome {
+        var pending: PendingResume?
+        var outcome = await locked(unattended: unattended) {
+            let done = await switchLocked(to: target, accounts: accounts, unattended: unattended, progress: progress)
+            pending = done.resume
+            return done.outcome
+        }
+        guard let pending else { return outcome }
+        await switched(outcome)
+        let reports = await pending.run(progress: progress)
+        outcome.add(reports, answered: pending.answered)
+        return outcome
+    }
+
+    /// Chats a confirmed switch moved that were working, to resume once the lock is released.
+    struct PendingResume {
+        let chats: [MovedChat]
+        let folder: URL
+        let reopenedAt: Double
+        let answered: Bool
+        /// The lock's generation when this switch held it; another switch changes it.
+        let generation: String
+
+        func run(progress: @escaping Progress) async -> [ChatResumer.Report] {
+            var resumer = ChatResume.resumer(in: folder, reopenedAt: reopenedAt, progress: progress)
+            resumer.current = { SwitchLock.generation() == generation }
+            return await resumer.run(chats)
         }
     }
 
@@ -746,18 +805,18 @@ enum SwitchEngine {
     }
 
     private static func switchLocked(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool,
-                                     progress: @escaping Progress) async -> SwitchOutcome {
+                                     progress: @escaping Progress) async -> (outcome: SwitchOutcome, resume: PendingResume?) {
         guard let want = LoginSlot.identity(target) else {
-            return SwitchOutcome(ok: false, message: SwitchError.noSlot(target.label).localizedDescription)
+            return (SwitchOutcome(ok: false, message: SwitchError.noSlot(target.label).localizedDescription), nil)
         }
         if ClaudeApp.currentIdentity() == want {
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
-            return SwitchOutcome(ok: true, message: "Already using \(target.label).", confirmed: true)
+            return (SwitchOutcome(ok: true, message: "Already using \(target.label).", confirmed: true), nil)
         }
         let current: (acct: AccountRecord, id: Identity)?
         let answered: Bool
         switch await prepare(accounts: accounts, unattended: unattended, progress: progress) {
-        case .failure(let e): return e.outcome
+        case .failure(let e): return (e.outcome, nil)
         case .success(let p): current = p.current; answered = p.answered
         }
         // Claude has quit, so its log ends with the run that just finished: the chats it stopped
@@ -766,7 +825,7 @@ enum SwitchEngine {
         ended.read(ClaudeApp.currentRunText())
         guard var journal = startJournal(from: current?.id, to: want) else {
             await ClaudeApp.launch()
-            return SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed.")
+            return (SwitchOutcome(ok: false, message: "Could not back up Claude's files, so nothing was changed."), nil)
         }
         do {
             if let current {
@@ -778,7 +837,7 @@ enum SwitchEngine {
             if let current { try moveSessions(from: current.id, to: want, journal: &journal) }
         } catch {
             _ = await rollback(journal, unattended: unattended, progress: progress)
-            return SwitchOutcome(ok: false, message: "Switch failed and was undone: \(error.localizedDescription)")
+            return (SwitchOutcome(ok: false, message: "Switch failed and was undone: \(error.localizedDescription)"), nil)
         }
 
         progress("Opening Claude as \(target.label)…")
@@ -794,35 +853,26 @@ enum SwitchEngine {
                                               to: URL(fileURLWithPath: journal.backup).appendingPathComponent("switch.json"))
             pruneBackups()
             let working = ResumeRule.toResume(chats, stoppedByLimit: ended.stoppedByLimit, cutByQuit: ended.cutByQuit)
-            let reports = await ChatResume.run(working, in: ClaudeApp.folder(want), reopenedAt: reopenedAt, progress: progress)
-            let resumed = reports.filter(\.result.runningAgain)
-            let waiting = reports.compactMap { r -> String? in
-                switch r.result {
-                case .notResumed(let why): return "\(r.chat.title) (\(why))"
-                case .draft: return "\(r.chat.title) (it has an unsent draft)"
-                case .running, .sent: return nil
-                }
+            var outcome = SwitchOutcome(ok: true, message: "Switched to \(target.label), with \(chats.count) open session\(chats.count == 1 ? "" : "s").",
+                                        moved: chats.count, confirmed: true, backup: journal.backup)
+            guard !working.isEmpty else {
+                outcome.add([], answered: answered)
+                return (outcome, nil)
             }
-            var message = "Switched to \(target.label), with \(chats.count) open session\(chats.count == 1 ? "" : "s")."
-            if !reports.isEmpty {
-                message += " " + ResumeRule.summary(running: resumed.count, of: reports.count)
-            } else if answered {
-                message += " No stopped chat was found; check the ones that were working."
-            }
-            return SwitchOutcome(ok: true, message: message, moved: chats.count, confirmed: true, backup: journal.backup,
-                                 resumed: resumed.map(\.chat.title), notResumed: waiting)
+            return (outcome, PendingResume(chats: working, folder: ClaudeApp.folder(want), reopenedAt: reopenedAt,
+                                           answered: answered, generation: SwitchLock.generation()))
         case .signedOut:
             let undone = await rollback(journal, unattended: unattended, progress: progress)
-            return SwitchOutcome(ok: false, message: "The saved login of \(target.label) has expired, so "
-                                 + (undone ? "the switch was undone. Use Set Up on its row to sign in again."
-                                           : "Claude opened signed out. Quit Claude and click Switch to undo."))
+            return (SwitchOutcome(ok: false, message: "The saved login of \(target.label) has expired, so "
+                                  + (undone ? "the switch was undone. Use Set Up on its row to sign in again."
+                                            : "Claude opened signed out. Quit Claude and click Switch to undo.")), nil)
         case .other(let seen):
             let who = accounts.row(for: seen)?.label ?? (seen == nil ? "no account" : "another account")
             let what = seen?.account == want.account ? "\(target.label) in another organization than its saved login"
                                                      : "\(who) instead of \(target.label)"
             let undone = await rollback(journal, unattended: unattended, progress: progress)
-            return SwitchOutcome(ok: false, message: "Claude opened as \(what), so "
-                                 + (undone ? "the switch was undone." : "the switch needs undoing: quit Claude and click Switch."))
+            return (SwitchOutcome(ok: false, message: "Claude opened as \(what), so "
+                                  + (undone ? "the switch was undone." : "the switch needs undoing: quit Claude and click Switch.")), nil)
         }
     }
 
@@ -1050,10 +1100,6 @@ enum ChatResume {
             retrying: retrying)
     }
 
-    static func run(_ wanted: [MovedChat], in folder: URL, reopenedAt: Double,
-                    progress: @escaping SwitchEngine.Progress) async -> [ChatResumer.Report] {
-        await resumer(in: folder, reopenedAt: reopenedAt, progress: progress).run(wanted)
-    }
 }
 
 /// A macOS notification, for a switch nobody watched, posted by the app itself so it shows the
@@ -1378,7 +1424,7 @@ final class Store: ObservableObject {
             toldNowhereFor = nil
             AutoSwitchLog.started(now, leaving: current.id, outUntil: AutoSwitchRule.outUntil(leaving: current, now: now))
             flash(reason, for: 10)
-            runSwitch(notify: reason) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1) }
+            runSwitch(notify: reason) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1, switched: $2) }
         }
     }
 
@@ -1519,21 +1565,35 @@ final class Store: ObservableObject {
 
     /// One click: quit Claude, save the current account's login, load the target's, move the
     /// open Code sessions into the target's folder, and reopen Claude as the target.
-    func switchTo(_ target: AccountRecord) { runSwitch { await SwitchEngine.run(to: target, accounts: $0, progress: $1) } }
+    func switchTo(_ target: AccountRecord) { runSwitch { await SwitchEngine.run(to: target, accounts: $0, progress: $1, switched: $2) } }
 
     /// Reopen Claude at its sign-in page for an account that has no saved Claude login yet.
-    func setUp(_ target: AccountRecord) { runSwitch { await SwitchEngine.setUp(target, accounts: $0, progress: $1) } }
+    func setUp(_ target: AccountRecord) { runSwitch { accounts, progress, _ in await SwitchEngine.setUp(target, accounts: accounts, progress: progress) } }
 
     /// `notify` posts the outcome as a notification after that reason, for a switch auto-switch
-    /// started with nobody watching.
+    /// started with nobody watching. Switch is free again once the switch itself is done
+    /// (`switched`); the resume that follows shows its steps on the status line, and its outcome
+    /// is shown unless another switch overtook it.
     private func runSwitch(notify reason: String? = nil,
-                           _ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress) async -> SwitchOutcome) {
+                           _ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress,
+                                              @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome) {
         guard switching == nil else { return }
         switching = "Starting…"
         let all = accounts
+        let phase = SwitchPhase()
         Task {
-            let outcome = await body(all) { step in Task { @MainActor in self.switching = step } }
-            self.switching = nil
+            let outcome = await body(all, { step in
+                Task { @MainActor in if phase.freed { self.keep(step) } else { self.switching = step } }
+            }, { switched in
+                await MainActor.run {
+                    phase.freed = true
+                    self.switching = nil
+                    self.keep(switched.message)
+                    self.inUse = self.logWatcher.poll()
+                }
+            })
+            if !phase.freed { self.switching = nil }
+            guard !outcome.superseded else { return }
             self.show(outcome)
             self.inUse = self.logWatcher.poll()
             if let reason {

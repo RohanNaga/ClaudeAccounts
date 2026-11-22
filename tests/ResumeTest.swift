@@ -140,6 +140,20 @@ struct ResumeTest {
         check(lines.all(prefix: "sent: ").filter { $0.hasPrefix("local_mute") }.count == 1, "the chat that got no reply was sent one message, not one per pass")
         check(lines.all(prefix: "sent: ").filter { $0.hasPrefix("local_never") }.isEmpty, "the chat that never loaded was never typed into")
 
+        // Another switch starts 30 s into a resume: it stops there, types into nothing after that,
+        // and doesn't wait out its schedule. The idle decoy would have been sent a message.
+        clock.now = Date(timeIntervalSince1970: 0)
+        traced = []
+        var cut = resumer()
+        cut.current = { clock.now.timeIntervalSince1970 < 30 }
+        let stopped = await cut.run([chat("local_never", 2), chat("local_decoy", 1)])
+        check(stopped.map(\.result) == [.notResumed(ChatResumer.superseded), .notResumed(ChatResumer.superseded)],
+              "a resume another switch overtook reports both chats as left for that switch: got \(stopped.map(\.result))")
+        check(traced.filter { $0.hasPrefix("pass ") }.count == 1 && clock.now.timeIntervalSince1970 < ResumeRule.retryEvery,
+              "it stopped in its first pass instead of trying again for 30 minutes")
+        check(firstOpened["local_decoy"] == nil && lines.all(prefix: "sent: ").count == 8,
+              "it never opened the next chat, and sent nothing more")
+
         tell("state", answer: "focus: ")
         let boxes = lines.all(prefix: "box: ")
         check(boxes.contains("local_draft [a note I haven't sent]"), "the unsent draft is untouched")
