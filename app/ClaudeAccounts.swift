@@ -2089,6 +2089,27 @@ struct Badge: View {
     }
 }
 
+/// The card an account sits on. Fill and edge are system colors over the menu's vibrancy, so they
+/// follow light, dark and increased contrast; increased contrast draws the edge in the label color.
+struct Card<Content: View>: View {
+    var fill: AnyShapeStyle = AnyShapeStyle(Color(nsColor: .quaternarySystemFill))
+    /// The in-use account's accent edge; nil draws the quiet outline.
+    var edge: Color? = nil
+    @ViewBuilder let content: Content
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
+        // The separator color is too faint to outline a card over the menu's vibrancy; the tertiary
+        // label color is the next system gray, lighter in dark mode and darker in light.
+        let quiet = contrast == .increased ? Color.primary.opacity(0.55) : Color(nsColor: .tertiaryLabelColor)
+        content
+            .background(shape.fill(fill))
+            .overlay(shape.strokeBorder(edge ?? quiet, lineWidth: edge == nil ? 1 : 1.5))
+            .clipShape(shape)
+    }
+}
+
 struct Meter: View {
     let label: String
     let window: UsageWindow?
@@ -2349,7 +2370,10 @@ struct AccountRow: View {
             }
         }
         .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(inUse ? Color.primary.opacity(0.06) : .clear))
+        // Inside an account's card, the organization in use is lit; a one-row card lights itself.
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+            .fill(inUse && organizationEntry ? Color.accentColor.opacity(0.12) : .clear)
+            .padding(3))
     }
 
     private func signInPrompt(_ reason: String) -> some View {
@@ -2435,36 +2459,14 @@ struct MenuContent: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(10)
             }
-            // One entry per account; an account in several organizations lists each beneath its
+            // One card per account; an account in several organizations lists each beneath its
             // name, shown until its name is clicked to fold them away.
             let groups = store.accounts.groupedByAccount()
             let next = store.nextRow
-            ForEach(groups, id: \.[0].id) { group in
-                if group.count == 1 {
-                    row(group[0], in: group, next: next)
-                } else {
-                    let account = group[0].accountUuid ?? group[0].id
-                    let shown = store.settings.showsOrganizations(of: account)
-                    VStack(alignment: .leading, spacing: 0) {
-                        AccountHeader(name: group[0].name, color: group[0].color, shown: shown,
-                                      inUse: !shown && group.contains(where: store.isInUse),
-                                      next: !shown && group.contains { $0.id == next },
-                                      canReset: store.accounts.renamed(group[0], to: "", organization: false).first { $0.id == group[0].id }?.name != group[0].name,
-                                      onFold: {
-                                          withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { store.setShowsOrganizations(of: account, !shown) }
-                                      },
-                                      onRename: { store.rename(group[0], to: $0, organization: false) },
-                                      onRecolor: { store.recolor(group[0], $0) },
-                                      move: moves(group[0], organization: false))
-                        .padding(.horizontal, 10).padding(.top, 8).padding(.bottom, shown ? 0 : 8)
-                        if shown {
-                            ForEach(group) { acct in
-                                row(acct, in: group, next: next, organizationTitle: acct.organization)
-                            }
-                        }
-                    }
-                }
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(groups, id: \.[0].id) { group in accountCard(group, next: next) }
             }
+            .padding(.top, 2)
         }
         .padding(6)
         .frame(width: 330)
@@ -2494,6 +2496,49 @@ struct MenuContent: View {
                    onRemove: { store.remove(acct) },
                    move: moves(acct, organization: organizationTitle != nil),
                    organizationTitle: organizationTitle)
+    }
+
+    /// The name above an account's organizations, which folds them away.
+    private func header(_ group: [AccountRecord], next: String?) -> some View {
+        let account = group[0].accountUuid ?? group[0].id
+        let shown = store.settings.showsOrganizations(of: account)
+        return AccountHeader(name: group[0].name, color: group[0].color, shown: shown,
+                             inUse: !shown && group.contains(where: store.isInUse),
+                             next: !shown && group.contains { $0.id == next },
+                             canReset: store.accounts.renamed(group[0], to: "", organization: false).first { $0.id == group[0].id }?.name != group[0].name,
+                             onFold: {
+                                 withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { store.setShowsOrganizations(of: account, !shown) }
+                             },
+                             onRename: { store.rename(group[0], to: $0, organization: false) },
+                             onRecolor: { store.recolor(group[0], $0) },
+                             move: moves(group[0], organization: false))
+    }
+
+    private func shown(_ group: [AccountRecord]) -> Bool {
+        store.settings.showsOrganizations(of: group[0].accountUuid ?? group[0].id)
+    }
+
+    /// One card per account. Its organizations are rows inside, split by hairlines; the
+    /// card of the account in use has an accent edge and its organization in use is lit.
+    private func accountCard(_ group: [AccountRecord], next: String?) -> some View {
+        let inUse = group.contains(where: store.isInUse)
+        return Card(fill: AnyShapeStyle(inUse && group.count == 1 ? Color.accentColor.opacity(0.12)
+                                        : Color(nsColor: .quaternarySystemFill)),
+                    edge: inUse ? .accentColor : nil) {
+            VStack(alignment: .leading, spacing: 0) {
+                if group.count == 1 {
+                    row(group[0], in: group, next: next)
+                } else {
+                    header(group, next: next).padding(.horizontal, 10).padding(.vertical, 8)
+                    if shown(group) {
+                        ForEach(group) { acct in
+                            Divider().padding(.leading, 27)
+                            row(acct, in: group, next: next, organizationTitle: acct.organization)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Move Up and Move Down for a row's menu, each nil where the row is already at that end.
@@ -2840,16 +2885,10 @@ enum Entry {
         let current = accounts.row(for: log.identity).flatMap { row in all.first { $0.id == row.id } }
         let now = Date()
         func describe(_ c: SwitchCandidate) -> String {
-            guard let read = c.readAt else { return "no reading" }
-            let age = max(Int(now.timeIntervalSince(read) / 60), 0)
-            return (c.fiveHour.map { "5-hour \(AutoSwitchRule.percent($0)), " } ?? "no 5-hour limit, ")
-                + "weekly \(AutoSwitchRule.percent(c.weekly ?? 0)), read \(age) min ago"
-                + (c.isOut(at: now) ? ", out" : "") + setUp(c) + (c.needsSignIn ? ", needs sign-in" : "")
-        }
-        func setUp(_ c: SwitchCandidate) -> String {
-            guard !c.hasSavedLogin, let row = accounts.first(where: { $0.id == c.id }) else { return "" }
-            return ", not set up: " + SetUpRule.step(for: row, claudeAccount: log.identity?.account,
-                                                     refused: row.orgUuid.map { log.refusedAt[$0] != nil } ?? false)
+            let row = accounts.first { $0.id == c.id }
+            return c.summary(at: now, setUpStep: row.map {
+                SetUpRule.step(for: $0, claudeAccount: log.identity?.account, refused: $0.orgUuid.map { log.refusedAt[$0] != nil } ?? false)
+            } ?? "")
         }
         print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
         print("In use:             \(current?.name ?? "an account this app doesn't know")")

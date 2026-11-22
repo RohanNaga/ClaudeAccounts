@@ -474,7 +474,21 @@ struct RulesTests {
               "an organization Claude named after the email is named without it")
         check(SetUpRule.step(for: old[1], claudeAccount: "other") == "click Set Up, then sign in to it in Claude",
               "another account is signed in to first")
+        check(SetUpRule.step(for: old[1], claudeAccount: "acct", refused: true)
+              == "Claude asked for a new sign-in to this organization. Choose it in Claude, sign in, and stay on it for a minute to save it",
+              "one refusal in Claude's log is told as what happened, not as happening each time")
         check("choose it".capitalizedFirst == "Choose it", "a phrase starts a sentence")
+
+        // --dry-run says a row isn't set up whether or not it has a usage reading.
+        let unread = SwitchCandidate(id: "r", name: "Work · Research", fiveHour: nil, weekly: nil, readAt: nil,
+                                     needsSignIn: false, hasSavedLogin: false)
+        check(unread.summary(at: Date(), setUpStep: "click Set Up, then sign in to it in Claude")
+              == "no reading, not set up: click Set Up, then sign in to it in Claude",
+              "a row with no reading and no saved login says how to set it up")
+        let read = SwitchCandidate(id: "s", name: "Support", fiveHour: nil, weekly: 40, readAt: Date(timeIntervalSince1970: 0),
+                                   needsSignIn: false, hasSavedLogin: true)
+        check(read.summary(at: Date(timeIntervalSince1970: 300), setUpStep: "unused")
+              == "no 5-hour limit, weekly 40%, read 5 min ago", "a set-up row with a reading lists its meters and their age")
     }
 
     // MARK: Upgrade

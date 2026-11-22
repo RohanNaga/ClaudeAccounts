@@ -298,7 +298,7 @@ One step is Claude's own: choose the new organization once from your name at
 the bottom of Claude's sidebar. The app saves that organization's Claude login
 once Claude has stayed on it for a minute, and from then on Switch and
 auto-switch can move to it. If Claude asks for a new sign-in to that
-organization each time, its row says so: choose it in Claude, sign in, and stay
+organization, its row says so: choose it in Claude, sign in, and stay
 on it for a minute.
 
 ## Command line
