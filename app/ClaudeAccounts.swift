@@ -11,6 +11,7 @@ import AppKit
 import CryptoKit
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 // MARK: - Paths and constants
 
@@ -183,8 +184,8 @@ enum AccountStore {
     private struct File: Codable { var accounts: [AccountRecord] }
 
     /// The rows on disk. A row saved before organizations were tracked takes its organization from its
-    /// saved Claude login, else from its Claude Code login; this only reads, so --dry-run stays
-    /// read-only, and the next save keeps it.
+    /// saved Claude login, else from its Claude Code login, and a label that shows an email gets its
+    /// default label; this only reads, so --dry-run stays read-only, and the next save keeps it.
     static func load() -> [AccountRecord] {
         guard let data = try? Data(contentsOf: Paths.accountsFile),
               var accounts = (try? JSONDecoder().decode(File.self, from: data))?.accounts else { return [] }
@@ -193,7 +194,7 @@ enum AccountStore {
             accounts[i].orgUuid = LoginSlot.meta(accounts[i])?.orgFolder ?? profile["organizationUuid"] as? String
             if accounts[i].orgName == nil { accounts[i].orgName = profile["organizationName"] as? String }
         }
-        return accounts
+        return accounts.relabeled()
     }
 
     static func save(_ accounts: [AccountRecord]) throws {
@@ -256,43 +257,7 @@ enum Migration {
 
 // MARK: - Settings
 
-/// What the menu bar item shows next to its gauge.
-enum MenuBarDisplay: String, Codable, CaseIterable, Identifiable {
-    case gauge, gaugePercent, gaugeNamePercent
-    var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .gauge: return "Gauge Only"
-        case .gaugePercent: return "Gauge and Percentage"
-        case .gaugeNamePercent: return "Gauge, Name and Percentage"
-        }
-    }
-}
-
-/// Which limit the gauge and percentage follow.
-enum UsageMetric: String, Codable, CaseIterable, Identifiable {
-    case fiveHour, weekly
-    var id: String { rawValue }
-    var title: String { self == .fiveHour ? "5-Hour Limit" : "Weekly Limit" }
-}
-
-/// Menu bar preferences, kept in settings.json in the app's state folder.
-struct AppSettings: Codable, Equatable {
-    var display: MenuBarDisplay = .gaugeNamePercent
-    var metric: UsageMetric = .fiveHour
-    /// Switch by itself when the account in use runs out of usage.
-    var autoSwitch = AutoSwitchRule.onByDefault
-
-    init() {}
-
-    /// Each key is optional, so a settings file from an older version keeps what it has.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        display = try c.decodeIfPresent(MenuBarDisplay.self, forKey: .display) ?? .gaugeNamePercent
-        metric = try c.decodeIfPresent(UsageMetric.self, forKey: .metric) ?? .fiveHour
-        autoSwitch = try c.decodeIfPresent(Bool.self, forKey: .autoSwitch) ?? AutoSwitchRule.onByDefault
-    }
-
+extension AppSettings {
     private static var url: URL { Paths.stateDir.appendingPathComponent("settings.json") }
 
     static func load() -> AppSettings {
@@ -307,73 +272,6 @@ struct AppSettings: Codable, Equatable {
 }
 
 // MARK: - Usage
-
-struct UsageWindow: Equatable, Codable {
-    /// Percent used as the usage service reports it, unrounded; "out" is decided on this.
-    let utilization: Double
-    let resetsAt: Date?
-
-    /// Rounded, for display only.
-    var pct: Int { Int(utilization.rounded()) }
-
-    private enum CodingKeys: String, CodingKey { case utilization, pct, resetsAt }
-
-    init(utilization: Double, resetsAt: Date?) {
-        self.utilization = utilization
-        self.resetsAt = resetsAt
-    }
-
-    /// A cache written before the unrounded value was kept has only `pct`.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        utilization = try c.decodeIfPresent(Double.self, forKey: .utilization) ?? Double(c.decode(Int.self, forKey: .pct))
-        resetsAt = try c.decodeIfPresent(Date.self, forKey: .resetsAt)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(utilization, forKey: .utilization)
-        try c.encode(pct, forKey: .pct)
-        try c.encodeIfPresent(resetsAt, forKey: .resetsAt)
-    }
-
-    /// Relative and absolute together: "in 2 h 05 m · 13:10" today, "in 2 days · Sep 27, 13:00"
-    /// further out, and "No reset pending" for a window that hasn't started.
-    var resetText: String {
-        guard let date = resetsAt else { return "No reset pending" }
-        let secs = date.timeIntervalSinceNow
-        if secs <= 0 { return "Resetting now" }
-        let f = DateFormatter()
-        let relative: String
-        if secs < 24 * 3600 {
-            let h = Int(secs) / 3600, m = (Int(secs) % 3600) / 60
-            relative = h > 0 ? "in \(h) h \(String(format: "%02d", m)) m" : "in \(max(m, 1)) min"
-            f.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm" : "EEE HH:mm"
-        } else {
-            let days = Int((secs / 86400).rounded())
-            relative = "in \(days) day\(days == 1 ? "" : "s")"
-            f.dateFormat = "MMM d, HH:mm"
-        }
-        return "\(relative) · \(f.string(from: date))"
-    }
-
-    /// A reset this close means the account frees up soon, which is when switching to it pays off.
-    var resetsSoon: Bool { resetsAt.map { $0.timeIntervalSinceNow > 0 && $0.timeIntervalSinceNow <= 15 * 60 } ?? false }
-
-    init?(_ raw: Any?) {
-        guard let dict = raw as? [String: Any], let util = dict["utilization"] as? Double else { return nil }
-        utilization = util
-        resetsAt = (dict["resets_at"] as? String).flatMap(Self.parseDate)
-    }
-
-    private static func parseDate(_ s: String) -> Date? {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: s) { return d }
-        f.formatOptions = [.withInternetDateTime]
-        return f.date(from: s)
-    }
-}
 
 enum AccountState: Equatable {
     case loading
@@ -924,7 +822,7 @@ enum SwitchEngine {
         // own organization switch; the next switch away from it saves that organization's login.
         if let now = ClaudeApp.currentIdentity(), now.account == target.accountUuid {
             return SwitchOutcome(ok: true, message: "Claude is already signed in to this account. Choose "
-                                 + (target.orgName ?? "this organization") + " once from your name at the bottom of Claude's sidebar. "
+                                 + (target.organization ?? "this organization") + " once from your name at the bottom of Claude's sidebar. "
                                  + "Claude Accounts saves it then, and from that point Switch moves your open sessions between the organizations.")
         }
         let current: (acct: AccountRecord, id: Identity)?
@@ -950,8 +848,8 @@ enum SwitchEngine {
         SwitchJournal.clear()
         await ClaudeApp.launch()
         let organization = accounts.otherOrganizations(of: target).isEmpty ? ""
-            : ", then choose \(target.orgName ?? "this organization") from your name at the bottom of Claude's sidebar"
-        return SwitchOutcome(ok: true, message: "Sign in to Claude as \(target.email ?? target.name)\(organization). Your open sessions stay with "
+            : ", then choose \(target.organization ?? "this organization") from your name at the bottom of Claude's sidebar"
+        return SwitchOutcome(ok: true, message: "Sign in to Claude as \(target.name)\(organization). Your open sessions stay with "
                              + (current?.acct.name ?? "the previous account") + "; Switch brings them over.")
     }
 
@@ -1126,12 +1024,53 @@ enum ChatResume {
     }
 }
 
-/// A macOS notification, for a switch nobody watched. It shows on this Mac only.
+/// A macOS notification, for a switch nobody watched, posted by the app itself so it shows the
+/// app's name and icon. It shows on this Mac only, once macOS allows the app to post them.
 enum Notify {
+    /// Keeps a notification on screen while the menu is open, when macOS counts the app as in front.
+    private final class Presenter: NSObject, UNUserNotificationCenterDelegate {
+        func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                    withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+            done([.banner, .list])
+        }
+    }
+    private static let presenter = Presenter()
+
+    /// Only a process inside the app bundle has the app's identity to post with.
+    private static var center: UNUserNotificationCenter? {
+        Bundle.main.bundleIdentifier == nil ? nil : UNUserNotificationCenter.current()
+    }
+
+    /// The menu app calls this at launch. The first time, macOS asks whether Claude Accounts may
+    /// post notifications; the command line posts with the answer given there.
+    static func requestPermission() {
+        center?.delegate = presenter
+        center?.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// Whether macOS lets the app post notifications, for --status.
+    static func permission() -> String {
+        guard let center else { return "unknown: not run from the app bundle" }
+        let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var status = UNAuthorizationStatus.notDetermined
+        center.getNotificationSettings { status = $0.authorizationStatus; done.signal() }
+        guard done.wait(timeout: .now() + 5) == .success else { return "unknown" }
+        switch status {
+        case .authorized, .provisional, .ephemeral: return "allowed"
+        case .denied: return "not allowed (System Settings > Notifications > Claude Accounts)"
+        default: return "not asked yet: the menu app asks at launch"
+        }
+    }
+
+    /// Post at once, and return once macOS has the request, because the command line exits next.
     static func post(_ title: String, _ body: String) {
-        func quoted(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
-        _ = runProcessBlocking("/usr/bin/osascript", ["-e", "display notification \(quoted(body)) with title \(quoted(title))"],
-                               env: nil, cwd: nil, timeout: 10)
+        guard let center else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let done = DispatchSemaphore(value: 0)
+        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { _ in done.signal() }
+        _ = done.wait(timeout: .now() + 5)
     }
 
     /// The outcome of an unattended switch, after `reason` when auto-switch started it, naming the
@@ -1448,11 +1387,12 @@ final class Store: ObservableObject {
         openAtLogin = service.status == .enabled
     }
 
-    /// Save a new label or color for one account; the row keeps its place in the list.
+    /// Save a new label or color for one account; the row keeps its place in the list. An empty
+    /// label, or one with an email in it, puts the default label back.
     func update(_ acct: AccountRecord, name: String? = nil, color: String? = nil) {
         var all = AccountStore.load()
         guard let i = all.firstIndex(where: { $0.id == acct.id }) else { return }
-        if let name { all[i].name = name }
+        if let name { all[i].name = shownName(name) ?? all.defaultLabel(for: all[i]) }
         if let color { all[i].color = color }
         do {
             try AccountStore.save(all)
@@ -1515,7 +1455,12 @@ final class Store: ObservableObject {
     var inUseWindow: UsageWindow? {
         guard let current = accounts.first(where: isInUse),
               case .ok(_, let fh, let wk, _) = states[current.id] else { return nil }
-        return settings.metric == .fiveHour ? fh : wk
+        return MeterRule.gauge(settings.metric, fiveHour: fh, weekly: wk)
+    }
+
+    /// Show or fold away the organizations of an account in the menu; settings.json keeps it.
+    func setShowsOrganizations(of account: String, _ shown: Bool) {
+        settings.setShowsOrganizations(of: account, shown)
     }
 
     /// Gauge position, 0...1; a third before any reading so the glyph still looks like a gauge.
@@ -1525,7 +1470,7 @@ final class Store: ObservableObject {
     var menuBarTitle: String {
         guard let window = inUseWindow, settings.display != .gauge,
               let current = accounts.first(where: isInUse) else { return "" }
-        return settings.display == .gaugePercent ? "\(window.pct)%" : "\(current.shortName) \(window.pct)%"
+        return settings.display == .gaugePercent ? "\(window.pct)%" : "\(current.name) \(window.pct)%"
     }
 }
 
@@ -1571,8 +1516,8 @@ final class LoginFlow: ObservableObject {
     private var rollback: (keychain: (account: String, secret: String)?, profile: Data?)?
 
     /// Start a login. With `target`, sign that account in again in its own folder, so its
-    /// row keeps its place, name and color. Without it, add a new account; its email becomes
-    /// the label once sign-in finishes, so the folder gets a random id now. `organization`
+    /// row keeps its place, name and color. Without it, add a new account; it gets its label once
+    /// sign-in finishes, so the folder gets a random id now. `organization`
     /// (a target's own, or another organization of a known account) is pre-selected on the
     /// sign-in page through Claude Code's `forceLoginOrgUUID` setting in that login's folder.
     func start(reauth target: AccountRecord? = nil, organization: String? = nil, email: String? = nil) {
@@ -1709,9 +1654,9 @@ final class LoginFlow: ObservableObject {
         let orgName = profile["organizationName"] as? String
         let account = accounts.first { $0.accountUuid != nil && $0.accountUuid == profile["accountUuid"] as? String }
         let usedColors = Set(accounts.map(\.color))
-        let record = AccountRecord(
+        var record = AccountRecord(
             id: draft.id,
-            name: rowName(email: email, orgName: orgName, accountAlreadyAdded: account != nil, fallback: "Account \(accounts.count + 1)"),
+            name: "",
             // Another organization of a known account keeps that account's color.
             color: account?.color ?? presetColors.first { !usedColors.contains($0) } ?? presetColors[accounts.count % presetColors.count],
             configDir: draft.dir.path.replacingOccurrences(of: Paths.home.path, with: "~"),
@@ -1720,15 +1665,16 @@ final class LoginFlow: ObservableObject {
             accountUuid: profile["accountUuid"] as? String,
             orgName: orgName,
             orgUuid: org)
+        record.name = (accounts + [record]).defaultLabel(for: record)
         accounts.append(record)
         if let org { Self.preselect(org, in: draft.dir) }
         do {
             try AccountStore.save(accounts)
             // Claude's own login for this organization is the one step the app can't take.
             let next = account == nil ? nil
-                : "To switch Claude to \(orgName ?? "this organization"), choose it once from your name at the bottom of Claude's sidebar. "
+                : "To switch Claude to \(record.organization ?? "this organization"), choose it once from your name at the bottom of Claude's sidebar. "
                 + "Claude Accounts saves it then, and from that point Switch and auto-switch move between the two organizations."
-            phase = .done(record.email ?? record.name, next: next)
+            phase = .done(record.name, next: next)
         } catch {
             phase = .failed("Signed in, but could not save: \(error.localizedDescription)")
         }
@@ -1740,13 +1686,12 @@ final class LoginFlow: ObservableObject {
     private func finishReauth(_ target: AccountRecord, dir: URL) async {
         let signedIn = Self.profile(in: dir)
         if let uuid = target.accountUuid, signedIn["accountUuid"] as? String == uuid {
-            phase = .done(target.email ?? target.name, next: nil)
+            phase = .done(target.name, next: nil)
             return
         }
         if let snap = rollback?.keychain { await Keychain.restore(service: target.keychainService, snap) }
         if let file = rollback?.profile { try? file.write(to: dir.appendingPathComponent(".claude.json"), options: .atomic) }
-        let other = signedIn["emailAddress"] as? String ?? "a different account"
-        phase = .failed("You signed in as \(other), but this row is \(target.email ?? target.name). The previous login was kept; try again and pick \(target.email ?? "the right account").")
+        phase = .failed("That sign-in was a different account than \(target.name), so the previous login was kept. Try again and pick the Google account \(target.name) belongs to.")
     }
 
     /// Pin a login folder to one organization: Claude Code pre-selects it on the sign-in page
@@ -1791,6 +1736,18 @@ let accountColors: [(name: String, hex: String)] = [
     ("Purple", "#6B5BD2"), ("Teal", "#1F8A9A"), ("Red", "#C8412F"), ("Gray", "#7A8088"),
 ]
 let presetColors = accountColors.map(\.hex)
+
+/// A small capsule in a row's action slot: "In use", or "Out" for a row at its limit.
+struct Badge: View {
+    let text: String
+    var tint: Color = .accentColor
+
+    var body: some View {
+        Text(text).font(.caption.weight(.semibold))
+            .padding(.horizontal, 8).frame(height: 20)
+            .background(Capsule().fill(tint.opacity(0.18)))
+    }
+}
 
 struct Meter: View {
     let label: String
@@ -1838,18 +1795,24 @@ struct AccountRow: View {
     let onRename: (String) -> Void
     let onRecolor: (String) -> Void
     let onRemove: () -> Void
-    /// Shown under its account's name as one of that account's organizations.
-    var organizationEntry = false
+    /// Set when the row is shown under its account's name as one of that account's organizations.
+    var organizationTitle: String? = nil
+    private var organizationEntry: Bool { organizationTitle != nil }
     @State private var confirmingRemove = false
     @State private var renaming = false
     @State private var draftName = ""
     @FocusState private var nameFocused: Bool
 
-    /// An empty name puts the email back as the label.
+    /// An empty name puts the default label back.
     private func commitRename() {
-        let trimmed = draftName.trimmingCharacters(in: .whitespaces)
-        onRename(trimmed.isEmpty ? (account.email ?? account.name) : trimmed)
+        onRename(draftName.trimmingCharacters(in: .whitespaces))
         renaming = false
+    }
+
+    /// The meter holding this row at its limit, if any, and its name for the reason shown.
+    private var limit: (window: UsageWindow, name: String)? {
+        guard case .ok(_, let fh, let wk, _) = state, let full = MeterRule.limiting(fiveHour: fh, weekly: wk) else { return nil }
+        return (full, full == wk ? "weekly" : "5-hour")
     }
 
     /// "Login expires in 5 h" inside the warning window, nil otherwise.
@@ -1871,9 +1834,9 @@ struct AccountRow: View {
                         .onSubmit(commitRename)
                         .onExitCommand { renaming = false }
                 } else {
-                    Text(organizationEntry ? (account.orgName ?? account.name) : account.name)
+                    Text(organizationTitle ?? account.name)
                         .fontWeight(organizationEntry ? .regular : .semibold).lineLimit(1).truncationMode(.middle)
-                        .help(account.email ?? account.name)
+                        .help(account.name)
                     if case .ok(let plan?, _, _, _) = state {
                         Text(plan.capitalized).font(.caption).foregroundStyle(.secondary)
                     }
@@ -1882,9 +1845,12 @@ struct AccountRow: View {
                 // One fixed box for both, so "In use" and Switch share a center line and right edge.
                 Group {
                     if inUse {
-                        Text("In use").font(.caption.weight(.semibold))
-                            .padding(.horizontal, 8).frame(height: 20)
-                            .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                        Badge(text: "In use")
+                    } else if canSwitch, let limit {
+                        // Switching to an account at its limit would only stop the next chat.
+                        Badge(text: "Out", tint: .secondary)
+                            .help("Out of usage until its \(limit.name) limit resets \(limit.window.resetText)")
+                            .accessibilityLabel("Out of usage")
                     } else if canSwitch {
                         Button("Switch", action: onSwitch).controlSize(.small).disabled(switchBusy)
                             .help(organizationEntry ? "Quit Claude, switch it to this organization, and bring your open sessions along"
@@ -1898,9 +1864,10 @@ struct AccountRow: View {
                 }
                 .frame(width: 62, height: 22, alignment: .trailing)
                 Menu {
-                    if let email = account.email { Text(email) }
-                    if let org = account.orgName { Text(org) }
-                    Divider()
+                    if let org = account.organization {
+                        Text(org)
+                        Divider()
+                    }
                     Button("Rename…") {
                         draftName = account.name
                         renaming = true
@@ -1922,7 +1889,7 @@ struct AccountRow: View {
             }
             switch state {
             case .ok(_, let fh, let wk, _):
-                Meter(label: "5-hour", window: fh)
+                if MeterRule.showsFiveHour(fiveHour: fh, weekly: wk) { Meter(label: "5-hour", window: fh) }
                 Meter(label: "Weekly", window: wk)
                 if let warning = expiryWarning { signInPrompt(warning) }
                 if let until = retryAt, until > Date() {
@@ -1966,6 +1933,7 @@ struct AccountRow: View {
 struct MenuContent: View {
     @ObservedObject var store: Store
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2017,19 +1985,38 @@ struct MenuContent: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(10)
             }
-            // One entry per account; an account in several organizations lists each beneath its name.
+            // One entry per account; an account in several organizations lists each beneath its
+            // name, shown until its name is clicked to fold them away.
             ForEach(store.accounts.groupedByAccount(), id: \.[0].id) { group in
                 if group.count == 1 {
                     row(group[0], in: group)
                 } else {
+                    let account = group[0].accountUuid ?? group[0].id
+                    let shown = store.settings.showsOrganizations(of: account)
                     VStack(alignment: .leading, spacing: 0) {
-                        HStack(spacing: 8) {
-                            Circle().fill(Color(hex: group[0].color)).frame(width: 9, height: 9)
-                            Text(accountTitle(group)).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
-                                .help(group[0].email ?? group[0].name)
+                        Button {
+                            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { store.setShowsOrganizations(of: account, !shown) }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Circle().fill(Color(hex: group[0].color)).frame(width: 9, height: 9)
+                                Text(accountTitle(group)).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
+                                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                    .rotationEffect(.degrees(shown ? 90 : 0))
+                                Spacer()
+                                if !shown, group.contains(where: store.isInUse) { Badge(text: "In use") }
+                            }
+                            .contentShape(Rectangle())
                         }
-                        .padding(.horizontal, 10).padding(.top, 8)
-                        ForEach(group) { row($0, in: group) }
+                        .buttonStyle(.plain)
+                        .help(shown ? "Hide this account's organizations" : "Show this account's organizations")
+                        .accessibilityLabel(accountTitle(group))
+                        .accessibilityValue(shown ? "Organizations shown" : "Organizations hidden")
+                        .padding(.horizontal, 10).padding(.top, 8).padding(.bottom, shown ? 0 : 8)
+                        if shown {
+                            ForEach(Array(group.enumerated()), id: \.element.id) { i, acct in
+                                row(acct, in: group, organizationTitle: acct.organization ?? "Organization \(i + 1)")
+                            }
+                        }
                     }
                 }
             }
@@ -2042,7 +2029,7 @@ struct MenuContent: View {
         }
     }
 
-    private func row(_ acct: AccountRecord, in group: [AccountRecord]) -> some View {
+    private func row(_ acct: AccountRecord, in group: [AccountRecord], organizationTitle: String? = nil) -> some View {
         AccountRow(account: acct, state: store.states[acct.id], inUse: store.isInUse(acct),
                    sameAccountInUse: !store.isInUse(acct) && acct.accountUuid != nil && acct.accountUuid == store.inUse?.account,
                    canSwitch: LoginSlot.exists(acct), switchBusy: store.switching != nil,
@@ -2053,14 +2040,14 @@ struct MenuContent: View {
                    // An account's color is shared by all of its organizations.
                    onRecolor: { color in group.forEach { store.update($0, color: color) } },
                    onRemove: { store.remove(acct) },
-                   organizationEntry: group.count > 1)
+                   organizationTitle: organizationTitle)
     }
 
     /// An account's name above its organizations: its first row's label, without the
     /// organization that label may carry.
     private func accountTitle(_ group: [AccountRecord]) -> String {
         let first = group[0]
-        guard let org = first.orgName, first.name.hasSuffix(" · " + org) else { return first.name }
+        guard let org = first.organization, first.name.hasSuffix(" · " + org) else { return first.name }
         return String(first.name.dropLast(org.count + 3))
     }
 
@@ -2111,7 +2098,7 @@ struct SignInView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(target.map { "Sign in again: \($0.email ?? $0.name)" } ?? "Add a Claude account")
+            Text(target.map { "Sign in again: \($0.name)" } ?? "Add a Claude account")
                 .font(.title3.weight(.semibold)).lineLimit(1).truncationMode(.middle)
             steps
         }
@@ -2142,7 +2129,7 @@ struct SignInView: View {
         case .idle, .starting:
             HStack { ProgressView().controlSize(.small); Text("Opening the sign-in page in your browser…").font(.callout) }
         case .waitingForCode:
-            Text(target.map { "In your browser, choose Continue with Google and pick \($0.email ?? "the same account"). After you click Authorize, the page shows a code. Paste it here." }
+            Text(target.map { "In your browser, choose Continue with Google and pick the account \($0.name) belongs to. After you click Authorize, the page shows a code. Paste it here." }
                  ?? "In your browser, choose Continue with Google and pick the account to add. After you click Authorize, the page shows a code. Paste it here.")
                 .font(.callout).fixedSize(horizontal: false, vertical: true)
             TextField("Paste the code", text: $code)
@@ -2276,7 +2263,7 @@ private func drawWarning(centeredAt mid: NSPoint) {
 ///
 /// - `--status` prints what a switch would act on.
 /// - `--switch <account>` runs the menu's switch. The account can be named by id, label, email,
-///   or the email's first part.
+///   or the email's first part; none of them is printed back beyond the label.
 /// - `--auto-switch` runs the menu's Auto-Switch rule once: if Claude's log shows it stopped a
 ///   chat of the account in use for usage, it switches to the set-up account with the most room,
 ///   judged on the usage the menu last read.
@@ -2328,7 +2315,7 @@ enum Entry {
         } else {
             let key = (value(after: "--switch", in: args) ?? "").lowercased()
             let matches = accounts.filter {
-                [$0.id, $0.name, $0.email ?? "", $0.shortName, String(($0.email ?? "").prefix { $0 != "@" })]
+                [$0.id, $0.name, $0.email ?? "", String(($0.email ?? "").prefix { $0 != "@" })]
                     .map { $0.lowercased() }.contains(key)
             }
             guard matches.count == 1, let match = matches.first else {
@@ -2396,7 +2383,8 @@ enum Entry {
         func describe(_ c: SwitchCandidate) -> String {
             guard let read = c.readAt else { return "no reading" }
             let age = max(Int(now.timeIntervalSince(read) / 60), 0)
-            return "5-hour \(AutoSwitchRule.percent(c.fiveHour ?? 0)), weekly \(AutoSwitchRule.percent(c.weekly ?? 0)), read \(age) min ago"
+            return (c.fiveHour.map { "5-hour \(AutoSwitchRule.percent($0)), " } ?? "no 5-hour limit, ")
+                + "weekly \(AutoSwitchRule.percent(c.weekly ?? 0)), read \(age) min ago"
                 + (c.isOut(at: now) ? ", out" : "") + (c.hasSavedLogin ? "" : ", not set up") + (c.needsSignIn ? ", needs sign-in" : "")
         }
         print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
@@ -2427,6 +2415,7 @@ enum Entry {
         print("Interrupted switch: \(SwitchJournal.load() == nil ? "none" : "yes")")
         print("Auto-switch:      \(AppSettings.load().autoSwitch ? "on, when Claude stops a chat at the usage limit" : "off")")
         print("Accessibility:    \(QuitPrompt.trusted ? "granted to this process" : "not granted to this process")")
+        print("Notifications:    \(Notify.permission())")
         for acct in accounts {
             print("Saved login \(acct.name): \(LoginSlot.identity(acct).map { "organization \($0.org.prefix(8))" } ?? "none")")
         }
@@ -2477,6 +2466,8 @@ enum Entry {
 
 struct ClaudeAccountsApp: App {
     @StateObject private var store = Store()
+
+    init() { Notify.requestPermission() }
 
     var body: some Scene {
         MenuBarExtra {

@@ -1,5 +1,5 @@
 // Tests for app/Rules.swift: the auto-switch rule, reading Claude's log, the quit watch,
-// organization matching and the resume step. Run with ./test.sh; it needs only swiftc, like the app.
+// organization matching, labels, meters, settings and the resume step. Run with ./test.sh; it needs only swiftc, like the app.
 
 import Foundation
 
@@ -21,6 +21,9 @@ struct RulesTests {
         claudeLog()
         quitWatch()
         organizations()
+        labels()
+        meters()
+        settings()
         resume()
         print(failures == 0 ? "All \(count) checks passed." : "\(failures) of \(count) checks failed.")
         exit(failures == 0 ? 0 : 1)
@@ -87,7 +90,7 @@ struct RulesTests {
         check(nowhere(decide(busy, [row("a", 0, 0, readMinutesAgo: 20)])), "only stale targets: a notice, no switch")
         check(picked(decide(row("busy", 40, 70, readMinutesAgo: 600), [work])) == "work",
               "a stale reading of the account in use doesn't hold back a stop")
-        check(picked(decide(busy, [row("a", nil, nil), row("b", 1, 1)])) == "a", "a window not started yet counts as nothing used")
+        check(picked(decide(busy, [row("a", nil, nil), row("b", 1, 1)])) == "a", "a meter the account doesn't have counts as nothing used")
         let never = SwitchCandidate(id: "x", name: "x", fiveHour: nil, weekly: nil, readAt: nil, needsSignIn: false, hasSavedLogin: true)
         check(picked(decide(busy, [never])) == nil, "an account never read is not a target")
 
@@ -284,10 +287,6 @@ struct RulesTests {
               "offers the organizations not added yet, most used first")
         check(rows.organizationsToAdd(account: "acct", opened: opened) == ["org-c"], "never one already added")
         check(rows.organizationsToAdd(account: "acct", opened: []).isEmpty, "nothing known when Claude opened no other")
-        check(rowName(email: "me@example.com", orgName: "Team", accountAlreadyAdded: true, fallback: "x") == "me@example.com · Team",
-              "a second organization's row names its organization")
-        check(rowName(email: "me@example.com", orgName: "Team", accountAlreadyAdded: false, fallback: "x") == "me@example.com",
-              "a first row is just the email")
 
         // Auto-switch treats each account-and-organization pair as its own target.
         let outPersonal = row("a", 10, 60)
@@ -303,6 +302,93 @@ struct RulesTests {
         let decoded = try? JSONDecoder().decode(File.self, from: Data(old.utf8))
         check(decoded?.accounts.first?.orgUuid == nil && decoded?.accounts.first?.accountUuid == "u",
               "an accounts file from before organizations still loads")
+    }
+
+    // MARK: Labels
+
+    static func labels() {
+        func named(_ id: String, _ name: String, account: String?, orgName: String?) -> AccountRecord {
+            AccountRecord(id: id, name: name, color: "#000000", configDir: "~/x", keychainService: "k", email: "me@example.com",
+                          accountUuid: account, orgName: orgName, orgUuid: id)
+        }
+        // Labels used to default to the email; on load they become the default label.
+        let old = [named("a", "me@example.com", account: "acct", orgName: "Northwind Labs"),
+                   named("b", "me@example.com · Northwind Research", account: "acct", orgName: "Northwind Research"),
+                   named("c", "you@example.com", account: "other", orgName: "you@example.com's Organization")]
+        check(old.relabeled().map(\.name) == ["Northwind Labs", "Northwind Labs · Northwind Research", "Account 2"],
+              "an email label becomes the organization's name, the account's label and its organization, or Account N")
+        let renamed = [named("a", "Work", account: "acct", orgName: "Northwind Labs"),
+                       named("b", "me@example.com · Northwind Research", account: "acct", orgName: "Northwind Research")]
+        check(renamed.relabeled().map(\.name) == ["Work", "Work · Northwind Research"],
+              "a label someone chose is kept, and a second organization reads as that label and its organization")
+        let personal = [named("a", "Work", account: "acct", orgName: "Northwind Labs"),
+                        named("b", "me@example.com", account: "acct", orgName: "me@example.com's Organization")]
+        check(personal.relabeled().map(\.name) == ["Work", "Work · Organization 2"],
+              "an organization Claude named after the email is never shown by that name")
+        check(personal[1].organization == nil && personal[0].organization == "Northwind Labs", "an organization's name with an email is not shown")
+        let added = named("d", "", account: "acct", orgName: "Northwind Support")
+        check((renamed.relabeled() + [added]).defaultLabel(for: added) == "Work · Northwind Support", "a new organization of a known account")
+        check([named("e", "", account: "new", orgName: nil)].defaultLabel(for: named("e", "", account: "new", orgName: nil)) == "Account 1",
+              "a new account with no organization name is Account N")
+        check((old + personal).relabeled().allSatisfy { !$0.name.contains("@") }, "no label shows an email or part of one")
+        check(shownName("me@example.com") == nil && shownName("Work") == "Work" && shownName("") == nil, "only a name without an email is shown")
+    }
+
+    // MARK: Meters
+
+    static func meters() {
+        func body(_ json: String) -> [String: Any] {
+            (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
+        }
+        // The usage service's answer for a plan without a 5-hour limit, and for one whose window hasn't started.
+        let noFiveHour = body(#"{"five_hour": null, "seven_day": {"utilization": 41.5, "resets_at": "2026-11-25T17:00:00Z"}}"#)
+        let notStarted = body(#"{"five_hour": {"utilization": 0, "resets_at": null}, "seven_day": {"utilization": 3, "resets_at": null}}"#)
+        let nullUse = body(#"{"five_hour": {"utilization": null, "resets_at": null}, "seven_day": {"utilization": 3, "resets_at": null}}"#)
+        check(UsageWindow(noFiveHour["five_hour"]) == nil && UsageWindow(body("{}")["five_hour"]) == nil && UsageWindow(nullUse["five_hour"]) == nil,
+              "a missing, null, or null-utilization window is no window")
+        check(UsageWindow(notStarted["five_hour"])?.utilization == 0 && UsageWindow(noFiveHour["seven_day"])?.utilization == 41.5,
+              "a window at 0 with no reset is still a window")
+        let wk = UsageWindow(noFiveHour["seven_day"]), fh = UsageWindow(utilization: 20, resetsAt: nil)
+        check(!MeterRule.showsFiveHour(fiveHour: nil, weekly: wk), "no 5-hour meter for an account without a 5-hour window")
+        check(MeterRule.showsFiveHour(fiveHour: UsageWindow(notStarted["five_hour"]), weekly: wk), "a 5-hour window not started yet still shows")
+        check(MeterRule.showsFiveHour(fiveHour: nil, weekly: nil), "a reading with no window at all hides nothing")
+        check(MeterRule.gauge(.fiveHour, fiveHour: nil, weekly: wk) == wk, "the gauge follows the weekly meter when there is no 5-hour window")
+        check(MeterRule.gauge(.fiveHour, fiveHour: fh, weekly: wk) == fh && MeterRule.gauge(.weekly, fiveHour: fh, weekly: wk) == wk,
+              "otherwise it follows the chosen limit")
+
+        // Out and most room: an account without a 5-hour window is judged on its weekly meter alone.
+        check(picked(decide(row("busy", 40, 70), [row("ultra", nil, 30), row("max", 35, 5)])) == "ultra",
+              "no 5-hour window: its weekly meter is its room")
+        check(row("ultra", nil, 100).isOut(at: now) && !row("ultra", nil, 99.6).isOut(at: now), "and its weekly meter alone makes it out")
+        check(picked(decide(row("busy", 40, 70), [row("ultra", nil, 100), row("max", 35, 5)])) == "max", "never to it when its weekly is full")
+
+        // A row at its limit offers no Switch; the reason is the meter that frees up last.
+        let soon = Date().addingTimeInterval(3600), later = Date().addingTimeInterval(3 * 86400)
+        let fullFive = UsageWindow(utilization: 100, resetsAt: soon), fullWeek = UsageWindow(utilization: 100.2, resetsAt: later)
+        check(MeterRule.limiting(fiveHour: fullFive, weekly: UsageWindow(utilization: 60, resetsAt: later)) == fullFive, "a full 5-hour meter holds it")
+        check(MeterRule.limiting(fiveHour: fullFive, weekly: fullWeek) == fullWeek, "both full: the one that resets last")
+        check(MeterRule.limiting(fiveHour: nil, weekly: fullWeek) == fullWeek, "a full weekly meter with no 5-hour window")
+        check(MeterRule.limiting(fiveHour: UsageWindow(utilization: 99.6, resetsAt: soon), weekly: nil) == nil, "99.6 percent still has room")
+        check((MeterRule.limiting(fiveHour: nil, weekly: fullWeek) != nil) == row("x", nil, 100.2).atLimit
+              && (MeterRule.limiting(fiveHour: fullFive, weekly: nil) != nil) == row("x", 100, nil).atLimit,
+              "the menu and auto-switch agree on a meter at its limit")
+    }
+
+    // MARK: Settings
+
+    static func settings() {
+        func decode(_ json: String) -> AppSettings? { try? JSONDecoder().decode(AppSettings.self, from: Data(json.utf8)) }
+        let old = decode(#"{"display":"gauge","metric":"weekly","autoSwitch":false}"#)
+        check(old?.showsOrganizations(of: "acct") == true && old?.display == .gauge && old?.autoSwitch == false,
+              "a settings file from before shows every organization and keeps its other choices")
+        check(AppSettings().showsOrganizations(of: "acct") && AppSettings().autoSwitch, "organizations show by default")
+        var folded = AppSettings()
+        folded.setShowsOrganizations(of: "acct", false)
+        let reread = (try? JSONEncoder().encode(folded)).flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) }
+        check(reread?.showsOrganizations(of: "acct") == false && reread?.showsOrganizations(of: "other") == true,
+              "folding one account's organizations is remembered across launches, for that account only")
+        folded.setShowsOrganizations(of: "acct", true)
+        check(folded.showsOrganizations(of: "acct") && folded.collapsed.isEmpty, "and showing them again clears it")
     }
 
     // MARK: Resume
