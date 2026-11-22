@@ -2089,9 +2089,57 @@ struct Badge: View {
     }
 }
 
+/// Design step only: the three card looks the menu is rendered in for the pick. One survives.
+enum CardLook: String, CaseIterable {
+    /// One card per account, its organizations as rows inside it.
+    case account
+    /// One card per row, washed in the account's color.
+    case row
+    /// One card per row, neutral, colored only by its state: in use, out, not set up.
+    case state
+
+    nonisolated(unsafe) static var current: CardLook = .account
+}
+
+/// A meter at its limit means the row is out.
+extension AccountState {
+    var out: Bool {
+        guard case .ok(_, let fh, let wk, _) = self else { return false }
+        return max(fh?.utilization ?? 0, wk?.utilization ?? 0) >= AutoSwitchRule.limit
+    }
+}
+
+/// The surface a card sits on. Fill and edge are system colors over the menu's vibrancy, so they
+/// follow light, dark and increased contrast; increased contrast draws the edge in the label color.
+struct Card<Content: View>: View {
+    var fill: AnyShapeStyle = AnyShapeStyle(Color(nsColor: .quaternarySystemFill))
+    /// An edge that says something (in use, out); nil draws the quiet hairline.
+    var edge: Color? = nil
+    var dashed = false
+    @ViewBuilder let content: Content
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
+        let quiet = contrast == .increased ? Color.primary.opacity(0.55) : Color(nsColor: .separatorColor)
+        content
+            .background(shape.fill(fill))
+            .overlay(shape.strokeBorder(edge ?? quiet,
+                                        style: StrokeStyle(lineWidth: edge == nil ? 1 : 1.5, dash: dashed ? [4, 3] : [])))
+            .clipShape(shape)
+    }
+}
+
 struct Meter: View {
     let label: String
     let window: UsageWindow?
+    /// A gray bar that turns red only at the limit, for the look where state carries the color.
+    var quiet = false
+
+    private func barColor(_ pct: Int) -> Color {
+        guard quiet else { return severity(pct) }
+        return pct >= Int(AutoSwitchRule.limit) ? .red : Color(nsColor: .tertiaryLabelColor)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2104,7 +2152,7 @@ struct Meter: View {
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.secondary.opacity(0.2))
                     if let w = window {
-                        Capsule().fill(severity(w.pct))
+                        Capsule().fill(barColor(w.pct))
                             .frame(width: geo.size.width * CGFloat(min(max(w.pct, 0), 100)) / 100)
                     }
                 }
@@ -2269,15 +2317,24 @@ struct AccountRow: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 // An organization entry lines up under its account's dot instead of repeating it.
-                Circle().fill(organizationEntry ? Color.clear : Color(hex: account.color)).frame(width: 9, height: 9)
+                // A card washed in the account's color needs no dot.
+                if look != .row {
+                    Circle().fill(organizationEntry ? Color.clear : Color(hex: account.color)).frame(width: 9, height: 9)
+                }
                 if renaming {
                     RenameField(current: organizationTitle ?? account.name, renaming: $renaming, onCommit: onRename)
                 } else {
-                    Text(organizationTitle ?? account.name)
-                        .fontWeight(organizationEntry ? .regular : .semibold).lineLimit(1).truncationMode(.middle)
+                    // No account header in the row look, so each card names its account first.
+                    let title = look == .row && organizationEntry
+                        ? Text(account.name).fontWeight(.semibold) + Text(" · \(organizationTitle!)")
+                        : Text(organizationTitle ?? account.name).fontWeight(organizationEntry ? .regular : .semibold)
+                    title.lineLimit(1).truncationMode(.middle)
                         .help(account.label)
                     if case .ok(let plan?, _, _, _) = state {
                         Text(plan.capitalized).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if look == .state, !inUse, state?.out == true {
+                        Text("Out").font(.caption.weight(.semibold)).foregroundStyle(.red)
                     }
                     if next { NextMark() }
                 }
@@ -2317,8 +2374,8 @@ struct AccountRow: View {
             }
             switch state {
             case .ok(_, let fh, let wk, _):
-                if MeterRule.showsFiveHour(fiveHour: fh, weekly: wk) { Meter(label: "5-hour", window: fh) }
-                Meter(label: "Weekly", window: wk)
+                if MeterRule.showsFiveHour(fiveHour: fh, weekly: wk) { Meter(label: "5-hour", window: fh, quiet: look == .state) }
+                Meter(label: "Weekly", window: wk, quiet: look == .state)
                 if let warning = expiryWarning { signInPrompt(warning) }
                 if let until = retryAt, until > Date() {
                     Text("Rate-limited by the usage service · retrying at \(until.formatted(date: .omitted, time: .shortened))")
@@ -2349,8 +2406,13 @@ struct AccountRow: View {
             }
         }
         .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(inUse ? Color.primary.opacity(0.06) : .clear))
+        // Inside an account's card, the organization in use is lit; the other looks light the whole card.
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+            .fill(look == .account && inUse && organizationEntry ? Color.accentColor.opacity(0.12) : .clear)
+            .padding(3))
     }
+
+    private var look: CardLook { CardLook.current }
 
     private func signInPrompt(_ reason: String) -> some View {
         HStack {
@@ -2366,6 +2428,8 @@ struct MenuContent: View {
     @ObservedObject var store: Store
     @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2439,32 +2503,16 @@ struct MenuContent: View {
             // name, shown until its name is clicked to fold them away.
             let groups = store.accounts.groupedByAccount()
             let next = store.nextRow
-            ForEach(groups, id: \.[0].id) { group in
-                if group.count == 1 {
-                    row(group[0], in: group, next: next)
-                } else {
-                    let account = group[0].accountUuid ?? group[0].id
-                    let shown = store.settings.showsOrganizations(of: account)
-                    VStack(alignment: .leading, spacing: 0) {
-                        AccountHeader(name: group[0].name, color: group[0].color, shown: shown,
-                                      inUse: !shown && group.contains(where: store.isInUse),
-                                      next: !shown && group.contains { $0.id == next },
-                                      canReset: store.accounts.renamed(group[0], to: "", organization: false).first { $0.id == group[0].id }?.name != group[0].name,
-                                      onFold: {
-                                          withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { store.setShowsOrganizations(of: account, !shown) }
-                                      },
-                                      onRename: { store.rename(group[0], to: $0, organization: false) },
-                                      onRecolor: { store.recolor(group[0], $0) },
-                                      move: moves(group[0], organization: false))
-                        .padding(.horizontal, 10).padding(.top, 8).padding(.bottom, shown ? 0 : 8)
-                        if shown {
-                            ForEach(group) { acct in
-                                row(acct, in: group, next: next, organizationTitle: acct.organization)
-                            }
-                        }
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(groups, id: \.[0].id) { group in
+                    switch CardLook.current {
+                    case .account: accountCard(group, next: next)
+                    case .row: rowCards(group, next: next)
+                    case .state: stateCards(group, next: next)
                     }
                 }
             }
+            .padding(.top, 2)
         }
         .padding(6)
         .frame(width: 330)
@@ -2494,6 +2542,82 @@ struct MenuContent: View {
                    onRemove: { store.remove(acct) },
                    move: moves(acct, organization: organizationTitle != nil),
                    organizationTitle: organizationTitle)
+    }
+
+    /// The name above an account's organizations, which folds them away.
+    private func header(_ group: [AccountRecord], next: String?) -> some View {
+        let account = group[0].accountUuid ?? group[0].id
+        let shown = store.settings.showsOrganizations(of: account)
+        return AccountHeader(name: group[0].name, color: group[0].color, shown: shown,
+                             inUse: !shown && group.contains(where: store.isInUse),
+                             next: !shown && group.contains { $0.id == next },
+                             canReset: store.accounts.renamed(group[0], to: "", organization: false).first { $0.id == group[0].id }?.name != group[0].name,
+                             onFold: {
+                                 withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { store.setShowsOrganizations(of: account, !shown) }
+                             },
+                             onRename: { store.rename(group[0], to: $0, organization: false) },
+                             onRecolor: { store.recolor(group[0], $0) },
+                             move: moves(group[0], organization: false))
+    }
+
+    private func shown(_ group: [AccountRecord]) -> Bool {
+        store.settings.showsOrganizations(of: group[0].accountUuid ?? group[0].id)
+    }
+
+    /// Look (a): one card per account. Its organizations are rows inside, split by hairlines; the
+    /// card of the account in use has an accent edge and its organization in use is lit.
+    private func accountCard(_ group: [AccountRecord], next: String?) -> some View {
+        let inUse = group.contains(where: store.isInUse)
+        return Card(fill: AnyShapeStyle(inUse && group.count == 1 ? Color.accentColor.opacity(0.12)
+                                        : Color(nsColor: .quaternarySystemFill)),
+                    edge: inUse ? .accentColor : nil) {
+            VStack(alignment: .leading, spacing: 0) {
+                if group.count == 1 {
+                    row(group[0], in: group, next: next)
+                } else {
+                    header(group, next: next).padding(.horizontal, 10).padding(.vertical, 8)
+                    if shown(group) {
+                        ForEach(group) { acct in
+                            Divider().padding(.leading, 27)
+                            row(acct, in: group, next: next, organizationTitle: acct.organization)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Look (b): one card per row, washed in its account's color, with no account header; the row
+    /// in use has a full-strength edge.
+    private func rowCards(_ group: [AccountRecord], next: String?) -> some View {
+        ForEach(group) { acct in
+            let color = Color(hex: acct.color)
+            Card(fill: AnyShapeStyle(color.opacity(colorScheme == .dark ? 0.24 : 0.13)),
+                 edge: store.isInUse(acct) ? color : color.opacity(contrast == .increased ? 0.9 : 0.35)) {
+                row(acct, in: group, next: next, organizationTitle: group.count > 1 ? acct.organization : nil)
+            }
+        }
+    }
+
+    /// Look (c): the account header as today, then one neutral card per row whose fill and edge say
+    /// its state: accent in use, red when out, a dashed outline when not set up.
+    private func stateCards(_ group: [AccountRecord], next: String?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if group.count > 1 { header(group, next: next).padding(.horizontal, 10).padding(.top, 4) }
+            if group.count == 1 || shown(group) {
+                ForEach(group) { acct in
+                    let inUse = store.isInUse(acct)
+                    let out = !inUse && store.states[acct.id]?.out == true
+                    let notSetUp = !inUse && !LoginSlot.exists(acct)
+                    Card(fill: AnyShapeStyle(inUse ? Color.accentColor.opacity(0.14) : out ? Color.red.opacity(0.10)
+                                             : notSetUp ? Color.clear : Color(nsColor: .quaternarySystemFill)),
+                         edge: inUse ? .accentColor : out ? .red.opacity(contrast == .increased ? 1 : 0.6) : nil,
+                         dashed: notSetUp) {
+                        row(acct, in: group, next: next, organizationTitle: group.count > 1 ? acct.organization : nil)
+                    }
+                }
+            }
+        }
     }
 
     /// Move Up and Move Down for a row's menu, each nil where the row is already at that end.
