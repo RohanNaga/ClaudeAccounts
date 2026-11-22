@@ -2608,7 +2608,7 @@ struct MenuContent: View {
                 ForEach(group) { acct in
                     let inUse = store.isInUse(acct)
                     let out = !inUse && store.states[acct.id]?.out == true
-                    let notSetUp = !inUse && !LoginSlot.exists(acct)
+                    let notSetUp = !inUse && !store.hasSavedLogin(acct)
                     Card(fill: AnyShapeStyle(inUse ? Color.accentColor.opacity(0.14) : out ? Color.red.opacity(0.10)
                                              : notSetUp ? Color.clear : Color(nsColor: .quaternarySystemFill)),
                          edge: inUse ? .accentColor : out ? .red.opacity(contrast == .increased ? 1 : 0.6) : nil,
