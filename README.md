@@ -112,7 +112,7 @@ header's `···` menu turns the automatic part off.
 | `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Only on **Switch** or **Set Up**, with Claude quit; the folder names in `claude-code-sessions` are also read to find an account's other organizations |
 | `~/Library/Logs/Claude/main.log` | Read only, to see which account Claude reports and which chats Claude stopped because that account is out of usage | Always |
 | Claude's quit prompt, through Accessibility | Reads whether the prompt is open; presses **Quit anyway** | Only on an automatic or `--unattended` switch |
-| `claude://code/continue?session=…` and the chat's message box, through Accessibility | Opens each chat the quit or the limit stopped; types "resume" into that chat's own message box and presses its Send button, once | After every switch Claude confirms |
+| `claude://code/continue?session=…` and the chat's message box, through Accessibility | Opens each chat the quit or the limit stopped; types "resume" into that chat's own message box and presses its Send button, once; tries a chat that isn't running again every minute for 30 minutes while nobody uses the Mac | After every switch Claude confirms |
 
 **Remove** on an account's `···` menu signs its login out and deletes its
 keychain item. To uninstall, remove your accounts, quit the app, and delete it
@@ -218,20 +218,39 @@ Then, one chat at a time, most recently active first:
 2. It checks, through Accessibility, that Claude's window now shows that chat.
    It matches the session id in the page's address, never the window's place
    or order.
-3. If the chat is already running, it leaves it alone. If its message box holds
+3. It waits, up to two minutes, for the chat's page to finish loading and show
+   its message box. The box is the page's own text box named Prompt, or else its
+   only multi-line text box, so a side panel's address field or an artifact's
+   own text box is never taken for it.
+4. If the chat is already running, it leaves it alone. If its message box holds
    text you haven't sent, it leaves that too. A chat the quit cut off gets 10
    seconds to resume by itself on open.
-4. Otherwise it puts "resume" in that chat's message box and presses that
-   chat's Send button, once. It posts no keystrokes, so it doesn't matter which
-   window has keyboard focus.
-5. It waits for the chat to show its turn running, up to 30 seconds, before it
+5. Otherwise it puts "resume" in that chat's message box, waits for Claude to
+   show Send beside it (Claude shows Send only once the box holds text), and
+   presses it, once. It posts no keystrokes, so it doesn't matter which window
+   has keyboard focus, and it never presses a suggested reply.
+6. It waits for the chat to show its turn running, up to 30 seconds, before it
    opens the next one.
+
+A chat that isn't running after that is tried again every minute for 30
+minutes, until it runs or someone types in it. A retry opens a chat only after
+a minute with nobody using the Mac, so it never pulls you away from another
+chat. A chat that was sent "resume" is never sent it again. Then the
+notification says how many stopped chats are running again.
+
+A chat's subagents run inside it and stop with it, so the chat is what gets the
+message: its next turn starts them again.
 
 It never presses Retry or Rewind. Retry on a failed message rewinds the chat and
 starts its transcript over under a new id, without its subagents; a new message
-keeps them. A chat that couldn't be resumed is named in the notification with
-the reason, for example "it has an unsent draft". Send that one a message
-yourself.
+keeps them. A chat still not running after the 30 minutes is named in the
+notification and the menu with the reason, for example "it has an unsent draft".
+Send that one a message yourself. Each step is written to `resume.log` in the
+app's state folder.
+
+To watch these steps on one chat, run `--test-resume` with the chat's title or
+session id (see [Command line](#command-line)). It sends "resume" to that chat,
+so use a chat you don't mind getting it.
 
 Reaching a chat from your phone: Remote Control re-registers under the new
 account, so the Claude app on your phone has to be signed in to that account
@@ -274,10 +293,18 @@ The binary is at `Claude Accounts.app/Contents/MacOS/ClaudeAccounts`.
 | `--unattended` | With `--switch`, answers Claude's quit prompt with Quit anyway (implied by `--auto-switch`) |
 | `--dry-run` | Prints every check and what would happen, and changes nothing |
 | `--detach` | Starts the command in its own session and returns; output goes to `--log <file>`, by default `last-switch.log` in the app's state folder |
+| `--test-resume <title or id>` | Sends "resume" to that one open chat of the account Claude has open, by the steps a switch takes after it reopens Claude, once, and prints each step |
 
 Quitting Claude ends the processes Claude started, so from a shell inside
 Claude, for example in a Claude Code chat, add `--detach`. Without it, run the
 command from a terminal outside Claude.
+
+`--test-resume` needs Accessibility. To use the app's own access rather than
+your terminal's, start it through the app:
+
+```sh
+open -n -W -o "$(tty)" --stderr "$(tty)" -a "/Applications/Claude Accounts.app" --args --test-resume "<chat title>"
+```
 
 ## Usage and sign-in
 

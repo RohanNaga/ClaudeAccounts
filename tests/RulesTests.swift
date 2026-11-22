@@ -505,19 +505,52 @@ struct RulesTests {
         func step(_ s: ChatScreen?, interrupted: Bool = false, waited: TimeInterval = 1, shownFor: TimeInterval? = 1) -> ResumeRule.Step {
             ResumeRule.step(s, interrupted: interrupted, waited: waited, shownFor: shownFor)
         }
-        check(step(idle) == .send, "an idle chat with an empty message box gets the message")
+        check(step(idle) == .send, "an idle chat with an empty message box gets the message, though Claude shows no Send until it has text")
         check(step(ChatScreen(busy: true, composer: true, draft: false)) == .done(.running), "a running chat is never sent to")
-        check(step(ChatScreen(busy: false, composer: true, draft: true)) == .done(.notResumed("it has an unsent draft")),
-              "a chat with someone's unsent text is never sent to")
+        check(step(ChatScreen(loading: true, busy: true, composer: true, draft: false)) == .done(.running), "a running chat counts as running while its page is busy")
+        check(step(ChatScreen(busy: false, composer: true, draft: true)) == .done(.draft), "a chat with someone's unsent text is never sent to")
         check(step(nil, waited: 5, shownFor: nil) == .wait, "it waits for Claude to show the chat")
-        check(step(nil, waited: ResumeRule.showWait, shownFor: nil) == .done(.notResumed("Claude didn't show it")),
+        check(step(nil, waited: ResumeRule.readyWait, shownFor: nil) == .done(.notResumed("Claude didn't show it")),
               "a chat Claude never shows is reported, not sent to")
-        check(step(ChatScreen(busy: false, composer: false, draft: false), waited: 5) == .wait, "it waits for the message box to load")
-        check(step(ChatScreen(busy: false, composer: false, draft: false), waited: ResumeRule.showWait)
-              == .done(.notResumed("its message box wasn't found")), "a chat without a message box and send control is reported")
+        check(step(ChatScreen(loading: true, busy: false, composer: true, draft: false), waited: 60) == .wait,
+              "it waits while the chat's page is still loading")
+        check(step(ChatScreen(loading: true, busy: false, composer: true, draft: false), waited: ResumeRule.readyWait)
+              == .done(.notResumed("it was still loading")), "a page that never finishes loading is reported")
+        check(step(ChatScreen(busy: false, composer: false, draft: false), waited: 60) == .wait,
+              "it waits a minute and more for the message box to load")
+        check(step(ChatScreen(busy: false, composer: false, draft: false), waited: ResumeRule.readyWait)
+              == .done(.notResumed("its message box wasn't found")), "a chat whose message box never shows is reported")
         check(step(idle, interrupted: true, shownFor: 2) == .wait, "a chat a quit cut off gets time to resume by itself on open")
         check(step(idle, interrupted: true, shownFor: ResumeRule.resumeOnOpenWait) == .send, "then it gets the message")
-        check(ResumeRule.showWait == 20 && ResumeRule.resumeOnOpenWait == 10 && ResumeRule.startWait == 30 && ResumeRule.ownPassWait == 45,
-              "the waits are 20 s to show, 10 s for Claude's own resume on open, 30 s for the turn to start, 45 s for Claude's launch pass")
+        check(ResumeRule.readyWait == 120 && ResumeRule.resumeOnOpenWait == 10 && ResumeRule.startWait == 30 && ResumeRule.ownPassWait == 45,
+              "the waits are 120 s to show and load, 10 s for Claude's own resume on open, 30 s for the turn to start, 45 s for Claude's launch pass")
+
+        // The retry schedule.
+        check(ResumeRule.retryEvery == 60 && ResumeRule.retryFor == 30 * 60, "a chat not running is tried every minute for 30 minutes")
+        check(ResumeRule.tryAgain(left: 1, elapsed: 0) && ResumeRule.tryAgain(left: 1, elapsed: ResumeRule.retryFor - ResumeRule.retryEvery),
+              "another pass while one is left and it starts within the 30 minutes")
+        check(!ResumeRule.tryAgain(left: 0, elapsed: 0), "no pass once every chat runs or is left to someone")
+        check(!ResumeRule.tryAgain(left: 1, elapsed: ResumeRule.retryFor - ResumeRule.retryEvery + 1), "and none past the 30 minutes")
+        check(ResumeRule.mayRetry(secondsSinceInput: ResumeRule.retryEvery) && !ResumeRule.mayRetry(secondsSinceInput: 5),
+              "a retry opens a chat only after a minute with nobody using the Mac")
+        check(ResumeRule.Result.draft.settled && ResumeRule.Result.running.settled && ResumeRule.Result.sent.settled
+              && !ResumeRule.Result.notResumed("x").settled, "running, sent and someone's draft end the tries; anything else is tried again")
+        check(ResumeRule.summary(running: 0, of: 1) == "Running again: 0 of 1 stopped chat."
+              && ResumeRule.summary(running: 2, of: 3) == "Running again: 2 of 3 stopped chats.", "the summary says how many run again")
+
+        // Telling the message box apart.
+        typealias Box = ComposerRule.Box
+        let prompt = Box(named: true, multiline: true, focused: false)
+        let address = Box(named: false, multiline: false, focused: false)
+        let unnamed = Box(named: false, multiline: true, focused: false)
+        check(ComposerRule.pick([address, prompt])! == (1, .name), "the box named Prompt, past a side panel's address field")
+        check(ComposerRule.pick([address, unnamed])! == (1, .multiline), "a box named only by its placeholder: the only multi-line one")
+        check(ComposerRule.pick([address]) == nil, "an address field alone is never the message box")
+        check(ComposerRule.pick([unnamed, unnamed]) == nil, "two unnamed boxes and neither focused: no guess")
+        check(ComposerRule.pick([unnamed, Box(named: false, multiline: true, focused: true)])! == (1, .focus),
+              "two unnamed boxes: the one with keyboard focus")
+        check(ComposerRule.pick([prompt, Box(named: true, multiline: true, focused: true)])! == (1, .focus),
+              "two Prompt boxes, as in a split view: the focused one")
+        check(ComposerRule.pick([]) == nil, "no box: none")
     }
 }
