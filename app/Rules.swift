@@ -12,6 +12,14 @@ import Foundation
 struct Identity: Hashable, Codable, Sendable {
     let account: String
     let org: String
+
+    /// A row saved before organizations were tracked, whose organization no saved login names
+    /// (13a.4). It needs sign-in, and Set Up learns its organization from the pair Claude holds.
+    var orgUnknown: Bool { org.isEmpty }
+
+    /// The pair Claude holds stands for this seat: the same pair, or, for a seat whose
+    /// organization is not known yet, the same account in any organization.
+    func matches(_ held: Identity) -> Bool { held == self || (orgUnknown && held.account == account) }
 }
 
 /// One row in the menu: one Claude login for one account in one organization.
@@ -46,6 +54,10 @@ struct AccountRecord: Codable, Identifiable, Equatable {
 
     /// The account and organization this row stands for, once both are known.
     var identity: Identity? { accountUuid.flatMap { account in orgUuid.map { Identity(account: account, org: $0) } } }
+
+    /// The key of this row's seat in the menu: its pair, or, while its organization is unknown,
+    /// its account with an empty organization (13a.4).
+    var seat: Identity { identity ?? Identity(account: accountUuid ?? id, org: "") }
 }
 
 /// Claude names an account's own individual organization "<email>'s Organization"; the app calls
@@ -946,10 +958,13 @@ struct SeatMeters: Equatable, Codable {
     var fiveHour: MeterReading?
     var weekly: MeterReading?
     var readAt: Date?
+    /// Set when the Mac wakes: the reading stays on the row but is no longer fresh, so it can't
+    /// choose or rule out an automatic target until the next reading replaces it.
+    var wokeSince: Date?
 
     /// The fuller of the two meters: the one a compact row and the menu bar show.
     var fuller: MeterReading? { [fiveHour, weekly].compactMap { $0 }.max { $0.percent < $1.percent } }
-    func isFresh(at now: Date) -> Bool { readAt.map { now.timeIntervalSince($0) < Limits.freshness } ?? false }
+    func isFresh(at now: Date) -> Bool { wokeSince == nil && (readAt.map { now.timeIntervalSince($0) < Limits.freshness } ?? false) }
     func isStale(at now: Date) -> Bool { readAt != nil && !isFresh(at: now) }
 
     /// "not read yet", "read 40 min ago", or nil while fresh.
@@ -1244,10 +1259,10 @@ struct Seat: Equatable, Identifiable {
 
 enum Seats {
     static func build(_ f: Facts, now: Date) -> [Seat] {
-        let rows = f.rows.filter { $0.identity != nil }
+        let rows = f.rows
         let labels = unique(rows.map { ($0.label.isEmpty ? $0.name : $0.label, $0.organization) })
         return zip(rows, labels).map { row, label in
-            let id = row.identity!
+            let id = row.seat
             let state = seatState(id, f, now: now)
             let action: SeatAction?
             switch state {
@@ -1305,7 +1320,7 @@ enum AppState {
     /// target waits for Claude to be opened again.
     static func notice(_ f: Facts, now: Date, failure: String? = nil, success: String? = nil, finishing: String? = nil) -> Notice? {
         var all: [Notice] = []
-        let name = { (s: Identity?) in f.rows.first { $0.identity == s && s != nil }.map { $0.label.isEmpty ? $0.name : $0.label } }
+        let name = { (s: Identity?) in f.rows.first { $0.seat == s && s != nil }.map { $0.label.isEmpty ? $0.name : $0.label } }
         if let s = f.switching {
             all.append(finishing.map { Notice(kind: .switching, text: "Open Claude to finish switching to \($0).") }
                        ?? Notice(kind: .switching, text: s.note ?? "Switching to \(name(s.target) ?? "a seat")… \(s.step)"))
