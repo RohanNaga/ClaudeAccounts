@@ -265,9 +265,12 @@ open "Claude Accounts.app"
 ```
 
 It needs the Xcode Command Line Tools (`xcode-select --install`). `build.sh`
-compiles one binary for Apple Silicon and Intel with `swiftc`. If this folder's
-copy of the app is running, `build.sh` quits it before signing and opens it
-again afterwards. It never touches a copy elsewhere.
+compiles one binary for Apple Silicon and Intel with `swiftc`, then signs and
+checks it before it replaces this folder's copy, so a build that fails, or that
+would lose the installed copy's Accessibility permission, changes nothing. If
+this folder's copy is running, `build.sh` quits it, swaps the new one in and
+opens it, and puts the old one back if the new one does not start; it never
+touches a copy elsewhere.
 
 macOS ties the Accessibility permission to the app's signature, and the ad-hoc
 signature `build.sh` uses by default changes with every build, so each rebuild
