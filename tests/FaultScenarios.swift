@@ -51,15 +51,19 @@ final class Strike: @unchecked Sendable {
     var fired: Bool { lock.withLock { struck } }
     var parked: Bool { lock.withLock { isParked } }
 
+    /// Hooks inside a step (a journal write, one chat's move, a saved login's rename). A fault that
+    /// struck stays through them, so the write right after the strike meets it.
+    static let withinStep: Set<String> = ["journal", "moveChat", "save.rename"]
+
     /// What to do at a willStep: strike at the hook's `nth` call once `when` holds there, put
-    /// things back at any later one.
+    /// things back as the next step begins.
     func next(_ step: String, strikeAt hook: String, nth: Int = 1, when: () -> Bool = { true }) -> Next {
         lock.withLock {
             if !struck, step == hook {
                 calls += 1
                 if calls >= nth, when() { struck = true; return .strike }
             }
-            return struck && !changed.isEmpty ? .restore : .none
+            return struck && !changed.isEmpty && !Self.withinStep.contains(step) ? .restore : .none
         }
     }
     func park() { lock.withLock { isParked = true } }
