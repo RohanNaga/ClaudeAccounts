@@ -1048,6 +1048,7 @@ enum Switch {
     /// Undo: quit Claude, move the chats back, put back the files backed up after the quit, and
     /// reopen Claude. `ok` says the undo finished; a Claude that won't quit keeps the journal.
     private static func rollback(_ j: inout SwitchJournal, _ r: Request, progress: @escaping Progress) async -> SwitchOutcome {
+        await World.claude.willStep("rollback")
         progress("Going back to \(r.name(j.from))…")
         if !ClaudeApp.pids().isEmpty {
             guard await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress).outcome == .quit else {
