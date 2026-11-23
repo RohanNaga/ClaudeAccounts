@@ -153,7 +153,37 @@ struct Scenario {
     var quits: Int { claude.actions.filter { $0 == "quit" }.count }
     var launches: Int { claude.actions.filter { $0 == "launch" }.count }
     func resumed(_ chat: String) -> Bool { claude.sent.contains("\(chat) resume") }
+
+    /// Personal and organization seats interleaved down the menu: Home is not set up and Lab is
+    /// out; the rest are Ready with fresh readings. Claude holds `held` settled with one chat.
+    func mixedSeats(holding held: String, order: SwitchOrder?) async {
+        try? rows(mixed.map { ($0.0, $0.1) }, orgNames: mixed.map(\.2))
+        // The held seat's login is saved last, so its sign-in is the one left in Claude's files.
+        for (name, seat, _) in mixed.filter({ $0.0 != held }) + mixed.filter({ $0.0 == held }) where name != "Home" {
+            try? await savedLogin(name, seat)
+        }
+        for (name, seat, _) in mixed { usage.set(seat, fiveHour: name == "Lab" ? 100 : 20, resetsAt: clock.now().addingTimeInterval(3 * 3600)) }
+        let seat = mixed.first { $0.0 == held }!.1
+        claude.addChat("local_one", in: seat, lastActivity: clock.now())
+        claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
+        claudeHoldsSettled(); make()
+        if let order { store.settings.switchOrder = order }
+        await tick(); await settle()
+    }
+
+    /// The row the menu marks Next.
+    var nextRow: String? { store.seats.first(where: \.isNext)?.name }
 }
+
+/// Rows in menu order for the switch-order scenarios: (name, seat, organization name).
+let mixed: [(String, StandSeat, String)] = [
+    ("Work", StandSeat(1, org: 1), "Team"),
+    ("Home", StandSeat(2, org: 0), "two@example.com's Organization"),
+    ("Lab", StandSeat(3, org: 3), "Lab"),
+    ("Side", StandSeat(4, org: 0), "four@example.com's Organization"),
+    ("Studio", StandSeat(5, org: 5), "Studio"),
+    ("Den", StandSeat(6, org: 0), "six@example.com's Organization"),
+]
 
 /// The part of section 8's one line every shape miss shares, whatever names the cause.
 let pausedLine = "Switching on its own is paused."
@@ -629,6 +659,30 @@ let scenarios: [Scenario] = [
         h.claude.logLimitStop("local_one")
         await h.run(until: { h.claude.held != A && h.claude.held != nil }, limit: 600)
         h.check(h.claude.held == C, "the automatic target follows the person's order: \(String(describing: h.claude.held))")
+    },
+    // Switch order: the automatic target and the menu's Next mark follow the person's choice.
+    // Down the menu from Work, Home is not set up, Lab is out, then Side (personal), Studio and Den.
+    Scenario(pair: "(Switch order never set, seat in use out)", model: "4: the first Ready seat down the menu, wrapping round, as before the setting") { h in
+        await h.mixedSeats(holding: "Work", order: nil)
+        h.check(h.store.settings.switchOrder == .topToBottom, "an untouched setting is Top to Bottom")
+        h.check(h.nextRow == "Side", "Next marks the first Ready seat down the menu, past Home and Lab: \(String(describing: h.nextRow))")
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held != nil && h.claude.held != mixed[0].1 }, limit: 600)
+        h.check(h.claude.held == mixed[3].1, "the automatic switch goes to Side: \(String(describing: h.claude.held))")
+    },
+    Scenario(pair: "(Switch order personal first, seat in use out)", model: "4: personal seats first, in menu order, wrapping round; out and not set up skipped") { h in
+        await h.mixedSeats(holding: "Den", order: .personalFirst)
+        h.check(h.nextRow == "Side", "Next passes Work, the first Ready seat down the menu, and Home, not set up, for Side: \(String(describing: h.nextRow))")
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held != nil && h.claude.held != mixed[5].1 }, limit: 600)
+        h.check(h.claude.held == mixed[3].1, "the automatic switch goes where Next pointed, Side: \(String(describing: h.claude.held))")
+    },
+    Scenario(pair: "(Switch order organizations first, seat in use out)", model: "4: organization seats first, in menu order; out and not set up skipped") { h in
+        await h.mixedSeats(holding: "Work", order: .organizationsFirst)
+        h.check(h.nextRow == "Studio", "Next passes Side, the first Ready seat down the menu, and Lab, out, for Studio: \(String(describing: h.nextRow))")
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held != nil && h.claude.held != mixed[0].1 }, limit: 600)
+        h.check(h.claude.held == mixed[4].1, "the automatic switch goes where Next pointed, Studio: \(String(describing: h.claude.held))")
     },
     Scenario(pair: "(Not in use, row removed)", model: "saved login and row deleted; chats stay") { h in
         h.claude.addChat("beta_chat", in: B, lastActivity: h.clock.now())
