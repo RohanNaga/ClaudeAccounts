@@ -1826,11 +1826,12 @@ final class Store: ObservableObject {
         return accounts.moved(row, by: step, organization: organization) != nil
     }
 
-    /// Drop the row and delete its saved login at once, then sign its Claude Code login out and
-    /// delete it. Its chats stay in Claude's folder for that pair.
+    /// Drop the row and delete its saved login and the previous build's slot at once, then sign its
+    /// Claude Code login out and delete it. Its chats stay in Claude's folder for that pair.
     func remove(_ seat: Seat) {
         guard let row = record(for: seat) else { return }
         SavedLogins.remove(seat.id)
+        try? FileManager.default.removeItem(at: LoginSlot.dir(row))
         meters[seat.id] = nil
         PairFile<SeatMeters>(name: "meters.json").save(meters)
         save(AccountStore.load().filter { $0.id != row.id })
