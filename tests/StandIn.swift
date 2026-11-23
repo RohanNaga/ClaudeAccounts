@@ -114,9 +114,10 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var signsInAs: StandSeat?
     /// The version Claude logs at start (the contracts were recorded on 1.0.0).
     var version = "1.0.0"
-    /// Times the person opens Claude again after a switch quit it, once the sign-in files change.
+    /// Times the person opens Claude again after a switch quit it, between the quit and the launch:
+    /// on the app's first look at Claude once the chats left the folder of the seat it quit on.
     var reopensAfterQuit = 0
-    private var quitStamp: Date?
+    private var quitOn: StandSeat?
     /// Opens a window of its own right after launch, which a scenario uses for "the person opened Claude".
     var personOpensClaudeDuringSwitch = 0
     /// Chats on screen, by session id, and what their composer shows.
@@ -260,15 +261,14 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
 
     /// Claude stops: a crash, or the person quitting it.
     func stop() {
-        let m = (try? FileManager.default.attributesOfItem(atPath: cookies.path))?[.modificationDate] as? Date
-        lock.withLock { pid = nil; held = nil; promptOpen = false; quitStamp = m ?? Date.distantPast }
+        lock.withLock { quitOn = held; pid = nil; held = nil; promptOpen = false }
     }
 
     func pids() -> [pid_t] {
         guard installed else { return [] }
-        if lock.withLock({ pid == nil && reopensAfterQuit > 0 && quitStamp != nil }),
-           let m = (try? FileManager.default.attributesOfItem(atPath: cookies.path))?[.modificationDate] as? Date, m != quitStamp {
-            lock.withLock { reopensAfterQuit -= 1; quitStamp = nil; actions.append("person opened") }
+        let seat: StandSeat? = lock.withLock { pid == nil && reopensAfterQuit > 0 ? quitOn : nil }
+        if let seat, chats(in: seat).isEmpty {
+            lock.withLock { reopensAfterQuit -= 1; quitOn = nil; actions.append("person opened") }
             start()
         }
         return lock.withLock { pid.map { [$0] } ?? [] }
@@ -290,8 +290,9 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     }
 
     func launch() async {
-        lock.withLock { actions.append("launch") }
-        guard installed, pids().isEmpty else { return }
+        // Launching ends the gap between quit and launch, so it is not a look at Claude.
+        let closed: Bool = lock.withLock { actions.append("launch"); quitOn = nil; return pid == nil }
+        guard installed, closed else { return }
         start()
     }
 
