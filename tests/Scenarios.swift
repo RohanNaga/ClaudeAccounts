@@ -154,6 +154,22 @@ struct Scenario {
     var launches: Int { claude.actions.filter { $0 == "launch" }.count }
     func resumed(_ chat: String) -> Bool { claude.sent.contains("\(chat) resume") }
 
+    /// A switch to Beta brings a stopped chat that Claude doesn't show, so its resume keeps trying.
+    /// `wait` seconds after the chat is opened, the person switches to Gamma: the chat must carry
+    /// over and be resumed there, wherever the old resume stood (section 6, step 7).
+    func secondSwitchDuringResume(after wait: TimeInterval) async {
+        await standard(onScreen: false)
+        claude.logLimitStop("local_one")
+        await run(until: { claude.actions.contains { $0.hasPrefix("open ") } }, limit: 900)
+        await pass(wait)
+        check(claude.held == B && !resumed("local_one"), "Beta's resume is still trying (the chat isn't on screen): \(claude.actions)")
+        click("Gamma")
+        claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
+        await run(until: { claude.held == C && resumed("local_one") }, limit: 600)
+        check(claude.chats(in: C).contains("local_one"), "the chat carried over to Gamma: holds \(String(describing: claude.held)), \(claude.actions), \(notice)")
+        check(resumed("local_one"), "and resumed after Gamma's confirm: \(claude.sent)")
+    }
+
     /// Personal and organization seats interleaved down the menu: Home is not set up and Lab is
     /// out; the rest are Ready with fresh readings. Claude holds `held` settled with one chat.
     func mixedSeats(holding held: String, order: SwitchOrder?) async {
@@ -526,17 +542,11 @@ let scenarios: [Scenario] = [
         await h.settle()
         h.check(h.noticeHas("Already switching to Beta."), "the second request is refused: \(h.notice)")
     },
-    Scenario(pair: "(During resume, second switch)", model: "resume cancelled, chats carried over") { h in
-        await h.standard(onScreen: false)
-        h.claude.logLimitStop("local_one")
-        await h.run(until: { h.claude.held == B }, limit: 600)
-        await h.pass(90)
-        h.check(!h.resumed("local_one"), "the resume is still retrying (box not on screen)")
-        h.click("Gamma")
-        h.claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
-        await h.run(until: { h.claude.held == C && h.resumed("local_one") }, limit: 600)
-        h.check(h.claude.chats(in: C).contains("local_one"), "the chat carried over to Gamma: holds \(String(describing: h.claude.held)), \(h.claude.actions), \(h.notice)")
-        h.check(h.resumed("local_one"), "and resumed after Gamma's confirm: \(h.claude.sent)")
+    Scenario(pair: "(During resume, waiting for the chat, second switch)", model: "resume cancelled, chats carried over") { h in
+        await h.secondSwitchDuringResume(after: ResumeRule.readyWait / 2)
+    },
+    Scenario(pair: "(During resume, between tries, second switch)", model: "resume cancelled, chats carried over") { h in
+        await h.secondSwitchDuringResume(after: ResumeRule.readyWait + ResumeRule.retryEvery / 2)
     },
     Scenario(pair: "(Resume, message box not on screen)", model: "\"Couldn't resume 1 chat: send it a message.\" after 30 min") { h in
         await h.standard(onScreen: false)
