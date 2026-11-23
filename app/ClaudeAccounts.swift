@@ -496,40 +496,12 @@ enum LoginSlot {
 
     static func dir(_ acct: AccountRecord) -> URL { Paths.stateDir.appendingPathComponent("slots/\(acct.id)") }
 
-    /// The row has a saved login Claude still accepts, by the refusals in Claude's `log`.
-    static func exists(_ acct: AccountRecord, log: LogFollower) -> Bool { identity(acct, log: log) != nil }
-
     /// `orgFolder` is the organization whose sessions Claude showed when this login was saved.
     struct Meta: Codable { var account: String?; var orgFolder: String?; var config: [String: String] }
 
     static func meta(_ acct: AccountRecord) -> Meta? {
         guard let data = try? Data(contentsOf: dir(acct).appendingPathComponent("slot.json")) else { return nil }
         return try? JSONDecoder().decode(Meta.self, from: data)
-    }
-
-    /// Where the row's sessions go: set only when the saved login is the row's own account and
-    /// organization, and Claude hasn't refused that sign-in since it was saved (SaveRule.counts).
-    static func identity(_ acct: AccountRecord, log: LogFollower) -> Identity? {
-        guard let id = savedIdentity(acct),
-              let savedAt = (try? dir(acct).appendingPathComponent("slot.json").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-              SaveRule.counts(savedAt: savedAt, refusedAt: log.refusal(of: id, at: World.now())) else { return nil }
-        return id
-    }
-
-    /// The pair this row's saved login is for, and when it was saved (F4).
-    static func saved(_ acct: AccountRecord) -> (Identity, Date)? {
-        guard let id = savedIdentity(acct),
-              let at = (try? dir(acct).appendingPathComponent("slot.json").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-        else { return nil }
-        return (id, at)
-    }
-
-    private static func savedIdentity(_ acct: AccountRecord) -> Identity? {
-        guard let uuid = acct.accountUuid, let meta = meta(acct), let org = meta.orgFolder,
-              FileManager.default.fileExists(atPath: dir(acct).appendingPathComponent("cookies.db").path),
-              meta.config[ClaudeFiles.lastKnownAccount] == uuid, (meta.account ?? uuid) == uuid,
-              acct.orgUuid == nil || acct.orgUuid == org else { return nil }
-        return Identity(account: uuid, org: org)
     }
 
     static func sqlite(_ db: URL, _ sql: String) async -> ProcResult {
@@ -542,22 +514,59 @@ enum LoginSlot {
         await sqlite(db, "select value from meta where key='version';").out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Save the login Claude holds, at switch-away with Claude quit or, `whileRunning`, once Claude
-    /// has held it steadily (SaveRule). `identity` is who Claude says it is; the row must be that
-    /// account and organization (or the account's one unnamed row) and Claude's settings must
-    /// agree, so a login is never filed under another row. While Claude runs, its cookie file must
-    /// sit still through the copy, and Claude must still hold `identity` right before the write.
-    static func capture(_ acct: AccountRecord, as identity: Identity, whileRunning: Bool = false) async throws {
-        guard acct.accountUuid == identity.account, acct.orgUuid == nil || acct.orgUuid == identity.org else {
-            throw SwitchError.inconsistent
+}
+
+/// The app's copy of Claude's sign-in for each seat (F4), filed under the seat's pair in
+/// `saved/<account>_<org>/current`. A save builds `new`, checks it, moves `current` to `prev`,
+/// moves `new` to `current`, reads it back, and only then deletes `prev`: a copy is never lost,
+/// and a save that stops partway leaves `prev`, which still counts (invariant A).
+enum SavedLogins {
+    struct Meta: Codable, Equatable {
+        var account: String
+        var org: String
+        /// When the copy was proven, on the app's clock.
+        var savedAt: Date
+        var config: [String: String]
+    }
+
+    static var root: URL { Paths.stateDir.appendingPathComponent("saved") }
+    static func dir(_ seat: Identity) -> URL { root.appendingPathComponent("\(seat.account)_\(seat.org)") }
+    private static func folder(_ seat: Identity, _ name: String) -> URL { dir(seat).appendingPathComponent(name) }
+
+    /// The copy's metadata when the folder holds a copy that matches the seat's pair.
+    private static func check(_ folder: URL, _ seat: Identity) -> Meta? {
+        guard let data = try? Data(contentsOf: folder.appendingPathComponent("login.json")),
+              let meta = try? JSONDecoder().decode(Meta.self, from: data),
+              meta.account == seat.account, meta.org == seat.org, meta.config[ClaudeFiles.lastKnownAccount] == seat.account,
+              FileManager.default.fileExists(atPath: folder.appendingPathComponent("cookies.db").path) else { return nil }
+        return meta
+    }
+
+    /// The folder with the seat's proven copy: `current`, else the `prev` an interrupted save left.
+    private static func proven(_ seat: Identity) -> (folder: URL, meta: Meta)? {
+        for name in ["current", "prev"] {
+            let f = folder(seat, name)
+            if let meta = check(f, seat) { return (f, meta) }
         }
+        return nil
+    }
+
+    /// When the seat's login was saved, if it has one.
+    static func savedAt(_ seat: Identity) -> Date? { proven(seat)?.meta.savedAt }
+
+    /// Save the login Claude holds as `seat`: with Claude quit, or `whileRunning` once Claude has
+    /// held the seat settled. Claude's settings must name the seat's account, and while Claude runs
+    /// its cookie file must sit still through the copy and Claude must still hold the seat.
+    static func save(_ seat: Identity, whileRunning: Bool = false) async throws {
         if !whileRunning { guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed } }
-        guard ClaudeApp.savedAccount() == identity.account else { throw SwitchError.inconsistent }
+        guard ClaudeApp.savedAccount() == seat.account else { throw SwitchError.inconsistent }
         let fm = FileManager.default
-        let slot = dir(acct)
-        try fm.createDirectory(at: slot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let source = slot.appendingPathComponent("source.db")
-        for f in [source, slot.appendingPathComponent("source.db-journal")] { try? fm.removeItem(at: f) }
+        try fm.createDirectory(at: dir(seat), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let new = folder(seat, "new"), current = folder(seat, "current"), prev = folder(seat, "prev")
+        try? fm.removeItem(at: new)
+        try fm.createDirectory(at: new, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? fm.removeItem(at: new) }
+        let source = new.appendingPathComponent("source.db"), sourceJournal = new.appendingPathComponent("source.db-journal")
         func stamp() -> (size: UInt64, modified: Date)? {
             guard let a = try? fm.attributesOfItem(atPath: ClaudeApp.cookies.path),
                   let size = (a[.size] as? NSNumber)?.uint64Value, let modified = a[.modificationDate] as? Date else { return nil }
@@ -565,60 +574,95 @@ enum LoginSlot {
         }
         // Copied while Claude runs, the file must have sat still for 2 s and through the copy.
         let before = stamp()
-        if whileRunning { guard let b = before, World.now().timeIntervalSince(b.modified) >= 2 else { throw SwitchError.cookiesChanging } }
+        if whileRunning { guard let b = before, Date().timeIntervalSince(b.modified) >= 2 else { throw SwitchError.cookiesChanging } }
         try fm.copyItem(at: ClaudeApp.cookies, to: source)
-        if fm.fileExists(atPath: ClaudeApp.cookiesJournal.path) {
-            try fm.copyItem(at: ClaudeApp.cookiesJournal, to: slot.appendingPathComponent("source.db-journal"))
-        }
+        if fm.fileExists(atPath: ClaudeApp.cookiesJournal.path) { try fm.copyItem(at: ClaudeApp.cookiesJournal, to: sourceJournal) }
         if whileRunning { guard let a = stamp(), let b = before, a == b else { throw SwitchError.cookiesChanging } }
-        defer { for f in [source, slot.appendingPathComponent("source.db-journal")] { try? fm.removeItem(at: f) } }
-        guard await sqlite(source, "pragma quick_check;").out.trimmingCharacters(in: .whitespacesAndNewlines) == "ok" else {
+        guard await LoginSlot.sqlite(source, "pragma quick_check;").out.trimmingCharacters(in: .whitespacesAndNewlines) == "ok" else {
             throw SwitchError.sqlite("Claude's cookie database failed its integrity check")
         }
-        guard await cookieVersion(source) == cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
-
-        let fresh = slot.appendingPathComponent("cookies.new.db")
-        try? fm.removeItem(at: fresh)
-        let res = await sqlite(fresh, "ATTACH \(quoted(source)) AS c; CREATE TABLE cookies AS SELECT * FROM c.cookies WHERE host_key IN \(hosts);")
+        guard await LoginSlot.cookieVersion(source) == LoginSlot.cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
+        let cookies = new.appendingPathComponent("cookies.db")
+        let res = await LoginSlot.sqlite(cookies, "ATTACH \(LoginSlot.quoted(source)) AS c; CREATE TABLE cookies AS SELECT * FROM c.cookies WHERE host_key IN \(LoginSlot.hosts);")
         guard res.status == 0 else { throw SwitchError.sqlite(res.err) }
-        let count = await sqlite(fresh, "select count(*) from cookies where name='\(ClaudeFiles.signInCookie)';").out
-        guard count.trimmingCharacters(in: .whitespacesAndNewlines) == "1" else { throw SwitchError.notSignedIn }
-
+        for f in [source, sourceJournal] { try? fm.removeItem(at: f) }
+        guard await signInCount(cookies) == 1 else { throw SwitchError.notSignedIn }
         let config = try JSONSerialization.jsonObject(with: Data(contentsOf: ClaudeApp.config)) as? [String: Any] ?? [:]
         var keys: [String: String] = [:]
-        for k in configKeys { if let v = config[k] as? String { keys[k] = v } }
-        let meta = try JSONEncoder().encode(Meta(account: identity.account, orgFolder: identity.org, config: keys))
+        for k in LoginSlot.configKeys { if let v = config[k] as? String { keys[k] = v } }
+        let meta = Meta(account: seat.account, org: seat.org, savedAt: World.now(), config: keys)
+        try JSONEncoder().encode(meta).write(to: new.appendingPathComponent("login.json"), options: .atomic)
+        guard check(new, seat) == meta else { throw SwitchError.inconsistent }
         if whileRunning {
-            guard ClaudeApp.currentIdentity() == identity, ClaudeApp.savedAccount() == identity.account else {
-                throw SwitchError.inconsistent
-            }
+            guard ClaudeApp.currentIdentity() == seat, ClaudeApp.savedAccount() == seat.account else { throw SwitchError.inconsistent }
         }
-        _ = try fm.replaceItemAt(slot.appendingPathComponent("cookies.db"), withItemAt: fresh)
-        try meta.write(to: slot.appendingPathComponent("slot.json"), options: .atomic)
-        for f in ["cookies.db", "slot.json"] { try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: slot.appendingPathComponent(f).path) }
+        // The proven copy moves aside, never away, until the new one reads back.
+        if check(current, seat) != nil {
+            try? fm.removeItem(at: prev)
+            try fm.moveItem(at: current, to: prev)
+        } else {
+            try? fm.removeItem(at: current)
+        }
+        try fm.moveItem(at: new, to: current)
+        guard check(current, seat) == meta, await signInCount(current.appendingPathComponent("cookies.db")) == 1 else {
+            try? fm.removeItem(at: current)
+            if fm.fileExists(atPath: prev.path) { try? fm.moveItem(at: prev, to: current) }
+            throw SwitchError.inconsistent
+        }
+        try? fm.removeItem(at: prev)
     }
 
-    /// Put a saved login into Claude's files, or with nil clear them so Claude opens at its
+    private static func signInCount(_ db: URL) async -> Int {
+        Int(await LoginSlot.sqlite(db, "select count(*) from cookies where name='\(ClaudeFiles.signInCookie)';").out
+            .trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    }
+
+    /// Put a seat's saved login into Claude's files, or with nil clear them so Claude opens at its
     /// sign-in page. Claude must be closed.
-    static func load(_ acct: AccountRecord?) async throws {
+    static func load(_ seat: Identity?) async throws {
         guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed }
         var values: [String: String] = [:]
         var insert = ""
-        if let acct {
-            guard savedIdentity(acct) != nil, let meta = meta(acct) else { throw SwitchError.noSlot(acct.label) }
-            values = meta.config
-            insert = "ATTACH \(quoted(dir(acct).appendingPathComponent("cookies.db"))) AS s; "
+        if let seat {
+            guard let copy = proven(seat) else { throw SwitchError.noSlot("that seat") }
+            values = copy.meta.config
+            insert = "ATTACH \(LoginSlot.quoted(copy.folder.appendingPathComponent("cookies.db"))) AS s; "
         }
-        guard await cookieVersion(ClaudeApp.cookies) == cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
-        let sql = insert + "BEGIN; DELETE FROM main.cookies WHERE host_key IN \(hosts); "
-            + (acct == nil ? "" : "INSERT INTO main.cookies SELECT * FROM s.cookies; ") + "COMMIT;"
-        let res = await sqlite(ClaudeApp.cookies, sql)
+        guard await LoginSlot.cookieVersion(ClaudeApp.cookies) == LoginSlot.cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
+        let sql = insert + "BEGIN; DELETE FROM main.cookies WHERE host_key IN \(LoginSlot.hosts); "
+            + (seat == nil ? "" : "INSERT INTO main.cookies SELECT * FROM s.cookies; ") + "COMMIT;"
+        let res = await LoginSlot.sqlite(ClaudeApp.cookies, sql)
         guard res.status == 0 else { throw SwitchError.sqlite(res.err) }
-
         var config = try JSONSerialization.jsonObject(with: Data(contentsOf: ClaudeApp.config)) as? [String: Any] ?? [:]
-        for k in configKeys { config[k] = values[k] }
-        let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted])
-        try data.write(to: ClaudeApp.config, options: .atomic)
+        for k in LoginSlot.configKeys { config[k] = values[k] }
+        try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted]).write(to: ClaudeApp.config, options: .atomic)
+    }
+
+    static func remove(_ seat: Identity) { try? FileManager.default.removeItem(at: dir(seat)) }
+
+    /// A row's saved login Claude still accepts: saved, and not refused since (model, section 3).
+    static func usable(_ row: AccountRecord, refusedAt: (Identity) -> Date?) -> Identity? {
+        guard let seat = row.identity, let at = savedAt(seat), !(refusedAt(seat).map { $0 > at } ?? false) else { return nil }
+        return seat
+    }
+
+    /// Bring each row's login from the old per-row slot into its pair's folder, once.
+    static func adopt(_ rows: [AccountRecord]) {
+        let fm = FileManager.default
+        for row in rows {
+            guard let seat = row.identity, proven(seat) == nil, let old = LoginSlot.meta(row), old.orgFolder == seat.org,
+                  old.config[ClaudeFiles.lastKnownAccount] == seat.account else { continue }
+            let slot = LoginSlot.dir(row), current = folder(seat, "current")
+            let at = (try? slot.appendingPathComponent("slot.json").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date()
+            try? fm.createDirectory(at: current, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            guard (try? fm.copyItem(at: slot.appendingPathComponent("cookies.db"), to: current.appendingPathComponent("cookies.db"))) != nil,
+                  let data = try? JSONEncoder().encode(Meta(account: seat.account, org: seat.org, savedAt: at, config: old.config)),
+                  (try? data.write(to: current.appendingPathComponent("login.json"), options: .atomic)) != nil else {
+                try? fm.removeItem(at: current)
+                continue
+            }
+            try? fm.removeItem(at: slot)
+        }
     }
 }
 
@@ -806,7 +850,7 @@ enum SwitchEngine {
 
     private static func switchLocked(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool,
                                      progress: @escaping Progress) async -> (outcome: SwitchOutcome, resume: PendingResume?) {
-        guard let want = LoginSlot.identity(target, log: ClaudeApp.currentLog()) else {
+        guard let want = SavedLogins.usable(target, refusedAt: { ClaudeApp.currentLog().refusal(of: $0, at: World.now()) }) else {
             return (SwitchOutcome(ok: false, message: SwitchError.noSlot(target.label).localizedDescription), nil)
         }
         if ClaudeApp.currentIdentity() == want {
@@ -831,10 +875,10 @@ enum SwitchEngine {
             // A login Claude hasn't held steadily may be one its organization refuses; the row keeps its last one.
             if let current, steady {
                 progress("Saving \(current.acct.label)…")
-                try await LoginSlot.capture(current.acct, as: current.id)
+                try await SavedLogins.save(current.id)
             }
             progress("Loading \(target.label)…")
-            try await LoginSlot.load(target)
+            try await SavedLogins.load(want)
             if let current { try moveSessions(from: current.id, to: want, journal: &journal) }
         } catch {
             _ = await rollback(journal, unattended: unattended, progress: progress)
@@ -931,9 +975,9 @@ enum SwitchEngine {
             do {
                 if let previous, ready.steady {
                     progress("Saving \(previous.acct.label)…")
-                    try await LoginSlot.capture(previous.acct, as: previous.id)
+                    try await SavedLogins.save(previous.id)
                 }
-                try await LoginSlot.load(nil)
+                try await SavedLogins.load(nil)
             } catch {
                 _ = await rollback(journal, progress: progress)
                 return (SwitchOutcome(ok: false, message: "Set up failed and was undone: \(error.localizedDescription)"), nil)
@@ -965,7 +1009,7 @@ enum SwitchEngine {
         guard let previous, previous.id != want, moving > 0 else {
             // Nothing to bring over, so the login is saved with Claude left open.
             do {
-                try await LoginSlot.capture(target, as: want, whileRunning: true)
+                try await SavedLogins.save(want, whileRunning: true)
                 return (SwitchOutcome(ok: true, message: "Set up \(target.label).", confirmed: true), nil)
             } catch {
                 return (SwitchOutcome(ok: false, message: "\(error.localizedDescription) Claude Accounts tries again while Claude stays on \(target.label).",
@@ -988,7 +1032,7 @@ enum SwitchEngine {
         }
         do {
             progress("Saving \(target.label)…")
-            try await LoginSlot.capture(target, as: want)
+            try await SavedLogins.save(want)
             try moveSessions(from: previous.id, to: want, journal: &journal)
         } catch {
             _ = await rollback(journal, progress: progress)
@@ -1282,7 +1326,7 @@ enum UsageCache {
             return SwitchCandidate(acct, fiveHour: e?.fiveHour, weekly: e?.weekly,
                                    readAt: hasReading ? (e?.readAt ?? e?.polledAt) : nil,
                                    needsSignIn: e?.loginExpiresAt.map { $0.timeIntervalSinceNow < API.signInWarning } ?? false,
-                                   hasSavedLogin: LoginSlot.exists(acct, log: log), outUntil: outUntil[acct.id])
+                                   hasSavedLogin: SavedLogins.usable(acct, refusedAt: { log.refusal(of: $0, at: World.now()) }) != nil, outUntil: outUntil[acct.id])
         }
     }
 }
@@ -1437,7 +1481,10 @@ final class Store: ObservableObject {
     private var timer: Timer?
     private(set) var switchTask: Task<Void, Never>?
 
-    init() { publish() }
+    init() {
+        SavedLogins.adopt(accounts)
+        publish()
+    }
 
     /// Start the app's own ticking. Tests never call this: they call `tick()` themselves.
     func start() {
@@ -1455,7 +1502,7 @@ final class Store: ObservableObject {
         f.rows = accounts.inMenuOrder
         f.claude = ClaudeFacts(installed: World.claude.installed, running: running, recognised: true)
         f.log = log.events
-        f.saved = Dictionary(accounts.compactMap(LoginSlot.saved), uniquingKeysWith: max)
+        f.saved = Dictionary(accounts.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
         f.meters = meters
         f.stops = stops
         f.failedTargets = failedTargets
@@ -1534,7 +1581,7 @@ final class Store: ObservableObject {
               SwitchJournal.load() == nil, let lock = SwitchLock.acquire(newGeneration: false) else { return }
         defer { lock.release() }
         do {
-            try await LoginSlot.capture(row, as: hold.seat, whileRunning: true)
+            try await SavedLogins.save(hold.seat, whileRunning: true)
             savedHold = hold
         } catch SwitchError.cookiesChanging {
             // Tried again on the next tick.
@@ -1703,9 +1750,9 @@ final class Store: ObservableObject {
         let id = UUID().uuidString
         let sibling = accounts.first { $0.accountUuid == seat.account }
         var record = AccountRecord(id: id, name: "", color: "",
-                                   configDir: Paths.stateDir.appendingPathComponent("accounts/\(id)").path
+                                   configDir: Paths.loginsDir.appendingPathComponent(id).path
                                        .replacingOccurrences(of: Paths.home.path, with: "~"),
-                                   keychainService: Keychain.service(forConfigDir: Paths.stateDir.appendingPathComponent("accounts/\(id)")),
+                                   keychainService: Keychain.service(forConfigDir: Paths.loginsDir.appendingPathComponent(id)),
                                    email: nil, accountUuid: seat.account, orgName: nil, orgUuid: seat.org)
         record.name = sibling.map { accounts.accountName(for: $0) } ?? "Seat \(accounts.count + 1)"
         save(accounts + [record])
@@ -1742,7 +1789,7 @@ final class Store: ObservableObject {
             _ = await ClaudeCLI.run(configDir: row.configURL, ["auth", "logout"])
             if await Keychain.credential(service: row.keychainService) != nil { await Keychain.delete(service: row.keychainService) }
             try? FileManager.default.removeItem(at: row.configURL)
-            try? FileManager.default.removeItem(at: LoginSlot.dir(row))
+            SavedLogins.remove(seat.id)
             self.meters[seat.id] = nil
             self.save(AccountStore.load().filter { $0.id != row.id })
         }
@@ -2255,7 +2302,7 @@ enum Entry {
         print("Notifications:    \(Notify.permission())")
         let log = ClaudeApp.currentLog()
         for acct in accounts {
-            print("Saved login \(acct.label): \(LoginSlot.identity(acct, log: log).map { "organization \($0.org.prefix(8))" } ?? "none")")
+            print("Saved login \(acct.label): \(SavedLogins.usable(acct, refusedAt: { log.refusal(of: $0, at: World.now()) }).map { "organization \($0.org.prefix(8))" } ?? "none")")
         }
         exit(0)
     }
@@ -2266,7 +2313,7 @@ enum Entry {
         var problems: [String] = []
         let current = ClaudeApp.currentIdentity()
         let currentAcct = accounts.row(for: current)
-        let want = LoginSlot.identity(target, log: ClaudeApp.currentLog())
+        let want = SavedLogins.usable(target, refusedAt: { ClaudeApp.currentLog().refusal(of: $0, at: World.now()) })
         print("Target:             \(target.label)")
         print("Target saved login: \(want.map { "organization \($0.org.prefix(8))" } ?? "none")")
         if want == nil { problems.append(SwitchError.noSlot(target.label).localizedDescription) }
