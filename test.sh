@@ -22,12 +22,13 @@ swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/rules-tests" \
   "${CORE[@]}" "$ROOT/tests/RulesTests.swift"
 "$OUT/rules-tests"
 
-# The menu's status line wraps to every line it needs: a cut-off instruction can't be followed.
-status=$(grep -A4 'if let msg = store.message {' "$ROOT/app/Views.swift")
-if ! grep -q 'Text(msg).*fixedSize(horizontal: false, vertical: true)' <<<"$status" || grep -qE 'lineLimit|truncationMode' <<<"$status"; then
-  echo "FAIL: the menu's status line must wrap (fixedSize vertical, no lineLimit or truncation)"; exit 1
+# The menu's one notice is one line (model, section 11), so a cut-off line must still be readable
+# whole: its tooltip carries the full text.
+notice=$(awk '/^struct NoticeLine/ {f=1} f {print} f && /^}/ {exit}' "$ROOT/app/Views.swift")
+if ! grep -q 'lineLimit(1)' <<<"$notice" || ! grep -q '\.help(notice.detail ?? notice.text)' <<<"$notice"; then
+  echo "FAIL: the notice must be one line with its full text as its tooltip"; exit 1
 fi
-echo "Status line wraps: ok"
+echo "Notice is one line with its full text on hover: ok"
 
 # Manual Switch, Set Up and the automatic switch run one procedure, which never reads meters:
 # a manual switch is the person's call (model, section 6).
