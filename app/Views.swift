@@ -148,6 +148,21 @@ func shortReset(_ date: Date?, now: Date, dayOnly: Bool = false) -> String? {
     return date.formatted(.dateTime.month(.abbreviated).day())
 }
 
+extension Color {
+    /// The menu's quiet text. The system's secondary label measures about 3.9:1 on the light menu;
+    /// this keeps 4.5:1 or more on the menu and on the lit row in use, in light and dark.
+    static let quietText = Color.primary.opacity(0.7)
+}
+
+/// How long ago a seat's meters were read, while they are no longer fresh: "Read 42m ago", or
+/// "Not read yet". Nil while they are fresh.
+func readAge(_ meters: SeatMeters, now: Date) -> String? {
+    guard let readAt = meters.readAt else { return "Not read yet" }
+    guard meters.isStale(at: now) else { return nil }
+    let minutes = Int(now.timeIntervalSince(readAt) / 60)
+    return minutes < 120 ? "Read \(minutes)m ago" : "Read \(minutes / 60)h ago"
+}
+
 /// A meter's bar. A stale reading draws faded, so its colour doesn't claim more than it knows.
 struct MeterBar: View {
     let meter: MeterReading?
@@ -178,12 +193,14 @@ struct MeterLine: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(label).foregroundStyle(.secondary).frame(width: 44, alignment: .leading)
+            Text(label).foregroundStyle(Color.quietText).frame(width: 44, alignment: .leading)
             MeterBar(meter: meter, stale: stale)
+            // A stale percent is quiet, so it doesn't read as current.
             Text(meter.map { "\(Int($0.percent.rounded()))%" } ?? "–").monospacedDigit().fontWeight(.semibold)
+                .foregroundStyle(stale ? Color.quietText : .primary)
                 .frame(width: 34, alignment: .trailing)
             Text(meter.flatMap { shortReset($0.resetsAt, now: now) }.map { "resets \($0)" } ?? "")
-                .foregroundStyle(.tertiary).lineLimit(1)
+                .foregroundStyle(Color.quietText).lineLimit(1)
                 .frame(width: 100, alignment: .trailing)
         }
         .font(.caption)
@@ -453,7 +470,7 @@ struct NoticeLine: View {
     var body: some View {
         HStack(spacing: 6) {
             if notice.kind == .switching { ProgressView().controlSize(.mini) }
-            Text(notice.text).font(.caption).foregroundStyle(.secondary)
+            Text(notice.text).font(.caption).foregroundStyle(Color.quietText)
                 .lineLimit(1).truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .help(notice.detail ?? notice.text)
@@ -656,29 +673,35 @@ struct SeatRow: View {
         }
     }
 
-    /// What the row says between its name and its button.
+    /// What the row says between its name and its button. A meter's text sits before its bar, so
+    /// every bar ends at the button and the bars line up down the menu whatever the text's width.
+    /// A reading that isn't fresh says its age in place of its percent.
     @ViewBuilder private var status: some View {
         switch seat.state {
         case .inUse:
+            if let age = readAge(seat.meters, now: now) { quiet(age) }
             Badge(text: "In use")
         case .switching:
             ProgressView().controlSize(.mini)
-            Text("Switching").font(.caption).foregroundStyle(.secondary)
+            quiet("Switching")
         case .needsSignIn:
-            Text("Sign in once").font(.caption).foregroundStyle(.secondary)
+            quiet("Sign in once")
         case .out(let resetsAt):
-            MeterBar(meter: seat.meters.fuller, stale: stale).frame(width: 40)
             Text(shortReset(resetsAt, now: now, dayOnly: true).map { "Out · \($0)" } ?? "Out")
                 .font(.caption).fontWeight(.semibold).lineLimit(1).fixedSize()
+            MeterBar(meter: seat.meters.fuller, stale: stale).frame(width: 40)
         case .ready:
-            if let fuller = seat.meters.fuller {
-                MeterBar(meter: fuller, stale: stale).frame(width: 40)
+            if let fuller = seat.meters.fuller, !stale {
                 Text("\(Int(fuller.percent.rounded()))%").font(.caption).monospacedDigit().fontWeight(.semibold)
-                    .frame(width: 32, alignment: .trailing)
             } else {
-                Text("Not read yet").font(.caption).foregroundStyle(.tertiary)
+                quiet(readAge(seat.meters, now: now) ?? "Not read yet")
             }
+            MeterBar(meter: seat.meters.fuller, stale: stale).frame(width: 40)
         }
+    }
+
+    private func quiet(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(Color.quietText).lineLimit(1).fixedSize()
     }
 
     @ViewBuilder private var actionButton: some View {
