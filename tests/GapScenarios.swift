@@ -372,4 +372,25 @@ let gapScenarios: [Scenario] = [
         h.check(colour() == "#123456" && h.store.settings.display == .gauge && h.store.settings.metric == .weekly,
                 "both are kept when the app starts again: colour \(String(describing: colour())), \(h.store.settings.display), \(h.store.settings.metric)")
     },
+
+    // 18. Sections 4 and 6.6: the chats an automatic switch carries survive its undo and wait.
+    Scenario(pair: "(Automatic switch undone, then every seat out)", model: "6.6 and 4: an undone automatic switch keeps its chats; with no other target they wait, and resume in place once the seat in use resets") { h in
+        await h.standard()
+        let start = h.now
+        // Alpha resets off the 5 min grid, well inside Beta's 10 min cool-down; Gamma stays out.
+        let resetA = start.addingTimeInterval(437)
+        h.usage.set(A, fiveHour: 100, resetsAt: resetA)
+        h.usage.set(C, fiveHour: 100, resetsAt: start.addingTimeInterval(4 * 3600))
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        h.claude.opensAsOnce = X
+        h.claude.logLimitStop("local_one")
+        let usage = h.usage
+        h.clock.after(resetA.timeIntervalSince(h.now) - 5) { usage.set(A, fiveHour: 0, resetsAt: resetA.addingTimeInterval(5 * 3600)) }
+        await h.run(until: { h.claude.at("launch").count >= 2 && !h.switchInFlight && h.claude.held != nil }, limit: 300)
+        h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "setup: the switch to Beta was undone, back on Alpha with the chat: \(String(describing: h.claude.held)), \(h.claude.actions)")
+        await h.run(until: { h.resumed("local_one") }, limit: Spec.coolDown)
+        h.check(h.claude.notifications.contains { $0.hasPrefix("Every seat is out") }, "the undone switch's chat waits, and the wait is posted: \(h.claude.notifications)")
+        h.check(h.resumed("local_one") && h.claude.held == A, "it resumes in place once Alpha resets, before Beta's cool-down ends: typed \(h.claude.sent), holds \(String(describing: h.claude.held)), \(h.claude.actions)")
+        h.check(h.claude.at("launch").count == 2, "no second switch, only the switch's launch and the undo's: \(h.claude.actions)")
+    },
 ]
