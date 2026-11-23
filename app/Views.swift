@@ -57,7 +57,12 @@ enum MenuLayout {
             : line
     }
 
-    static func cardHeight(_ card: [Seat], expanded: Identity?) -> CGFloat {
+    /// Whether a card shows only its account's name: an account with several organizations that
+    /// the person folded away.
+    static func isFolded(_ card: [Seat], folded: Set<String>) -> Bool { card.count > 1 && folded.contains(card[0].id.account) }
+
+    static func cardHeight(_ card: [Seat], expanded: Identity?, folded: Set<String> = []) -> CGFloat {
+        if isFolded(card, folded: folded) { return line }
         let rows = card.reduce(0) { $0 + rowHeight($1, expanded: expanded) }
         return card.count == 1 ? rows : line + CGFloat(card.count) * hairline + rows
     }
@@ -65,29 +70,60 @@ enum MenuLayout {
     /// Everything above the cards, plus the menu's padding: the part that never scrolls.
     static func chrome(hasNotice: Bool) -> CGFloat { 2 * padding + titleBar + (hasNotice ? notice : 0) }
 
-    static func cardsHeight(seats: [Seat], expanded: Identity?) -> CGFloat {
+    static func cardsHeight(seats: [Seat], expanded: Identity?, folded: Set<String> = []) -> CGFloat {
         let cards = cards(seats)
-        return cards.reduce(0) { $0 + cardHeight($1, expanded: expanded) } + CGFloat(max(cards.count - 1, 0)) * cardGap
+        return cards.reduce(0) { $0 + cardHeight($1, expanded: expanded, folded: folded) } + CGFloat(max(cards.count - 1, 0)) * cardGap
     }
 
     /// The menu's height if the screen were tall enough for every row.
-    static func contentHeight(seats: [Seat], hasNotice: Bool, expanded: Identity? = nil) -> CGFloat {
-        chrome(hasNotice: hasNotice) + cardsHeight(seats: seats, expanded: expanded)
+    static func contentHeight(seats: [Seat], hasNotice: Bool, expanded: Identity? = nil, folded: Set<String> = []) -> CGFloat {
+        chrome(hasNotice: hasNotice) + cardsHeight(seats: seats, expanded: expanded, folded: folded)
     }
 
     /// The menu's height on a screen whose visible part (below the menu bar) is
     /// `visibleScreenHeight` tall: every row when they fit, else as tall as the screen allows,
     /// with the cards scrolling under the pinned title bar and notice.
-    static func height(visibleScreenHeight: CGFloat, seats: [Seat], hasNotice: Bool, expanded: Identity? = nil) -> CGFloat {
+    static func height(visibleScreenHeight: CGFloat, seats: [Seat], hasNotice: Bool, expanded: Identity? = nil,
+                       folded: Set<String> = []) -> CGFloat {
         chrome(hasNotice: hasNotice) + cardsViewport(visibleScreenHeight: visibleScreenHeight, seats: seats,
-                                                     hasNotice: hasNotice, expanded: expanded)
+                                                     hasNotice: hasNotice, expanded: expanded, folded: folded)
     }
 
     /// The height the cards get, which scroll when it is less than they need.
-    static func cardsViewport(visibleScreenHeight: CGFloat, seats: [Seat], hasNotice: Bool, expanded: Identity?) -> CGFloat {
+    static func cardsViewport(visibleScreenHeight: CGFloat, seats: [Seat], hasNotice: Bool, expanded: Identity?,
+                              folded: Set<String> = []) -> CGFloat {
         let room = max(visibleScreenHeight - screenMargin - chrome(hasNotice: hasNotice), minimumCards)
-        return min(cardsHeight(seats: seats, expanded: expanded), room)
+        return min(cardsHeight(seats: seats, expanded: expanded, folded: folded), room)
     }
+}
+
+// MARK: - Account colours
+
+/// Named account colours, offered in each account's Color menu.
+let accountColors: [(name: String, hex: String)] = [
+    ("Blue", "#3567CF"), ("Orange", "#B96E22"), ("Pink", "#B3405F"), ("Green", "#2C8A5E"),
+    ("Purple", "#6B5BD2"), ("Teal", "#1F8A9A"), ("Red", "#C8412F"), ("Gray", "#7A8088"),
+]
+
+extension Color {
+    /// A "#RRGGBB" colour; anything unreadable draws gray.
+    init(hex: String) {
+        let digits = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        let v = UInt64(digits, radix: 16) ?? 0x7A8088
+        self.init(red: Double((v >> 16) & 0xFF) / 255, green: Double((v >> 8) & 0xFF) / 255, blue: Double(v & 0xFF) / 255)
+    }
+}
+
+/// Each account's colour, in menu order. An account saved without one (core gives a new row "")
+/// shows the first named colour no other account uses, so new accounts differ without a choice.
+func resolvedColors(_ saved: [(account: String, color: String)]) -> [String: String] {
+    var colors: [String: String] = [:]
+    for (account, color) in saved where !color.isEmpty && colors[account] == nil { colors[account] = color }
+    for (account, _) in saved where colors[account] == nil {
+        let used = Set(colors.values)
+        colors[account] = accountColors.first { !used.contains($0.hex) }?.hex ?? accountColors[colors.count % accountColors.count].hex
+    }
+    return colors
 }
 
 // MARK: - Pieces
@@ -205,6 +241,40 @@ struct RenameField: View {
     }
 }
 
+/// An account's colour dot, before its name.
+struct ColorDot: View {
+    let hex: String
+    var body: some View { Circle().fill(Color(hex: hex)).frame(width: 9, height: 9).accessibilityHidden(true) }
+}
+
+/// The account colours, with the current one checked.
+struct ColorMenu: View {
+    let current: String
+    let onPick: (String) -> Void
+
+    var body: some View {
+        Menu("Color") {
+            ForEach(accountColors, id: \.hex) { color in
+                Button { onPick(color.hex) } label: {
+                    if color.hex == current { Label(color.name, systemImage: "checkmark") } else { Text(color.name) }
+                }
+            }
+        }
+    }
+}
+
+/// Rename…, and Reset Name when the name is not the default one.
+struct NameItems: View {
+    let canReset: Bool
+    @Binding var renaming: Bool
+    let onReset: () -> Void
+
+    var body: some View {
+        Button("Rename…") { renaming = true }
+        if canReset { Button("Reset Name", action: onReset) }
+    }
+}
+
 /// The "···" button that opens a row's or an account's menu.
 struct MoreMenu<Items: View>: View {
     let name: String
@@ -234,6 +304,13 @@ struct MenuActions {
     var refresh: () -> Void = {}
     var setAutoSwitch: (Bool) -> Void = { _ in }
     var toggleOpenAtLogin: () -> Void = {}
+    /// Colours every row of the seat's account.
+    var recolor: (Seat, String) -> Void = { _, _ in }
+    /// Shows (true) or folds away (false) an account's organizations, by account id.
+    /// Nil leaves the account's name as plain text, with nothing to fold.
+    var showOrganizations: ((String, Bool) -> Void)? = nil
+    var setDisplay: (MenuBarDisplay) -> Void = { _ in }
+    var setMetric: (UsageMetric) -> Void = { _ in }
 
     static let none = MenuActions()
 }
@@ -244,6 +321,24 @@ struct MenuHeader {
     var autoSwitch = true
     var openAtLogin = false
     var updatedAt: Date?
+    var display = MenuBarDisplay.gaugeNamePercent
+    var metric = UsageMetric.fiveHour
+}
+
+/// What the person chose for how accounts look: colours, folded accounts, and which names they
+/// changed, so Reset Name shows only where it does something.
+struct MenuLooks {
+    /// Each account's colour by account id, defaults already filled in (`resolvedColors`).
+    var colors: [String: String] = [:]
+    /// Accounts whose organizations are folded under the account's name.
+    var folded: Set<String> = []
+    /// Accounts whose name is not the default one.
+    var renamedAccounts: Set<String> = []
+    /// Seats whose organization's name is not the default one.
+    var renamedOrganizations: Set<Identity> = []
+
+    /// The seat's account colour; nil, and no dot or Color menu, when none is given.
+    func color(_ seat: Seat) -> String? { colors[seat.id.account] }
 }
 
 /// The whole menu, drawn from values only: the store's adapter is `MenuContent`.
@@ -254,6 +349,7 @@ struct MenuPanel: View {
     /// NSScreen.visibleFrame.height of the screen the menu opens on.
     let visibleScreenHeight: CGFloat
     var header = MenuHeader()
+    var looks = MenuLooks()
     var actions = MenuActions.none
     var now: Date = World.now()
     /// The one row expanded to both meters. Never remembered: it is cleared whenever the menu opens.
@@ -282,14 +378,14 @@ struct MenuPanel: View {
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: MenuLayout.cardGap) {
                     ForEach(MenuLayout.cards(seats), id: \.[0].id.account) { card in
-                        AccountCard(seats: card, expanded: $expanded, busy: busy, actions: actions, now: now)
+                        AccountCard(seats: card, expanded: $expanded, busy: busy, looks: looks, actions: actions, now: now)
                             .id(card[0].id.account)
                     }
                 }
             }
             .scrollIndicators(.automatic)
             .frame(height: MenuLayout.cardsViewport(visibleScreenHeight: visibleScreenHeight, seats: seats,
-                                                    hasNotice: notice != nil, expanded: expanded))
+                                                    hasNotice: notice != nil, expanded: expanded, folded: looks.folded))
             .onAppear { if let inUseCard { proxy.scrollTo(inUseCard, anchor: .center) } }
         }
     }
@@ -321,6 +417,13 @@ struct TitleBar: View {
             .accessibilityLabel("Refresh")
             MoreMenu(name: "Claude Accounts") {
                 Button("Add Account…") { actions.signIn(nil) }
+                Divider()
+                Picker("Menu Bar Shows", selection: Binding(get: { header.display }, set: { actions.setDisplay($0) })) {
+                    ForEach(MenuBarDisplay.allCases) { Text($0.title).tag($0) }
+                }
+                Picker("Gauge Tracks", selection: Binding(get: { header.metric }, set: { actions.setMetric($0) })) {
+                    ForEach(UsageMetric.allCases) { Text($0.title).tag($0) }
+                }
                 Divider()
                 Toggle("Auto-Switch When Out", isOn: Binding(get: { header.autoSwitch }, set: { actions.setAutoSwitch($0) }))
                     .help("When Claude stops a chat because the seat in use is out of usage, quit Claude, reopen it on the next seat in this menu's order that has room, and send \u{201C}resume\u{201D} to the chats that were working")
@@ -363,15 +466,17 @@ struct NoticeLine: View {
     }
 }
 
-/// One account: its seat alone, or its name above a row per organization. The account in use has
-/// an accent edge, and its organization in use is lit.
+/// One account: its seat alone, or its name above a row per organization, which the name folds
+/// away. The account in use has an accent edge, and its organization in use is lit.
 struct AccountCard: View {
     let seats: [Seat]
     @Binding var expanded: Identity?
     let busy: Bool
+    let looks: MenuLooks
     let actions: MenuActions
     let now: Date
     @State private var renaming = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let inUse = seats.contains { $0.state == .inUse }
@@ -379,35 +484,68 @@ struct AccountCard: View {
              edge: inUse ? .accentColor : nil) {
             VStack(alignment: .leading, spacing: 0) {
                 if seats.count == 1 {
-                    SeatRow(seat: seats[0], title: seats[0].name, inCard: false, expanded: $expanded, busy: busy, actions: actions, now: now)
+                    SeatRow(seat: seats[0], title: seats[0].name, inCard: false, expanded: $expanded, busy: busy,
+                            looks: looks, actions: actions, now: now)
                 } else {
-                    accountName
-                    ForEach(seats) { seat in
-                        Divider().frame(height: MenuLayout.hairline).padding(.leading, 10)
-                        SeatRow(seat: seat, title: seat.organization, inCard: true, expanded: $expanded, busy: busy, actions: actions, now: now)
+                    accountName(inUse: inUse)
+                    if !MenuLayout.isFolded(seats, folded: looks.folded) {
+                        ForEach(seats) { seat in
+                            Divider().frame(height: MenuLayout.hairline).padding(.leading, 10)
+                            SeatRow(seat: seat, title: seat.organization, inCard: true, expanded: $expanded, busy: busy,
+                                    looks: looks, actions: actions, now: now)
+                        }
                     }
                 }
             }
         }
     }
 
-    private var accountName: some View {
-        let first = seats[0]
+    private func accountName(inUse: Bool) -> some View {
+        let first = seats[0], account = first.id.account
+        let folded = MenuLayout.isFolded(seats, folded: looks.folded)
         return HStack(spacing: 8) {
+            if let hex = looks.color(first) { ColorDot(hex: hex) }
             if renaming {
                 RenameField(current: first.accountName, renaming: $renaming) { actions.rename(first, $0, false) }
+            } else if let fold = actions.showOrganizations {
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { fold(account, folded) }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(first.accountName).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
+                        Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(folded ? 0 : 90))
+                        Spacer(minLength: 4)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(folded ? "Show this account's organizations" : "Hide this account's organizations")
+                .accessibilityLabel(first.accountName)
+                .accessibilityValue(folded ? "Organizations hidden" : "Organizations shown")
+                .accessibilityAddTraits(.isHeader)
+                // Folded away, the account in use still says so.
+                if folded && inUse { Badge(text: "In use") }
+                menu
             } else {
                 Text(first.accountName).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
                     .accessibilityAddTraits(.isHeader)
                 Spacer()
-                MoreMenu(name: first.accountName) {
-                    Button("Rename…") { renaming = true }
-                    MoveItems(seat: first, organization: false, actions: actions)
-                }
+                menu
             }
         }
         .padding(.horizontal, 10)
         .frame(height: MenuLayout.line)
+    }
+
+    /// The account's own menu: its name, its colour and its place in the order.
+    private var menu: some View {
+        let first = seats[0]
+        return MoreMenu(name: first.accountName) {
+            NameItems(canReset: looks.renamedAccounts.contains(first.id.account), renaming: $renaming) { actions.rename(first, "", false) }
+            if let hex = looks.color(first) { ColorMenu(current: hex) { actions.recolor(first, $0) } }
+            MoveItems(seat: first, organization: false, actions: actions)
+        }
     }
 }
 
@@ -436,6 +574,7 @@ struct SeatRow: View {
     let inCard: Bool
     @Binding var expanded: Identity?
     let busy: Bool
+    var looks = MenuLooks()
     let actions: MenuActions
     let now: Date
     @State var renaming = false
@@ -466,6 +605,8 @@ struct SeatRow: View {
     }
 
     @ViewBuilder private var summaryLine: some View {
+        // A seat alone on its card carries its account's colour; organizations take the card's.
+        if !inCard, let hex = looks.color(seat) { ColorDot(hex: hex) }
         if renaming {
             RenameField(current: title, renaming: $renaming) { actions.rename(seat, $0, inCard) }
         } else {
@@ -474,7 +615,9 @@ struct SeatRow: View {
             status
             actionButton
             MoreMenu(name: seat.name) {
-                Button("Rename…") { renaming = true }
+                NameItems(canReset: inCard ? looks.renamedOrganizations.contains(seat.id) : looks.renamedAccounts.contains(seat.id.account),
+                          renaming: $renaming) { actions.rename(seat, "", inCard) }
+                if !inCard, let hex = looks.color(seat) { ColorMenu(current: hex) { actions.recolor(seat, $0) } }
                 MoveItems(seat: seat, organization: inCard, actions: actions)
                 Divider()
                 Button("Sign in again…") { actions.signIn(seat) }
@@ -589,8 +732,9 @@ struct MenuContent: View {
     var body: some View {
         MenuPanel(seats: store.seats, notice: store.notice, firstRun: store.firstRun, visibleScreenHeight: screenHeight,
                   header: MenuHeader(refreshing: store.loading, autoSwitch: store.settings.autoSwitch,
-                                     openAtLogin: store.openAtLogin, updatedAt: store.lastUpdated),
-                  actions: actions)
+                                     openAtLogin: store.openAtLogin, updatedAt: store.lastUpdated,
+                                     display: store.settings.display, metric: store.settings.metric),
+                  looks: looks, actions: actions)
             .onAppear {
                 // The menu opens under its menu bar item, where the pointer is.
                 let mouse = NSEvent.mouseLocation
@@ -615,7 +759,24 @@ struct MenuContent: View {
                     },
                     notice: { store.noticeAction($0) }, closeNotice: { store.closeNotice() },
                     refresh: { store.refresh(manual: true) }, setAutoSwitch: { store.setAutoSwitch($0) },
-                    toggleOpenAtLogin: { store.toggleOpenAtLogin() })
+                    toggleOpenAtLogin: { store.toggleOpenAtLogin() },
+                    recolor: { store.recolor($0, $1) },
+                    showOrganizations: { store.setShowsOrganizations(of: $0, $1) },
+                    setDisplay: { store.settings.display = $0 }, setMetric: { store.settings.metric = $0 })
+    }
+
+    /// The rows' colours, folds and changed names, keyed the way the menu's seats are.
+    private var looks: MenuLooks {
+        let rows = store.accounts
+        let account = { (row: AccountRecord) in row.seat.account }
+        func differs(_ row: AccountRecord, organization: Bool) -> Bool {
+            guard let reset = rows.renamed(row, to: "", organization: organization).first(where: { $0.id == row.id }) else { return false }
+            return organization ? reset.organization != row.organization : reset.name != row.name
+        }
+        return MenuLooks(colors: resolvedColors(rows.map { (account($0), $0.color) }),
+                         folded: Set(rows.map(account).filter { !store.settings.showsOrganizations(of: $0) }),
+                         renamedAccounts: Set(rows.filter { differs($0, organization: false) }.map(account)),
+                         renamedOrganizations: Set(rows.filter { differs($0, organization: true) }.map(\.seat)))
     }
 }
 
