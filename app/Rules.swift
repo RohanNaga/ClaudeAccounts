@@ -28,7 +28,7 @@ struct AccountRecord: Codable, Identifiable, Equatable {
     let id: String
     /// The account's name, the same on every row of the account.
     var name: String
-    /// No longer shown (rows have no colours). Still written so an older version can read the file.
+    /// The account's colour in the menu; empty shows the first colour no other account uses.
     var color: String
     var configDir: String
     var keychainService: String

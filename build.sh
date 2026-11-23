@@ -10,8 +10,32 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="$ROOT/Claude Accounts.app"
 BIN="$APP/Contents/MacOS/ClaudeAccounts"
 
-# Quit a running copy so the rebuilt binary is the one that launches next.
-pkill -x ClaudeAccounts 2>/dev/null || true
+# The processes running this folder's app, matched by their full executable path, so a copy
+# installed anywhere else is never touched.
+running_pids() {
+  ps -axo pid=,comm= | awk -v bin="$BIN" '{ pid = $1; sub(/^ *[0-9]+ /, "") } $0 == bin { print pid }'
+}
+
+# Ask one process to quit, as the Quit menu item does, and wait until it has. It stops the build
+# rather than force it.
+quit_running_copy() {
+  local pid="$1"
+  osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid).terminate" \
+    >/dev/null 2>&1 || kill -TERM "$pid"
+  for _ in $(seq 1 100); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  echo "Claude Accounts did not quit. Quit it from its menu, then run this again." >&2
+  exit 1
+}
+
+# Replace a running copy with the new build, and reopen it after signing.
+WAS_RUNNING=false
+for pid in $(running_pids); do
+  quit_running_copy "$pid"
+  WAS_RUNNING=true
+done
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -70,3 +94,10 @@ else
   codesign --force --sign - "$APP"
 fi
 echo "Built: $APP"
+
+if [ "$WAS_RUNNING" = true ]; then
+  open "$APP"
+  echo "Reopened Claude Accounts."
+else
+  echo "Claude Accounts was not running, so it was left closed."
+fi
