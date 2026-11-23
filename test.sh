@@ -48,3 +48,28 @@ swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/prompt-test" \
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/resume-test" \
   "${CORE[@]}" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/ResumeTest.swift"
 "$OUT/resume-test" "$OUT/prompt-fixture"
+
+# The end-to-end scenarios (tests/Scenarios.swift): the app's own Store against a stand-in Claude
+# on a virtual clock, one (state, event) pair at a time. Each pair runs alone in its own stand-in
+# root, several side by side, each stopped after SCENARIO_LIMIT seconds of real time. Pair names
+# travel NUL-separated, so any character in a name is safe.
+APP_SOURCES=()
+for f in "$ROOT"/app/*.swift; do
+  case "$(basename "$f")" in Main.swift|make-icon.swift|make-social.swift) ;; *) APP_SOURCES+=("$f") ;; esac
+done
+SCENARIO_FILES=("$ROOT/tests/StandIn.swift" "$ROOT/tests/SeatSurface.swift" "$ROOT/tests/Scenarios.swift" "$ROOT/tests/BugScenarios.swift" "$ROOT/tests/FaultScenarios.swift" "$ROOT/tests/GapScenarios.swift")
+swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/scenarios" "${APP_SOURCES[@]}" "${SCENARIO_FILES[@]}"
+# The resume pair drives ChatComposer's own Accessibility code against the chat fixture.
+export CHAT_FIXTURE="$OUT/prompt-fixture"
+RESULTS="$OUT/scenario-results"
+rm -rf "$RESULTS"; mkdir -p "$RESULTS"
+"$OUT/scenarios" --list | awk '{ printf "%03d %s%c", NR, $0, 0 }' \
+  | BIN="$OUT/scenarios" D="$RESULTS" LIMIT="${SCENARIO_LIMIT:-120}" xargs -0 -n 1 -P "${SCENARIO_JOBS:-6}" bash -c '
+      n=${0%% *}; pair=${0#* }
+      r=$(perl -e "alarm $LIMIT; exec @ARGV" "$BIN" "$pair" 2>&1); code=$?
+      { grep -v "^Scenarios:" <<<"$r"; if [ $code -ge 128 ]; then echo "TIME $pair: stopped after $LIMIT s real time"; fi; } > "$D/$n"'
+cat "$RESULTS"/*
+passed=$(cat "$RESULTS"/* | awk '/^ok/ {n++} END {print n+0}')
+failed=$(cat "$RESULTS"/* | awk '/^(FAIL|TIME|PEND)/ {n++} END {print n+0}')
+echo "Scenarios: $passed passed, $failed not passing"
+[ "$failed" -eq 0 ]
