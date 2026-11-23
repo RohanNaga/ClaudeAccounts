@@ -641,8 +641,13 @@ let scenarios: [Scenario] = [
         await h.standard()
         h.claude.namedLineChanged = true
         h.click("Beta")
-        await h.run(until: { h.noticeHas(pausedLine) && !h.switchInFlight }, limit: 1800)
-        h.check(h.noticeHas(pausedLine), "a launch with no Named line pauses automatic switching, in one line: \(h.notice)")
+        await h.run(until: { !h.switchInFlight }, limit: 1800)
+        // Spec 11: the rollback's reason is a failure the person must act on, so it holds the one
+        // notice over the pause; the paused line shows once it is closed.
+        h.check(h.notice == ["Beta didn't open in time. Back on Alpha."], "the rollback's reason holds the notice: \(h.notice)")
+        h.store.closeNotice()
+        await h.tick()
+        h.check(h.noticeHas(pausedLine), "a launch with no Named line pauses automatic switching, in one line, once the failure is closed: \(h.notice)")
         await h.run(until: { h.claude.held != nil }, limit: 60)
         h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "confirm could not read the log, so it rolled back to Alpha with the chat: \(String(describing: h.claude.held))")
         h.check(h.hasSavedLogin(A) && h.hasSavedLogin(B), "every saved login intact")
@@ -667,10 +672,14 @@ let scenarios: [Scenario] = [
         h.claude.quitBehaviour = .promptUnanswered
         h.claude.promptHasQuitButton = false
         h.claude.logLimitStop("local_one")
-        await h.run(until: { h.noticeHas(pausedLine) && !h.switchInFlight }, limit: 1800)
-        h.check(h.noticeHas(pausedLine), "a prompt without its button pauses automatic switching, in one line: \(h.notice)")
+        await h.run(until: { h.quits > 0 && !h.switchInFlight }, limit: 1800)
+        // Spec 11: the automatic switch's failure holds the one notice over the pause, as a manual one's does.
+        h.check(h.notice == ["Claude didn't quit, so nothing changed."], "the failed quit holds the notice: \(h.notice)")
+        h.store.closeNotice()
+        await h.tick()
+        h.check(h.noticeHas(pausedLine), "a prompt without its button pauses automatic switching, in one line, once the failure is closed: \(h.notice)")
         h.check(h.claude.held == A && !h.claude.pids().isEmpty && h.claude.chats(in: A).contains("local_one"), "nothing changed: Claude still runs on Alpha with the chat")
-        h.check(!h.claude.actions.contains("pressed \(ClaudeUI.quitAnyway)"), "the app never pressed a button it could not find: \(h.claude.actions)")
+        h.check(!h.claude.actions.contains { $0.hasPrefix("pressed") }, "the app never pressed anything on a prompt it could not recognise: \(h.claude.actions)")
         let quits = h.quits
         h.claude.logLimitStop("local_one")
         await h.pass(600)
@@ -713,7 +722,11 @@ let scenarios: [Scenario] = [
         let savedB = h.savedAt(B)
         h.click("Beta")
         await h.run(until: { !h.switchInFlight }, limit: 900)
-        h.check(h.noticeHas(pausedLine), "an unseen cookie format pauses automatic switching, in one line: \(h.notice)")
+        // Spec 11: the switch's failure holds the one notice over the pause until it is closed.
+        h.check(h.notice == ["Couldn't switch to Beta. Claude's sign-in file is in a format this app doesn't know."], "the failed switch says why: \(h.notice)")
+        h.store.closeNotice()
+        await h.tick()
+        h.check(h.noticeHas(pausedLine), "an unseen cookie format pauses automatic switching, in one line, once the failure is closed: \(h.notice)")
         await h.run(until: { h.claude.held != nil }, limit: 60)
         h.check(h.claude.held == A && h.claude.signInOnDisk() == A, "nothing is loaded in an unseen format, so Claude is back on Alpha: holds \(String(describing: h.claude.held)), running \(!h.claude.pids().isEmpty), \(h.claude.actions)")
         h.check(h.hasSavedLogin(A) && h.savedAt(B) == savedB, "every saved login intact, Beta's untouched")

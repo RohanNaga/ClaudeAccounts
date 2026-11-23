@@ -281,8 +281,9 @@ let gapScenarios: [Scenario] = [
                 "the switch waits 3 min for Claude to name Beta, then rolls back: rollback quit \(waited.map { "\(Int($0)) s" } ?? "never") after the launch")
         await runToEnd(h, lines, limit: 1200)
         h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "back on Alpha with its chat: \(String(describing: h.claude.held)), \(h.claude.actions)")
-        // No Named line within 3 min is also section 8's shape miss, so the paused line, not the
-        // rollback's reason, may hold the one notice; the pair asserts the wait, not the wording.
+        // No Named line within 3 min is also section 8's shape miss; spec 11 still gives the notice
+        // to the rollback's reason, a failure the person must act on.
+        h.check(lines.has("Beta didn't open in time. Back on Alpha."), "the row says why it went back: \(lines.seen)")
         h.check(Limits.confirmWait == Spec.confirmWait, "confirmWait is 3 min: \(Limits.confirmWait) s")
     },
 

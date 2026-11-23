@@ -184,8 +184,8 @@ final class Strike: @unchecked Sendable {
     checkActs(h)
     if fault == .failedRead, step.hook == "confirm" {
         h.check(held == A, "B: a confirm that can't read the log rolls back (section 8)")
-        // The miss clears once the relaunch on Alpha logs its Named line, so either line may stand.
-        h.check(lines.contains { $0.contains(pausedLine) || $0.contains("\(targetRow) didn't open in time") },
+        // Spec 11: the rollback's reason holds the notice over any pause.
+        h.check(lines.contains { $0.contains("\(targetRow) didn't open in time. Back on Alpha.") },
                 "B: one line says why the switch went back (sections 6 and 8); saw \(lines)")
     }
 
@@ -345,13 +345,17 @@ let autoFaultScenarios: [Scenario] = [
         h.claude.stop(crashed: true)
         await runToEnd(h, lines)
         checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
-        // The prompt had no Quit anyway button: a missing shape turns resume off, and one line says so.
+        // The prompt had no Quit anyway button: a missing shape turns resume off.
         h.check(h.claude.sent.isEmpty, "B: no resume typed while the quit button's shape is missing (8); typed \(h.claude.sent)")
-        h.check(lines.has(pausedLine), "B: one line says switching on its own is paused (8); saw \(lines.seen)")
         // Ruling on 22cef17: with resume off, the chats are named instead.
         await h.run(until: { lines.note(h); return lines.has("Couldn't resume") }, limit: ClaudeTiming.settle + 35 * 60)
         h.check(lines.has("Couldn't resume 1 chat: send it a message."), "the stopped chat is named while the shape miss stands (8, 12); saw \(lines.seen)")
         h.check(h.claude.sent.isEmpty, "still nothing typed: \(h.claude.sent)")
+        // Spec 11: that failure holds the one notice; the paused line says why once it is closed.
+        h.store.closeNotice()
+        await h.tick()
+        lines.note(h)
+        h.check(h.noticeHas(pausedLine), "B: one line says switching on its own is paused (8) once the failure is closed: \(h.notice)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
