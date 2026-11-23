@@ -723,7 +723,7 @@ let scenarios: [Scenario] = [
     },
     Scenario(pair: "(Any, more rows than fit)", model: "cards scroll; title and notice pinned; row in use visible (MenuLayout seam)") { h in
         await h.manyRows(30)
-        guard let m = h.menu(screen: 600) else { h.check(false, "this build has no fitted menu"); return }
+        let m = h.menu(screen: 600)
         h.check(m.height <= 600 - m.margin, "the menu stays on a 600 pt screen: \(m.height)")
         h.check(m.content > m.height, "the cards scroll: they need \(m.content), the menu is \(m.height)")
         h.check(m.height - m.pinned >= 3 * m.row, "the pinned title bar and notice leave room for at least three rows")
@@ -783,7 +783,7 @@ let scenarios: [Scenario] = [
     },
     Scenario(pair: "(Any Mac, twenty rows)", model: "cards scroll, compact rows; height within 900 pt and 1400 pt screens") { h in
         await h.manyRows(20)
-        guard let short = h.menu(screen: 900), let tall = h.menu(screen: 1400) else { h.check(false, "this build has no fitted menu"); return }
+        let short = h.menu(screen: 900), tall = h.menu(screen: 1400)
         // The cards scroll only when they need more than the screen gives; compact rows may fit.
         h.check(short.height <= 900 - short.margin && short.height == min(short.content, 900 - short.margin), "on 900 pt the menu fits, scrolling only past the screen: \(short.height) of \(short.content)")
         h.check(tall.height <= 1400 - tall.margin, "on 1400 pt the menu fits: \(tall.height)")
