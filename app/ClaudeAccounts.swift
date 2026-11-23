@@ -516,6 +516,14 @@ enum LoginSlot {
         return id
     }
 
+    /// The pair this row's saved login is for, and when it was saved (F4).
+    static func saved(_ acct: AccountRecord) -> (Identity, Date)? {
+        guard let id = savedIdentity(acct),
+              let at = (try? dir(acct).appendingPathComponent("slot.json").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        else { return nil }
+        return (id, at)
+    }
+
     private static func savedIdentity(_ acct: AccountRecord) -> Identity? {
         guard let uuid = acct.accountUuid, let meta = meta(acct), let org = meta.orgFolder,
               FileManager.default.fileExists(atPath: dir(acct).appendingPathComponent("cookies.db").path),
@@ -1332,255 +1340,334 @@ enum AutoSwitchLog {
 
 // MARK: - Store
 
-@MainActor
-final class Store: ObservableObject {
-    @Published var accounts: [AccountRecord] = AccountStore.load()
-    @Published var states: [String: AccountState] = [:]
-    /// Who Claude reports it is signed in as, from its own log.
-    @Published var inUse: Identity? { didSet { endSetUpMessageIfDone() } }
-    @Published var lastUpdated: Date?
-    @Published var loading = false
-    @Published var message: String?
-    /// The message stays until closed instead of clearing itself.
-    @Published var messageStays = false
-    /// The row whose set up the message asks for; the message goes once that row is set up.
-    private(set) var messageEndsWithSetUp: String?
-    /// The account the sign-in window re-authenticates; nil means it adds a new one.
-    @Published var signInTarget: AccountRecord?
-    @Published var openAtLogin = SMAppService.mainApp.status == .enabled
-    @Published var settings = AppSettings.load() { didSet { settings.save() } }
-    /// Progress text while a switch runs; nil when idle.
-    @Published var switching: String?
+/// A small JSON file of values keyed by seat pair, in the app's state folder.
+struct PairFile<Value: Codable> {
+    let name: String
+    private var url: URL { Paths.stateDir.appendingPathComponent(name) }
 
-    /// When the usage service lets each rate-limited account be asked again.
-    @Published var retryAt: [String: Date] = [:]
+    static func key(_ id: Identity) -> String { "\(id.account)_\(id.org)" }
 
-    /// Whether this app may press Claude's quit prompt, which an unattended switch needs.
-    @Published var accessibilityGranted = World.claude.trusted
-
-    private var timer: Timer?
-    private let logWatcher = LogWatcher()
-    private var polledAt: [String: Date] = [:]
-    /// When each row's shown reading was taken.
-    private var readAt: [String: Date] = [:]
-    /// The row the "no account has room" notice was last posted for, so it is posted once.
-    private var toldNowhereFor: String?
-
-    /// The Claude app's own usage reader reuses a good reading for 60 s; asking faster than
-    /// that earns a 429 with a multi-minute Retry-After, so no account is asked more often.
-    static let minPollInterval: TimeInterval = 60
-    /// A click on Refresh may re-read sooner, at the 20 s spacing the Claude app uses for retries.
-    static let manualPollInterval: TimeInterval = 20
-
-    /// True when any account needs a sign-in; the menu bar icon turns into a warning.
-    var needsAttention: Bool { states.values.contains { $0.needsSignIn } }
-
-    init() {
-        loadCache()
-        refresh()
-        // Tick often so each account is read as soon as it is due; the interval above sets the pace.
-        checkAccessibility()
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.checkAccessibility()
-                self?.refresh()
-                self?.considerAutoSwitch()
-                self?.saveSteadyLogin()
-            }
-        }
+    func load() -> [Identity: Value] {
+        guard let data = try? Data(contentsOf: url),
+              let raw = try? JSONDecoder().decode([String: Value].self, from: data) else { return [:] }
+        return Dictionary(uniqueKeysWithValues: raw.compactMap { key, value in
+            let parts = key.split(separator: "_", maxSplits: 1).map(String.init)
+            return parts.count == 2 ? (Identity(account: parts[0], org: parts[1]), value) : nil
+        })
     }
 
-    func isInUse(_ acct: AccountRecord) -> Bool { accounts.row(for: inUse)?.id == acct.id }
-
-    /// The row has a saved login Claude still accepts.
-    func hasSavedLogin(_ acct: AccountRecord) -> Bool { LoginSlot.exists(acct, log: logWatcher.log) }
-
-    /// Claude refused this row's sign-in as too old and hasn't held it steadily since.
-    func isRefused(_ acct: AccountRecord) -> Bool { logWatcher.log.refusal(of: acct.identity, at: World.now()) != nil }
-
-    /// The hold whose login was saved, so each steady hold is saved once.
-    private var savedHold: String?
-
-    /// Save the in-use row's login once Claude has held its account and organization steadily
-    /// (SaveRule), with Claude left open, so a row is saved without a switch away from it. Never
-    /// while a switch or set-up runs; the lock is taken without overtaking a resume.
-    private func saveSteadyLogin() {
-        let log = logWatcher.log
-        guard switching == nil, let held = log.steady(at: World.now()), let since = log.heldSince,
-              let row = accounts.row(for: held) else { return }
-        let hold = "\(row.id) \(since.timeIntervalSince1970)"
-        guard savedHold != hold, SwitchJournal.load() == nil, let lock = SwitchLock.acquire(newGeneration: false) else { return }
-        savedHold = hold
-        Task {
-            defer { lock.release() }
-            do {
-                try await LoginSlot.capture(row, as: held, whileRunning: true)
-            } catch SwitchError.cookiesChanging {
-                self.savedHold = nil  // tried again on the next tick
-            } catch {}
-            self.objectWillChange.send()
-            self.endSetUpMessageIfDone()
-        }
+    func save(_ values: [Identity: Value]) {
+        let raw = Dictionary(uniqueKeysWithValues: values.map { (Self.key($0.key), $0.value) })
+        guard let data = try? JSONEncoder().encode(raw) else { return }
+        try? FileManager.default.createDirectory(at: Paths.stateDir, withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
     }
+}
 
-    /// Opening the menu calls this; accounts that aren't due yet keep their cached reading.
-    func refreshIfStale() { refresh() }
+/// Claude's log read in order into `ClaudeEvents`, reading only what is new and following
+/// main.log across a rotation. A log it can't follow is read again from main1.log.
+struct LogReader {
+    private(set) var events = ClaudeEvents()
+    private var mark: ClaudeApp.LogMark?
 
-    /// Read usage for every account that is due: not asked in the last `minPollInterval`,
-    /// and not inside a rate-limit wait. `forcing` skips the spacing for one account
-    /// (a fresh sign-in) but still honours a rate-limit wait.
-    func refresh(forcing forcedId: String? = nil, manual: Bool = false) {
-        guard !loading else { return }
-        accounts = AccountStore.load()
-        inUse = logWatcher.poll()
-        let now = World.now()
-        let due = accounts.filter { acct in
-            if let until = retryAt[acct.id], until > now { return false }
-            if acct.id == forcedId { return true }
-            guard let last = polledAt[acct.id] else { return true }
-            if manual { return now.timeIntervalSince(last) >= Self.manualPollInterval }
-            // Claude reads the account it is signed in to once a minute too, and the two readers
-            // share that account's rate limit, so ours backs off to every other minute there.
-            let pace = isInUse(acct) ? Self.minPollInterval * 2 : Self.minPollInterval
-            return now.timeIntervalSince(last) >= pace
-        }
-        guard !due.isEmpty else { return }
-        loading = true
-        Task {
-            await withTaskGroup(of: (String, AccountState).self) { group in
-                for acct in due { group.addTask { (acct.id, await Usage.reader.state(for: acct)) } }
-                for await (id, state) in group { self.record(state, for: id) }
-            }
-            self.lastUpdated = World.now()
-            self.loading = false
-            self.saveCache()
-            self.considerAutoSwitch()
-        }
-    }
-
-    /// A rate-limit answer keeps the last good reading on screen instead of blanking the row.
-    private func record(_ state: AccountState, for id: String) {
-        polledAt[id] = World.now()
-        if case .rateLimited(let until) = state {
-            retryAt[id] = until
-            if states[id] == nil || states[id] == .loading { states[id] = state }
+    mutating func poll() {
+        let now = ClaudeApp.logMark()
+        if let mark, mark.inode == now.inode, mark.offset <= now.offset {
+            let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: mark.offset)
+            events.read(text)
+            self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
             return
         }
-        retryAt[id] = nil
-        states[id] = state
-        if case .ok = state { readAt[id] = World.now() }
-    }
-
-    // MARK: Cache
-
-    private func loadCache() {
-        let entries = UsageCache.load()
-        guard !entries.isEmpty else { return }
-        for (id, e) in entries {
-            polledAt[id] = e.polledAt
-            if let r = e.retryAt, r > World.now() { retryAt[id] = r }
-            if e.fiveHour != nil || e.weekly != nil || e.plan != nil {
-                states[id] = .ok(plan: e.plan, fiveHour: e.fiveHour, weekly: e.weekly, loginExpiresAt: e.loginExpiresAt)
-                readAt[id] = e.readAt ?? e.polledAt
-            } else if let r = retryAt[id] {
-                states[id] = .rateLimited(until: r)
-            }
+        let rotated = ClaudeFiles.rotations.map { ClaudeApp.logDir.appendingPathComponent(ClaudeFiles.rotatedLog($0)) }
+        if let mark, let older = rotated.first(where: { ClaudeApp.logMark($0).inode == mark.inode }) {
+            events.read(ClaudeApp.readLines(older, from: mark.offset).text)
+        } else {
+            events = ClaudeEvents()
+            events.read(ClaudeApp.readLines(rotated[0], from: 0).text)
         }
-        lastUpdated = entries.values.map(\.polledAt).max()
+        let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: 0)
+        events.read(text)
+        self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
     }
+}
 
-    private func saveCache() {
-        var entries: [String: UsageCache.Entry] = [:]
-        for (id, polled) in polledAt {
-            // A rate-limit wait is saved even without a reading, so a relaunch doesn't ask again early.
-            if case .ok(let plan, let fh, let wk, let exp) = states[id] {
-                entries[id] = UsageCache.Entry(polledAt: polled, retryAt: retryAt[id], plan: plan, fiveHour: fh, weekly: wk,
-                                               loginExpiresAt: exp, readAt: readAt[id])
-            } else if let wait = retryAt[id] {
-                entries[id] = UsageCache.Entry(polledAt: polled, retryAt: wait)
-            }
+/// The menu's one source: it gathers the facts (model, section 2), publishes each seat's state
+/// and the one notice from them, keeps the meters on their schedule, and runs the automatic
+/// switch. All of its timing is measured on `World`'s clock: `tick()` does whatever is due at
+/// that clock's now, the app calls it every few seconds, and a test calls it after moving its clock.
+@MainActor
+final class Store: ObservableObject {
+    @Published private(set) var seats: [Seat] = []
+    @Published private(set) var notice: Notice?
+    @Published private(set) var accounts: [AccountRecord] = AccountStore.load().labelled()
+    @Published var lastUpdated: Date?
+    @Published var loading = false
+    /// The seat the sign-in window signs in again; nil adds a new one.
+    @Published var signInTarget: Seat?
+    @Published var openAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var settings = AppSettings.load() { didSet { settings.save() } }
+
+    /// How often the app runs `tick()`. Each step it runs has its own schedule; this only sets
+    /// how soon a due step is noticed.
+    static let tickEvery: TimeInterval = 5
+    /// A click on Refresh re-reads a seat no sooner than this after its last read, the spacing
+    /// Claude itself uses for retries.
+    static let manualReadSpacing: TimeInterval = 20
+    /// How long a success stays in the notice.
+    static let successFor: TimeInterval = 10
+
+    private var log = LogReader()
+    private var running = false
+    private var trusted = World.claude.trusted
+    private var meters = PairFile<SeatMeters>(name: "meters.json").load()
+    private var stops = PairFile<StopMark>(name: "stops.json").load()
+    private var failedTargets: [Identity: Date] = [:]
+    /// When each seat's meters were last asked for, and when the service lets it be asked again.
+    private var askedAt: [Identity: Date] = [:]
+    private var retryAt: [Identity: Date] = [:]
+    private var forced: Set<Identity> = []
+    /// The hold whose login was saved, so each settled hold is saved once.
+    private var savedHold: Hold?
+    /// Chats already resumed in place, so a wait resumes each stopped chat once.
+    private var resumed: Set<String> = []
+    private var switchingTo: SwitchFacts?
+    private var failure: String?
+    private var success: (text: String, until: Date)?
+    private var ticking = false
+    private var timer: Timer?
+    private(set) var switchTask: Task<Void, Never>?
+
+    init() { publish() }
+
+    /// Start the app's own ticking. Tests never call this: they call `tick()` themselves.
+    func start() {
+        timer = Timer.scheduledTimer(withTimeInterval: Self.tickEvery, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.tick() }
         }
-        UsageCache.save(entries)
+        Task { await tick() }
     }
 
-    // MARK: Auto-switch
+    // MARK: The facts
 
-    /// Run the auto-switch rule, and switch with nobody at the Mac when it says so. Claude's log
-    /// is read first, so a chat Claude stops for usage is acted on at the next tick. The attempt
-    /// is logged before it starts, so the cool-down holds even if this app quits partway.
-    func considerAutoSwitch() {
-        guard settings.autoSwitch, switching == nil else { return }
-        inUse = logWatcher.poll()
+    /// Everything the model reads, as of `now` (model, section 2).
+    func facts(now: Date = World.now()) -> Facts {
+        var f = Facts()
+        f.rows = accounts.inMenuOrder
+        f.claude = ClaudeFacts(installed: World.claude.installed, running: running, recognised: true)
+        f.log = log.events
+        f.saved = Dictionary(accounts.compactMap(LoginSlot.saved), uniquingKeysWith: max)
+        f.meters = meters
+        f.stops = stops
+        f.failedTargets = failedTargets
+        f.switching = switchingTo
+        f.trusted = trusted
+        f.autoChosen = settings.autoSwitch
+        f.waitingChats = waitingChats(f).count
+        return f
+    }
+
+    /// Chats of the current run that Claude stopped for usage and that were not resumed yet.
+    private func waitingChats(_ f: Facts) -> Set<String> {
+        guard f.hold != nil else { return [] }
+        return f.log.stoppedChats.byLimit.subtracting(resumed)
+    }
+
+    /// Rebuild the rows and the notice from the facts.
+    private func publish(now: Date = World.now()) {
+        let f = facts(now: now)
+        if let s = success, s.until <= now { success = nil }
+        seats = Seats.build(f, now: now)
+        notice = AppState.notice(f, now: now, failure: failure, success: success?.text)
+    }
+
+    var firstRun: Bool { accounts.isEmpty }
+
+    /// The fuller meter of the seat in use: the menu bar's gauge.
+    var titleMeter: MeterReading? { seats.first { $0.state == .inUse }?.meters.fuller }
+
+    // MARK: Tick
+
+    /// Do everything due at the clock's now: read the new log lines and Claude's process, record
+    /// new usage stops, save a newly settled hold's login, read the meters that are due, then run
+    /// the automatic decision. An automatic switch it starts is awaited.
+    func tick() async {
+        guard !ticking else { return }
+        ticking = true
+        defer { ticking = false }
+        observe()
+        await saveSettledHold()
+        await readDueMeters()
+        publish()
+        await decide()
+        publish()
+    }
+
+    /// Read the facts that cost nothing: rows, Claude's process, its new log lines, Accessibility.
+    private func observe() {
+        accounts = AccountStore.load().labelled()
+        running = !ClaudeApp.pids().isEmpty
+        trusted = World.claude.trusted
+        log.poll()
+        recordStops()
+    }
+
+    /// Each settled usage stop becomes the seat's stop mark, with the reset of the reading taken
+    /// at the stop (model, section 4). A meter read follows the stop and completes the mark.
+    private func recordStops() {
+        var changed = false
+        for e in log.events.events where e.settled {
+            guard case .limitStop = e.event, let seat = e.held, e.at > (stops[seat]?.at ?? .distantPast) else { continue }
+            stops[seat] = StopMark(at: e.at, resetsAt: meters[seat]?.fullUntil(at: e.at) ?? meters[seat]?.fuller?.resetsAt)
+            forced.insert(seat)
+            changed = true
+        }
+        if changed { PairFile<StopMark>(name: "stops.json").save(stops) }
+    }
+
+    /// Save the login of a hold once it settles while Claude runs, so the seat Claude is on gets
+    /// one without a switch (13a.2). With no rows yet, the held seat becomes the first row (13a.6).
+    private func saveSettledHold() async {
         let now = World.now()
-        let all = candidates(now: now)
-        let current = accounts.row(for: inUse).flatMap { row in all.first { $0.id == row.id } }
-        // The log's stops once Claude settled on the account it names, which is `inUse`.
-        let stopped = !logWatcher.log.stoppedWhileSettled.isEmpty
-        // Only look for Claude's process once Claude has stopped a chat; `ps` is the reliable check.
-        let decision = AutoSwitchRule.decide(current: current, rows: all, enabled: true, limitStopped: stopped,
-                                             claudeRunning: stopped && !ClaudeApp.pids().isEmpty,
-                                             lastAttempt: AutoSwitchLog.lastAttempt(), now: now)
-        switch decision {
-        case .stay:
-            if !stopped { toldNowhereFor = nil }
-        case .nowhere(let why):
-            // Once per account running out, not on every tick while it stays out.
-            guard toldNowhereFor != current?.id else { return }
-            toldNowhereFor = current?.id
-            keep(why)
-            Notify.post("Claude Accounts didn't switch", why)
-        case .switchTo(let id, let reason):
-            guard let target = accounts.first(where: { $0.id == id }), let current else { return }
-            toldNowhereFor = nil
-            AutoSwitchLog.started(now, leaving: current.id, outUntil: AutoSwitchRule.outUntil(leaving: current, now: now))
-            flash(reason, for: 10)
-            runSwitch(notify: reason) { await SwitchEngine.run(to: target, accounts: $0, unattended: true, progress: $1, switched: $2) }
+        guard running, switchingTo == nil, let hold = log.events.hold, hold.settled(at: now), savedHold != hold else { return }
+        if accounts.isEmpty { addSeat(hold.seat) }
+        guard let row = accounts.first(where: { $0.identity == hold.seat }),
+              SwitchJournal.load() == nil, let lock = SwitchLock.acquire(newGeneration: false) else { return }
+        defer { lock.release() }
+        do {
+            try await LoginSlot.capture(row, as: hold.seat, whileRunning: true)
+            savedHold = hold
+        } catch SwitchError.cookiesChanging {
+            // Tried again on the next tick.
+        } catch {
+            savedHold = hold
         }
     }
 
-    /// Every row as the auto-switch rule sees it, from what the menu shows, in menu order.
-    private func candidates(now: Date) -> [SwitchCandidate] {
-        let outUntil = AutoSwitchLog.outUntil(now: now)
-        return accounts.inMenuOrder.map { acct in
-            var fiveHour: UsageWindow?, weekly: UsageWindow?, taken: Date?
-            if case .ok(_, let fh, let wk, _) = states[acct.id] { fiveHour = fh; weekly = wk; taken = readAt[acct.id] }
-            return SwitchCandidate(acct, fiveHour: fiveHour, weekly: weekly, readAt: taken,
-                                   needsSignIn: states[acct.id]?.needsSignIn ?? false, hasSavedLogin: hasSavedLogin(acct),
-                                   outUntil: outUntil[acct.id])
+    // MARK: Meters
+
+    /// The seats whose meters are due (model, section 5): never read, older than meterEvery, a
+    /// reset passed since the reading, a settled turn ended since it (at most once per
+    /// meterOnTurnEnd), a stop since it, or asked for. A rate-limit wait is always honoured.
+    private func dueSeats(now: Date) -> [AccountRecord] {
+        accounts.filter { row in
+            guard let seat = row.identity else { return false }
+            if let until = retryAt[seat], until > now { return false }
+            if forced.contains(seat) { return true }
+            guard let asked = askedAt[seat] else { return true }
+            let since = now.timeIntervalSince(asked)
+            if since >= Limits.meterEvery { return true }
+            let readAt = meters[seat]?.readAt ?? .distantPast
+            let resets = [meters[seat]?.fiveHour?.resetsAt, meters[seat]?.weekly?.resetsAt].compactMap { $0 }
+            if resets.contains(where: { readAt < $0 + Limits.meterAfterReset && $0 + Limits.meterAfterReset <= now }) { return true }
+            if let ended = log.events.lastTurnEnd(on: seat), ended >= readAt, since >= Limits.meterOnTurnEnd { return true }
+            return false
         }
     }
 
-    /// The row the next automatic switch would go to, which the menu marks; nil while auto-switch
-    /// is off or Claude uses no row this app knows.
-    var nextRow: String? {
-        guard settings.autoSwitch, let row = accounts.row(for: inUse) else { return nil }
-        let all = candidates(now: World.now())
-        guard let current = all.first(where: { $0.id == row.id }) else { return nil }
-        return AutoSwitchRule.next(after: current, in: all, now: World.now())?.id
+    private func readDueMeters() async {
+        let now = World.now()
+        let due = dueSeats(now: now)
+        guard !due.isEmpty else { return }
+        loading = true
+        defer { loading = false }
+        for row in due { if let seat = row.identity { askedAt[seat] = now; forced.remove(seat) } }
+        let results = await withTaskGroup(of: (Identity, AccountState).self) { group in
+            for row in due { if let seat = row.identity { group.addTask { (seat, await Usage.reader.state(for: row)) } } }
+            var all: [(Identity, AccountState)] = []
+            for await r in group { all.append(r) }
+            return all
+        }
+        let readAt = World.now()
+        for (seat, state) in results { record(state, for: seat, at: readAt) }
+        lastUpdated = readAt
+        PairFile<SeatMeters>(name: "meters.json").save(meters)
     }
 
-    /// Turn auto-switch on or off. Turning it on is a click by the person at the Mac, so this is
+    /// A reading replaces the seat's meters; a rate limit or a failed read keeps the last one,
+    /// which goes stale on its own. The first reading after a stop sets that stop's reset.
+    private func record(_ state: AccountState, for seat: Identity, at readAt: Date) {
+        switch state {
+        case .ok(_, let fh, let wk, _):
+            let before = meters[seat]?.readAt ?? .distantPast
+            let reading = SeatMeters(fiveHour: fh.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
+                                     weekly: wk.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
+                                     readAt: readAt)
+            meters[seat] = reading
+            retryAt[seat] = nil
+            if var mark = stops[seat], before < mark.at, readAt >= mark.at, let reset = reading.fullUntil(at: mark.at) {
+                mark.resetsAt = reset
+                stops[seat] = mark
+                PairFile<StopMark>(name: "stops.json").save(stops)
+            }
+        case .rateLimited(let until):
+            retryAt[seat] = until
+        case .loading, .needsLogin, .error:
+            break
+        }
+    }
+
+    /// Opening the menu re-reads the seats that are due.
+    func refreshIfStale() { Task { await tick() } }
+
+    /// Read every seat now (Refresh), or one seat (`forcing`, after it signed in), at most once per
+    /// manualReadSpacing.
+    func refresh(forcing id: String? = nil, manual: Bool = false) {
+        let now = World.now()
+        for row in accounts where manual || row.id == id {
+            guard let seat = row.identity else { continue }
+            if now.timeIntervalSince(askedAt[seat] ?? .distantPast) >= Self.manualReadSpacing { forced.insert(seat) }
+        }
+        Task { await tick() }
+    }
+
+    // MARK: The automatic switch
+
+    /// Run the model's decision (section 4) and act on it.
+    private func decide() async {
+        let now = World.now()
+        let f = facts(now: now)
+        switch AutoSwitch.decide(f, now: now) {
+        case .none, .wait:
+            break
+        case .resumeInPlace:
+            guard let seat = f.hold?.seat else { return }
+            resumeInPlace(waitingChats(f), on: seat, now: now)
+        case .switchTo(let target):
+            guard let from = f.hold?.seat, let row = accounts.first(where: { $0.identity == target }) else { return }
+            let name = seats.first { $0.id == from }?.name ?? "The seat in use"
+            await run(to: row, kind: .auto(reason: "\(name) is out.")).value
+            // A failed target is skipped for coolDown, so deciding again tries the next one.
+            if failedTargets[target] != nil, failedTargets[target]! >= now { await decide() }
+        }
+    }
+
+    /// Type "resume" into the chats a wait stopped, now that the seat in use has room again.
+    private func resumeInPlace(_ chats: Set<String>, on seat: Identity, now: Date) {
+        guard !chats.isEmpty else { return }
+        resumed.formUnion(chats)
+        let folder = ClaudeApp.folder(seat)
+        let moved = chats.compactMap { ChatResume.chat(folder.appendingPathComponent($0 + ".json")) }
+        let resumer = ChatResume.resumer(in: folder, reopenedAt: now.timeIntervalSince1970 * 1000, progress: { _ in })
+        Task { _ = await resumer.run(moved) }
+    }
+
+    /// Turn Auto-Switch on or off. Turning it on is a click by the person at the Mac, so this is
     /// when macOS is asked to list the app under Accessibility.
     func setAutoSwitch(_ on: Bool) {
         settings.autoSwitch = on
         if on, !World.claude.trusted { QuitPrompt.requestAccess() }
         checkAccessibility()
-        considerAutoSwitch()
+        Task { await tick() }
     }
 
-    /// Read the Accessibility grant again, on every tick and each time the menu opens, so the
-    /// Allow line goes as soon as it is granted. A grant is remembered: an update changes the
-    /// app's signature, and macOS then stops trusting it while its old entry still shows as on.
+    /// Read the Accessibility grant again each time the menu opens, so its notice goes as soon
+    /// as it is granted.
     func checkAccessibility() {
-        let trusted = World.claude.trusted
-        if trusted { UserDefaults.standard.set(true, forKey: Self.grantedBeforeKey) }
-        if accessibilityGranted != trusted { accessibilityGranted = trusted }
+        let now = World.claude.trusted
+        guard now != trusted else { return }
+        trusted = now
+        publish()
     }
-
-    private static let grantedBeforeKey = "accessibilityGrantedBefore"
-
-    /// An earlier build had Accessibility, so its entry in System Settings is the stale one.
-    var accessibilityGrantedBefore: Bool { UserDefaults.standard.bool(forKey: Self.grantedBeforeKey) }
 
     func openAccessibilitySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
@@ -1588,42 +1675,87 @@ final class Store: ObservableObject {
         }
     }
 
-    /// Show a short status line that clears itself.
-    func flash(_ text: String, for seconds: Double = 5) {
-        message = text
-        messageStays = false
-        messageEndsWithSetUp = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
-            if self?.message == text, self?.messageStays == false { self?.message = nil }
+    // MARK: The notice
+
+    func noticeAction(_ action: NoticeAction) {
+        switch action {
+        case .openAccessibility:
+            QuitPrompt.requestAccess()
+            openAccessibilitySettings()
+        case .addSeat:
+            if running, let hold = log.events.hold { addSeat(hold.seat) }
+        }
+        publish()
+    }
+
+    func closeNotice() {
+        failure = nil
+        success = nil
+        publish()
+    }
+
+    // MARK: Rows
+
+    /// Add the seat Claude holds as a row. Its name is its account's, when another row has that
+    /// account; the person can rename it. Its meters need a Claude Code sign-in, from Sign In.
+    private func addSeat(_ seat: Identity) {
+        guard !accounts.contains(where: { $0.identity == seat }) else { return }
+        let id = UUID().uuidString
+        let sibling = accounts.first { $0.accountUuid == seat.account }
+        var record = AccountRecord(id: id, name: "", color: "",
+                                   configDir: Paths.stateDir.appendingPathComponent("accounts/\(id)").path
+                                       .replacingOccurrences(of: Paths.home.path, with: "~"),
+                                   keychainService: Keychain.service(forConfigDir: Paths.stateDir.appendingPathComponent("accounts/\(id)")),
+                                   email: nil, accountUuid: seat.account, orgName: nil, orgUuid: seat.org)
+        record.name = sibling.map { accounts.accountName(for: $0) } ?? "Seat \(accounts.count + 1)"
+        save(accounts + [record])
+    }
+
+    private func record(for seat: Seat) -> AccountRecord? { accounts.first { $0.identity == seat.id } }
+
+    /// The row the sign-in window signs in again.
+    var signInRecord: AccountRecord? { signInTarget.flatMap(record(for:)) }
+
+    /// Rename a seat, or its organization; an empty name puts the default back.
+    func rename(_ seat: Seat, to name: String, organization: Bool) {
+        guard let row = record(for: seat) else { return }
+        save(AccountStore.load().renamed(row, to: name, organization: organization))
+    }
+
+    /// Move a seat one place up (-1) or down (1): an organization among its account's, any other
+    /// seat with its whole account. The order is the automatic switch's order.
+    func move(_ seat: Seat, by step: Int, organization: Bool) {
+        guard let row = record(for: seat), let moved = AccountStore.load().moved(row, by: step, organization: organization) else { return }
+        save(moved)
+    }
+
+    func canMove(_ seat: Seat, by step: Int, organization: Bool) -> Bool {
+        guard let row = record(for: seat) else { return false }
+        return accounts.moved(row, by: step, organization: organization) != nil
+    }
+
+    /// Sign the seat's Claude Code login out, delete it and its saved login, and drop the row.
+    /// Its chats stay in Claude's folder for that pair.
+    func remove(_ seat: Seat) {
+        guard let row = record(for: seat) else { return }
+        Task {
+            _ = await ClaudeCLI.run(configDir: row.configURL, ["auth", "logout"])
+            if await Keychain.credential(service: row.keychainService) != nil { await Keychain.delete(service: row.keychainService) }
+            try? FileManager.default.removeItem(at: row.configURL)
+            try? FileManager.default.removeItem(at: LoginSlot.dir(row))
+            self.meters[seat.id] = nil
+            self.save(AccountStore.load().filter { $0.id != row.id })
         }
     }
 
-    /// Show a status line that stays until it is closed or the next message replaces it, or, for
-    /// an instruction to set up a row, until that row is set up: a failure or a step to take in
-    /// Claude must still be there when the menu is next opened.
-    func keep(_ text: String, untilSetUp row: String? = nil) {
-        message = text
-        messageStays = true
-        messageEndsWithSetUp = row
-    }
-
-    /// A set-up instruction is done once its row is in use in Claude or has a saved login.
-    private func endSetUpMessageIfDone() {
-        guard let id = messageEndsWithSetUp else { return }
-        guard let row = accounts.first(where: { $0.id == id }) else { return closeMessage() }
-        if hasSavedLogin(row) { closeMessage() }
-    }
-
-    func closeMessage() {
-        message = nil
-        messageStays = false
-        messageEndsWithSetUp = nil
-    }
-
-    /// What a switch or a set up reports: a success clears itself, a failure or an instruction stays.
-    func show(_ outcome: SwitchOutcome) {
-        if outcome.ok, outcome.setsUp == nil, outcome.notResumed.isEmpty { flash(outcome.message, for: 10) }
-        else { keep(outcome.messageWithChatsLeft, untilSetUp: outcome.setsUp) }
+    private func save(_ all: [AccountRecord]) {
+        do {
+            try AccountStore.save(all)
+            accounts = all.labelled()
+        } catch {
+            failure = "Couldn't save the seats: \(error.localizedDescription)"
+        }
+        publish()
     }
 
     /// Register or unregister as a macOS login item; it appears in System Settings > Login Items.
@@ -1632,129 +1764,88 @@ final class Store: ObservableObject {
         do {
             if service.status == .enabled { try service.unregister() } else { try service.register() }
         } catch {
-            flash("Could not change Open at Login: \(error.localizedDescription)")
+            failure = "Couldn't change Open at Login: \(error.localizedDescription)"
         }
-        if service.status == .requiresApproval {
-            flash("Allow Claude Accounts in System Settings > Login Items.")
-            SMAppService.openSystemSettingsLoginItems()
-        }
+        if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
         openAtLogin = service.status == .enabled
-    }
-
-    /// Rename the row that was clicked: an organization entry renames its organization, any
-    /// other row renames its account. An empty name puts the default name back.
-    func rename(_ acct: AccountRecord, to name: String, organization: Bool) {
-        save(AccountStore.load().renamed(acct, to: name, organization: organization))
-    }
-
-    /// Give an account a new color, on every one of its rows; each row keeps its place in the list.
-    func recolor(_ acct: AccountRecord, _ color: String) {
-        var all = AccountStore.load()
-        for i in all.indices where all[i].id == acct.id || (acct.accountUuid != nil && all[i].accountUuid == acct.accountUuid) {
-            all[i].color = color
-        }
-        save(all)
-    }
-
-    /// Move a row one place up (`step` -1) or down (`step` 1) in the menu, which is the order
-    /// auto-switch tries the rows in: an organization entry among its account's organizations,
-    /// any other row with its whole account.
-    func move(_ acct: AccountRecord, by step: Int, organization: Bool) {
-        if let moved = AccountStore.load().moved(acct, by: step, organization: organization) { save(moved) }
-    }
-
-    private func save(_ all: [AccountRecord]) {
-        do {
-            try AccountStore.save(all)
-            accounts = all.labelled()
-        } catch {
-            flash("Could not save: \(error.localizedDescription)")
-        }
+        publish()
     }
 
     // MARK: Switching
 
-    /// One click: quit Claude, save the current account's login, load the target's, move the
-    /// open Code sessions into the target's folder, and reopen Claude as the target.
-    func switchTo(_ target: AccountRecord) { runSwitch { await SwitchEngine.run(to: target, accounts: $0, progress: $1, switched: $2) } }
+    enum SwitchKind { case manual, setUp, auto(reason: String) }
 
-    /// Reopen Claude at its sign-in page for an account that has no saved Claude login yet.
-    func setUp(_ target: AccountRecord) { runSwitch { await SwitchEngine.setUp(target, accounts: $0, progress: $1, switched: $2) } }
+    /// Switch Claude to a seat. A manual switch never checks room: it is the person's call.
+    func switchTo(_ seat: Seat) {
+        guard let row = record(for: seat) else { return }
+        _ = run(to: row, kind: .manual)
+    }
 
-    /// `notify` posts the outcome as a notification after that reason, for a switch auto-switch
-    /// started with nobody watching. Switch is free again once the switch itself is done
-    /// (`switched`); the resume that follows shows its steps on the status line, and its outcome
-    /// is shown unless another switch overtook it.
-    private func runSwitch(notify reason: String? = nil,
-                           _ body: @escaping ([AccountRecord], @escaping SwitchEngine.Progress,
-                                              @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome) {
-        guard switching == nil else { return }
-        switching = "Starting…"
+    /// Switch Claude to a seat with no saved login, at its sign-in page.
+    func setUp(_ seat: Seat) {
+        guard let row = record(for: seat) else { return }
+        _ = run(to: row, kind: .setUp)
+    }
+
+    /// Wait for the switch in progress, if any, to end.
+    func finishSwitch() async { await switchTask?.value }
+
+    /// Run one switch; a second request while one runs is refused with a notice.
+    @discardableResult
+    private func run(to row: AccountRecord, kind: SwitchKind) -> Task<Void, Never> {
+        if let busy = switchTask, let to = switchingTo {
+            failure = "Already switching to \(seats.first { $0.id == to.target }?.name ?? "a seat")."
+            publish()
+            return busy
+        }
+        guard let target = row.identity else { return Task {} }
+        failure = nil
+        success = nil
+        switchingTo = SwitchFacts(target: target, step: "Starting…")
+        publish()
         let all = accounts
-        let phase = SwitchPhase()
-        Task {
-            let outcome = await body(all, { step in
-                Task { @MainActor in if phase.freed { self.keep(step) } else { self.switching = step } }
-            }, { switched in
-                await MainActor.run {
-                    phase.freed = true
-                    self.switching = nil
-                    self.keep(switched.message)
-                    self.inUse = self.logWatcher.poll()
-                }
-            })
-            if !phase.freed { self.switching = nil }
-            guard !outcome.superseded else { return }
-            self.show(outcome)
-            self.inUse = self.logWatcher.poll()
-            if let reason {
-                AutoSwitchLog.finished(outcome.message)
-                Notify.outcome(outcome, reason: reason)
+        let progress: SwitchEngine.Progress = { step in
+            Task { @MainActor in
+                guard self.switchingTo?.target == target else { return }
+                self.switchingTo?.step = step
+                self.publish()
             }
         }
-    }
-
-    /// Sign the account's private login out, forget it, and delete its folder.
-    func remove(_ acct: AccountRecord) {
-        Task {
-            _ = await ClaudeCLI.run(configDir: acct.configURL, ["auth", "logout"])
-            if await Keychain.credential(service: acct.keychainService) != nil {
-                await Keychain.delete(service: acct.keychainService)
-            }
-            try? FileManager.default.removeItem(at: acct.configURL)
-            try? FileManager.default.removeItem(at: LoginSlot.dir(acct))
-            let remaining = AccountStore.load().filter { $0.id != acct.id }
-            do {
-                try AccountStore.save(remaining)
-                self.accounts = remaining
-                self.states[acct.id] = nil
-                self.flash("Removed \(acct.label).")
-            } catch {
-                self.flash("Could not save accounts: \(error.localizedDescription)")
+        let switched: (SwitchOutcome) async -> Void = { _ in
+            await MainActor.run {
+                self.switchingTo = nil
+                self.log.poll()
+                self.publish()
             }
         }
+        let task = Task {
+            let outcome: SwitchOutcome
+            switch kind {
+            case .setUp: outcome = await SwitchEngine.setUp(row, accounts: all, progress: progress, switched: switched)
+            case .manual: outcome = await SwitchEngine.run(to: row, accounts: all, progress: progress, switched: switched)
+            case .auto: outcome = await SwitchEngine.run(to: row, accounts: all, unattended: true, progress: progress, switched: switched)
+            }
+            self.finished(outcome, target: target, kind: kind)
+        }
+        switchTask = task
+        return task
     }
 
-    /// The in-use account's reading for the limit the menu bar follows.
-    var inUseWindow: UsageWindow? {
-        guard let current = accounts.first(where: isInUse),
-              case .ok(_, let fh, let wk, _) = states[current.id] else { return nil }
-        return MeterRule.gauge(settings.metric, fiveHour: fh, weekly: wk)
-    }
-
-    /// Show or fold away the organizations of an account in the menu; settings.json keeps it.
-    func setShowsOrganizations(of account: String, _ shown: Bool) {
-        settings.setShowsOrganizations(of: account, shown)
-    }
-
-    /// Gauge position, 0...1; a third before any reading so the glyph still looks like a gauge.
-    var menuBarFraction: Double { inUseWindow.map { Double($0.pct) / 100 } ?? 1.0 / 3 }
-
-    /// Text beside the gauge, per the Menu Bar Shows setting; empty means gauge only.
-    var menuBarTitle: String {
-        guard let window = inUseWindow, settings.display != .gauge,
-              let current = accounts.first(where: isInUse) else { return "" }
-        return settings.display == .gaugePercent ? "\(window.pct)%" : "\(current.label) \(window.pct)%"
+    private func finished(_ outcome: SwitchOutcome, target: Identity, kind: SwitchKind) {
+        let now = World.now()
+        switchingTo = nil
+        switchTask = nil
+        observe()
+        if outcome.ok, outcome.setsUp == nil, outcome.notResumed.isEmpty {
+            success = (outcome.message, now + Self.successFor)
+        } else if !outcome.superseded {
+            failure = outcome.messageWithChatsLeft
+        }
+        if case .auto(let reason) = kind {
+            if !outcome.ok { failedTargets[target] = now }
+            Notify.outcome(outcome, reason: reason)
+        }
+        publish()
     }
 }
 
@@ -1937,12 +2028,10 @@ final class LoginFlow: ObservableObject {
         }
         let orgName = profile["organizationName"] as? String
         let account = accounts.first { $0.accountUuid != nil && $0.accountUuid == profile["accountUuid"] as? String }
-        let usedColors = Set(accounts.map(\.color))
         var record = AccountRecord(
             id: draft.id,
             name: "",
-            // Another organization of a known account keeps that account's color.
-            color: account?.color ?? presetColors.first { !usedColors.contains($0) } ?? presetColors[accounts.count % presetColors.count],
+            color: account?.color ?? "",
             configDir: draft.dir.path.replacingOccurrences(of: Paths.home.path, with: "~"),
             keychainService: service,
             email: email,
@@ -2214,16 +2303,22 @@ enum Entry {
 }
 
 struct ClaudeAccountsApp: App {
-    @StateObject private var store = Store()
+    @StateObject private var store: Store
 
-    init() { Notify.requestPermission() }
+    init() {
+        Notify.requestPermission()
+        let store = Store()
+        store.start()
+        _store = StateObject(wrappedValue: store)
+    }
 
     var body: some Scene {
         MenuBarExtra {
             MenuContent(store: store)
         } label: {
-            Image(nsImage: menuBarImage(title: store.menuBarTitle, fraction: store.menuBarFraction,
-                                        warning: store.needsAttention))
+            Image(nsImage: menuBarImage(title: store.titleMeter.map { "\(Int($0.percent.rounded()))%" } ?? "",
+                                        fraction: store.titleMeter.map { $0.percent / 100 } ?? 1.0 / 3,
+                                        warning: store.notice?.kind == .failure))
         }
         .menuBarExtraStyle(.window)
 
