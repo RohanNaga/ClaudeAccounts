@@ -881,7 +881,16 @@ enum OutRule {
 // MARK: The automatic switch
 
 enum AutoSwitch {
-    enum Status: Equatable { case on, offAccessibility, offShapeMissing(ClaudeShape), offByPerson }
+    enum Status: Equatable {
+        case on, offAccessibility, offShapeMissing(ClaudeShape), offByPerson
+
+        /// A wait still ends in place. A shape miss pauses switching on its own, not that end:
+        /// the chats are then named instead of typed into, as after a switch (section 8 B).
+        var endsWaits: Bool {
+            if case .offShapeMissing = self { return true }
+            return self == .on
+        }
+    }
 
     static func status(_ f: Facts) -> Status {
         if !f.autoChosen { return .offByPerson }
@@ -947,11 +956,13 @@ enum AutoSwitch {
     }
 
     static func decide(_ f: Facts, now: Date) -> Decision {
-        guard status(f) == .on, f.switching == nil, let hold = f.hold, hold.settled(at: now),
+        let status = status(f)
+        guard status.endsWaits, f.switching == nil, let hold = f.hold, hold.settled(at: now),
               f.rows.contains(where: { $0.identity == hold.seat }) else { return .none }
         guard isDone(hold.seat, f, now: now) else {
             return f.waitingChats > 0 && hasRoom(hold.seat, f, now: now) ? .resumeInPlace : .none
         }
+        guard status == .on else { return .none }
         if let t = target(from: hold.seat, f, now: now) { return .switchTo(t) }
         let resets = f.rows.compactMap(\.identity).compactMap { s in OutRule.until(s, f, now: now).map { (s, $0) } }
         let first = resets.min { $0.1 < $1.1 }

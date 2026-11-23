@@ -1646,10 +1646,12 @@ final class Store: ObservableObject {
         World.claude.notify(title: "Every seat is out", body: "Chats resume when \(name) resets\(when).")
     }
 
-    /// Type "resume" into the chats a wait stopped, now that the seat in use has room again.
+    /// Type "resume" into the chats a wait stopped, now that the seat in use has room again. While a
+    /// Claude shape is missing nothing is typed: the chats are named instead, as after a switch (8 B).
     private func resumeInPlace(_ chats: Set<String>, on seat: Identity, now: Date) {
         guard !chats.isEmpty else { return }
         for chat in chats { resumed[chat] = now; waiting[chat] = nil }
+        guard ShapeMisses.load().isEmpty else { return needMessage(chats.count) }
         let folder = ClaudeApp.folder(seat)
         let moved = chats.compactMap { ChatResume.chat(folder.appendingPathComponent($0 + ".json")) }
         let resumer = ChatResume.resumer(in: folder, reopenedAt: now.timeIntervalSince1970 * 1000, progress: { _ in })
@@ -1929,8 +1931,14 @@ final class Store: ObservableObject {
 
     /// The chats a switch brought over were resumed: name any that still need a message.
     private func resumeEnded(_ outcome: SwitchOutcome) {
-        guard !outcome.superseded, !outcome.notResumed.isEmpty else { return }
-        let n = outcome.notResumed.count
+        guard !outcome.superseded else { return }
+        needMessage(outcome.notResumed.count)
+    }
+
+    /// One line names the stopped chats the app could not get running: the person sends them a
+    /// message (sections 7 and 12).
+    private func needMessage(_ n: Int) {
+        guard n > 0 else { return }
         failure = "Couldn't resume \(n) chat\(n == 1 ? "" : "s"): send \(n == 1 ? "it" : "them") a message."
     }
 
