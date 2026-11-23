@@ -378,7 +378,7 @@ let autoFaultScenarios: [Scenario] = [
         checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
         // The prompt had no Quit anyway button: a missing shape turns resume off.
         h.check(h.claude.sent.isEmpty, "B: no resume typed while the quit button's shape is missing (8); typed \(h.claude.sent)")
-        // Ruling on 22cef17: with resume off, the chats are named instead.
+        // Section 12: with resume off, the chats are named instead.
         await h.run(until: { lines.note(h); return lines.has("Couldn't resume") }, limit: ClaudeTiming.settle + 35 * 60)
         h.check(lines.has("Couldn't resume 1 chat: send it a message."), "the stopped chat is named while the shape miss stands (8, 12); saw \(lines.seen)")
         h.check(h.claude.sent.isEmpty, "still nothing typed: \(h.claude.sent)")

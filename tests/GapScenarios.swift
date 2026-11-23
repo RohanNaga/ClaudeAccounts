@@ -1,7 +1,8 @@
 import Foundation
 
-// Scenarios for model rules the scenario review (ca-reviewer-a, 2026-11-23) found with no pair.
-// Each is written from the model's words, and each check fails if the app does the wrong thing.
+// Scenarios for model rules that no pair in Scenarios.swift covered, and for decisions that were
+// checked only on their happy path. Each is written from the model's words, and each check fails
+// if the app does the wrong thing.
 
 @MainActor extension Harness {
     var now: Date { clock.now() }
@@ -245,7 +246,6 @@ let gapScenarios: [Scenario] = [
         h.check(!h.resumed("local_two"), "the idle chat got nothing: \(h.claude.sent)")
     },
 
-    // Pairs the second scenario review (ca-reviewer-b, 2026-11-23) found missing.
     // 11. Section 7 row 2 and section 5 confirmWait: Set Up where nobody signs in.
     Scenario(pair: "(Set Up on T, nobody signs in)", model: "7: a 10 min timeout rolls back; 5 confirmWait: 10 min for Set Up") { h in
         try? h.rows([("Alpha", A), ("Beta", B)])
@@ -394,7 +394,7 @@ let gapScenarios: [Scenario] = [
         h.check(h.claude.at("launch").count == 2, "no second switch, only the switch's launch and the undo's: \(h.claude.actions)")
     },
 
-    // Decisions the third scenario review (ca-reviewer-c, 2026-11-23) found checked only on their happy path.
+    // From here, decisions that a deliberately wrong app could pass on their happy path alone.
     // 19. Decision and 6.7: a manual switch carries every waiting chat, not only those Claude's run shows stopped.
     Scenario(pair: "(Waiting after a wrap-up, click Switch on T)", model: "decision and 6.7: a manual switch takes the waiting chats with it; the wrapped-up chat gets one resume on T") { h in
         await h.standard()
@@ -464,4 +464,61 @@ let gapScenarios: [Scenario] = [
         h.check(h.noticeHas(pausedLine), "then the pause says why: \(h.notice)")
         checkActs(h)
     },
+
+    // 22. Sections 7 and 12: a wait that ends in place gives up on a chat Claude never shows, and names it.
+    Scenario(pair: "(Waiting, the seat in use resets, the chat's message box not on screen)", model: "4 and 7: the wait ends in place; 7: open the chat by its link and retry every 60 s for 30 min, then name it, as after a switch") { h in
+        await h.standard(onScreen: false)
+        let resetA = await waitUntilAlphaResets(h)
+        let lines = Lines()
+        await h.run(until: { lines.note(h); return lines.has("Couldn't resume") }, limit: resetA.timeIntervalSince(h.now) + ClaudeTiming.meterEvery + 35 * 60)
+        let named = h.now
+        let opened = h.claude.opened.first
+        h.check(opened.map { $0 >= resetA } ?? false, "the chat was opened by its link once Alpha reset: opened \(secs(resetA, opened)) after the reset, \(h.claude.actions)")
+        h.check(lines.has("Couldn't resume 1 chat: send it a message."), "the chat the resume gave up on is named: \(lines.seen)")
+        let tried = gap(opened, named) ?? 0
+        h.check(tried >= ClaudeTiming.resumeFor - ClaudeTiming.resumeEvery && tried <= ClaudeTiming.resumeFor + 2 * ClaudeTiming.resumeEvery,
+                "it gives up 30 min after it first opened the chat, not sooner: after \(Int(tried / 60)) min")
+        h.check(h.claude.sent.isEmpty && h.quits == 0 && h.claude.held == A, "in place, on Alpha, nothing typed: typed \(h.claude.sent), \(h.claude.actions)")
+        h.check(Limits.resumeFor == ClaudeTiming.resumeFor, "resumeFor is 30 min: \(Limits.resumeFor) s")
+        h.store.closeNotice()
+        await h.pass(10 * 60)
+        h.check(!h.noticeHas("Couldn't resume") && h.claude.sent.isEmpty, "the chat is named once: \(h.notice), typed \(h.claude.sent)")
+    },
+
+    // 23. Sections 7 and 12: a wait that ends in place once Accessibility is gone names its chats.
+    Scenario(pair: "(Waiting, Accessibility removed, the seat in use resets)", model: "7: without Accessibility nothing is typed; 12: if typing \"resume\" can't work, the app names the chats that need a message") { h in
+        await h.standard()
+        let resetA = await waitUntilAlphaResets(h) { h.claude.trustedAX = false }
+        let lines = Lines()
+        await h.run(until: { lines.note(h); return lines.has("Couldn't resume") }, limit: resetA.timeIntervalSince(h.now) + 30 * 60)
+        let named = h.now
+        h.check(lines.has("Couldn't resume 1 chat: send it a message."), "once Alpha has room again the waiting chat is named: \(lines.seen)")
+        h.check(named >= resetA, "not before Alpha resets: named \(secs(resetA, named)) after the reset")
+        h.check(h.claude.sent.isEmpty && h.claude.untrustedSends.isEmpty && !h.claude.actions.contains { $0.hasPrefix("open ") },
+                "nothing opened, typed or tried without Accessibility: typed \(h.claude.sent), tried \(h.claude.untrustedSends), \(h.claude.actions)")
+        h.check(h.quits == 0 && h.claude.held == A, "in place, on Alpha: \(h.claude.actions)")
+        h.store.closeNotice()
+        await h.tick()
+        h.check(h.noticeHas("Allow Accessibility"), "the Accessibility line shows once that line is closed: \(h.notice)")
+        await h.pass(10 * 60)
+        h.check(!h.noticeHas("Couldn't resume"), "the chat is named once: \(h.notice)")
+    },
 ]
+
+/// Alpha runs out with its chat stopped while Beta and Gamma are out too, so the chat waits; then
+/// `meanwhile` runs, and Alpha's meter shows room again from its reset, off the 5 min grid. Returns
+/// Alpha's reset time.
+@MainActor private func waitUntilAlphaResets(_ h: Harness, meanwhile: () -> Void = {}) async -> Date {
+    let start = h.now
+    let resetA = start.addingTimeInterval(737)
+    h.usage.set(A, fiveHour: 100, resetsAt: resetA)
+    for s in [B, C] { h.usage.set(s, fiveHour: 100, resetsAt: start.addingTimeInterval(4 * 3600)) }
+    await h.pass(ClaudeTiming.meterEvery + 5)
+    h.claude.logLimitStop("local_one")
+    await h.pass(60)
+    h.check(h.noticeHas("Every seat is out") && h.claude.actions.isEmpty, "setup: the chat waits, every seat out: \(h.notice), \(h.claude.actions)")
+    meanwhile()
+    let usage = h.usage
+    h.clock.after(resetA.timeIntervalSince(h.now) - 5) { usage.set(A, fiveHour: 0, resetsAt: resetA.addingTimeInterval(5 * 3600)) }
+    return resetA
+}
