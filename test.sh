@@ -16,7 +16,7 @@ swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/rules-tests" \
 "$OUT/rules-tests"
 
 # The menu's status line wraps to every line it needs: a cut-off instruction can't be followed.
-status=$(grep -A4 'if let msg = store.message {' "$ROOT/app/ClaudeAccounts.swift")
+status=$(grep -A4 'if let msg = store.message {' "$ROOT/app/Views.swift")
 if ! grep -q 'Text(msg).*fixedSize(horizontal: false, vertical: true)' <<<"$status" || grep -qE 'lineLimit|truncationMode' <<<"$status"; then
   echo "FAIL: the menu's status line must wrap (fixedSize vertical, no lineLimit or truncation)"; exit 1
 fi
@@ -24,9 +24,9 @@ echo "Status line wraps: ok"
 
 # A manual switch is the person's call: a row's action comes from RowAction (tested above), which
 # never reads usage, and the switch itself never checks whether the target is out.
-section() { awk -v start="$1" '$0 ~ start {f=1; print; next} f && /^(enum|struct|final class|class|extension) / {exit} f' "$ROOT/app/ClaudeAccounts.swift"; }
-if ! grep -q 'RowAction.pick' <<<"$(section '^struct AccountRow')" \
-   || grep -qE 'isOut|atLimit|MeterRule|AutoSwitchRule' <<<"$(section '^enum SwitchEngine')"; then
+section() { awk -v start="$1" '$0 ~ start {f=1; print; next} f && /^(enum|struct|final class|class|extension) / {exit} f' "$ROOT/app/$2"; }
+if ! grep -q 'RowAction.pick' <<<"$(section '^struct AccountRow' Views.swift)" \
+   || grep -qE 'isOut|atLimit|MeterRule|AutoSwitchRule' <<<"$(section '^enum SwitchEngine' ClaudeAccounts.swift)"; then
   echo "FAIL: a row's action must come from RowAction, and a manual switch must not check the target's usage"; exit 1
 fi
 echo "Manual switch to any row: ok"
