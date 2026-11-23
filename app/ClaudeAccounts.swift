@@ -1383,6 +1383,7 @@ final class Store: ObservableObject {
         f.switching = switchingTo ?? SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "Open Claude to finish." : "Finishing…") }
         f.trusted = trusted
         f.autoChosen = settings.autoSwitch
+        f.order = settings.switchOrder
         f.waitingChats = waitingChats(f).count
         return f
     }
@@ -1631,6 +1632,12 @@ final class Store: ObservableObject {
         settings.autoSwitch = on
         if on, !World.claude.trusted { QuitPrompt.requestAccess() }
         checkAccessibility()
+        Task { await tick() }
+    }
+
+    /// Set the order the automatic switch tries seats in, and decide again with it.
+    func setSwitchOrder(_ order: SwitchOrder) {
+        settings.switchOrder = order
         Task { await tick() }
     }
 
@@ -2283,7 +2290,9 @@ enum StatusReport {
         f.failedTargets = PairFile<Date>(name: "failed-targets.json").load()
         f.switching = SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "parked until Claude opens" : "in progress") }
         f.trusted = World.claude.trusted
-        f.autoChosen = AppSettings.load().autoSwitch
+        let settings = AppSettings.load()
+        f.autoChosen = settings.autoSwitch
+        f.order = settings.switchOrder
         f.waitingChats = f.hold == nil ? 0 : log.events.stoppedChats.byLimit.count
         return f
     }
@@ -2306,6 +2315,7 @@ enum StatusReport {
         case .offByPerson: auto = "off, turned off in the menu"
         }
         out += "Automatic switching: \(auto)\n"
+        out += "Accessibility: \(f.trusted ? "granted" : "not granted")\n"
         for (i, seat) in seats.enumerated() {
             var line = "\(i + 1). \(seat.name): \(Diagnostics.stateName(seat.state))"
             if case .out(let until?) = seat.state { line += " until \(ClockText.time(until))" }

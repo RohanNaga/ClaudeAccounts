@@ -59,14 +59,22 @@ struct AccountRecord: Codable, Identifiable, Equatable {
     /// The key of this row's seat in the menu: its pair, or, while its organization is unknown,
     /// its account with an empty organization (13a.4).
     var seat: Identity { identity ?? Identity(account: accountUuid ?? id, org: "") }
+
+    /// This row is the account's own personal organization, which Claude names after its email.
+    var isPersonal: Bool { isPersonalOrganization(orgName) }
 }
 
-/// Claude names an account's own individual organization "<email>'s Organization"; the app calls
-/// it "Individual". A team organization keeps its name.
+/// Claude names an account's own personal organization "<email>'s Organization".
+func isPersonalOrganization(_ orgName: String?) -> Bool {
+    guard let orgName else { return false }
+    return orgName.contains("@") || orgName.hasSuffix("'s Organization") || orgName.hasSuffix("\u{2019}s Organization")
+}
+
+/// The app calls an account's personal organization "Individual". A team organization keeps its
+/// name.
 func defaultOrganizationName(_ orgName: String?) -> String {
     guard let orgName, !orgName.isEmpty else { return "Organization" }
-    if orgName.contains("@") || orgName.hasSuffix("'s Organization") || orgName.hasSuffix("\u{2019}s Organization") { return "Individual" }
-    return orgName
+    return isPersonalOrganization(orgName) ? "Individual" : orgName
 }
 
 /// An organization name that can name an account, which a team's name can and "Individual" can't.
@@ -317,12 +325,26 @@ enum UsageMetric: String, Codable, CaseIterable, Identifiable {
     var title: String { self == .fiveHour ? "5-Hour Limit" : "Weekly Limit" }
 }
 
+/// Which seats the automatic switch tries first. Within each group, the menu's order decides.
+enum SwitchOrder: String, Codable, CaseIterable, Identifiable {
+    case topToBottom, personalFirst, organizationsFirst
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .topToBottom: return "Top to Bottom"
+        case .personalFirst: return "Personal First"
+        case .organizationsFirst: return "Organizations First"
+        }
+    }
+}
+
 /// Menu preferences, kept in settings.json in the app's state folder.
 struct AppSettings: Codable, Equatable {
     var display: MenuBarDisplay = .gaugeNamePercent
     var metric: UsageMetric = .fiveHour
     /// Switch by itself when the account in use runs out of usage.
     var autoSwitch = true
+    var switchOrder: SwitchOrder = .topToBottom
     /// Accounts whose organizations the menu folds under the account's name. Empty at first, so
     /// every organization shows.
     var collapsed: Set<String> = []
@@ -335,6 +357,7 @@ struct AppSettings: Codable, Equatable {
         display = try c.decodeIfPresent(MenuBarDisplay.self, forKey: .display) ?? .gaugeNamePercent
         metric = try c.decodeIfPresent(UsageMetric.self, forKey: .metric) ?? .fiveHour
         autoSwitch = try c.decodeIfPresent(Bool.self, forKey: .autoSwitch) ?? true
+        switchOrder = try c.decodeIfPresent(SwitchOrder.self, forKey: .switchOrder) ?? .topToBottom
         collapsed = try c.decodeIfPresent(Set<String>.self, forKey: .collapsed) ?? []
     }
 
@@ -855,6 +878,8 @@ struct Facts {
     var trusted = false
     /// The person's Auto-Switch choice.
     var autoChosen = true
+    /// The person's order for the automatic switch.
+    var order: SwitchOrder = .topToBottom
     /// Chats stopped for usage or wrapped up that wait for a seat with room.
     var waitingChats = 0
 
@@ -916,15 +941,36 @@ enum AutoSwitch {
         return true
     }
 
-    /// Going down the menu from `from`, wrapping round: the first Ready seat with a fresh reading
-    /// that has not failed as a target within coolDown.
+    /// The order the automatic switch tries the other seats in: down the menu from `from`,
+    /// wrapping round, with the personal seats or the organization seats first when the person
+    /// chose so. This is the only place that order is decided.
+    static func order(from: Identity, _ f: Facts) -> [Identity] {
+        let rows = f.rows.filter { $0.identity != nil }
+        guard let i = rows.firstIndex(where: { $0.identity == from }) else { return [] }
+        let round = rows[(i + 1)...] + rows[..<i]
+        let ordered: [AccountRecord]
+        switch f.order {
+        case .topToBottom: ordered = Array(round)
+        case .personalFirst: ordered = round.filter(\.isPersonal) + round.filter { !$0.isPersonal }
+        case .organizationsFirst: ordered = round.filter { !$0.isPersonal } + round.filter(\.isPersonal)
+        }
+        return ordered.compactMap(\.identity)
+    }
+
+    /// In that order, the first Ready seat with a fresh reading that has not failed as a target
+    /// within coolDown.
     static func target(from: Identity, _ f: Facts, now: Date) -> Identity? {
-        let seats = f.rows.compactMap(\.identity)
-        guard let i = seats.firstIndex(of: from), seats.count > 1 else { return nil }
-        return (1..<seats.count).map { seats[(i + $0) % seats.count] }.first { s in
+        order(from: from, f).first { s in
             seatState(s, f, now: now) == .ready && (f.meters[s]?.isFresh(at: now) ?? false)
                 && !(f.failedTargets[s].map { now.timeIntervalSince($0) < Limits.coolDown } ?? false)
         }
+    }
+
+    /// The seat the automatic switch would move to if the seat Claude holds ran out now; the
+    /// menu marks it Next. Nil while automatic switching is off or Claude holds no seat.
+    static func next(_ f: Facts, now: Date) -> Identity? {
+        guard status(f) == .on, f.switching == nil, let seat = f.hold?.seat else { return nil }
+        return target(from: seat, f, now: now)
     }
 
     static func decide(_ f: Facts, now: Date) -> Decision {
@@ -951,12 +997,15 @@ struct Seat: Equatable, Identifiable {
     let state: SeatState
     let meters: SeatMeters
     let action: SeatAction?
+    /// The automatic switch would move here next (AutoSwitch.next).
+    let isNext: Bool
 }
 
 enum Seats {
     static func build(_ f: Facts, now: Date) -> [Seat] {
         let rows = f.rows
         let labels = unique(rows.map { ($0.label.isEmpty ? $0.name : $0.label, $0.organization) })
+        let next = AutoSwitch.next(f, now: now)
         return zip(rows, labels).map { row, label in
             let id = row.seat
             let state = seatState(id, f, now: now)
@@ -967,7 +1016,7 @@ enum Seats {
             case .out, .ready: action = f.claude.installed && f.switching == nil ? .switchTo : nil
             }
             return Seat(id: id, name: label, accountName: f.rows.accountName(for: row), organization: row.organization,
-                        state: state, meters: f.meters[id] ?? SeatMeters(), action: action)
+                        state: state, meters: f.meters[id] ?? SeatMeters(), action: action, isNext: id == next)
         }
     }
 
