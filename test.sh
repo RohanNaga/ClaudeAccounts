@@ -57,7 +57,7 @@ APP_SOURCES=()
 for f in "$ROOT"/app/*.swift; do
   case "$(basename "$f")" in Main.swift|make-icon.swift|make-social.swift) ;; *) APP_SOURCES+=("$f") ;; esac
 done
-SCENARIO_FILES=("$ROOT/tests/StandIn.swift" "$ROOT/tests/SeatSurface.swift" "$ROOT/tests/Scenarios.swift" "$ROOT/tests/BugScenarios.swift" "$ROOT/tests/FaultScenarios.swift")
+SCENARIO_FILES=("$ROOT/tests/StandIn.swift" "$ROOT/tests/SeatSurface.swift" "$ROOT/tests/Scenarios.swift" "$ROOT/tests/BugScenarios.swift" "$ROOT/tests/FaultScenarios.swift" "$ROOT/tests/GapScenarios.swift")
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/scenarios" "${APP_SOURCES[@]}" "${SCENARIO_FILES[@]}"
 # The resume pair drives ChatComposer's own Accessibility code against the chat fixture.
 export CHAT_FIXTURE="$OUT/prompt-fixture"

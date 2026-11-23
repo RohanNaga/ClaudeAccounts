@@ -5,6 +5,24 @@ import SwiftUI
 // red on the commit that had its bug and green once it was fixed.
 
 let bugScenarios: [Scenario] = [
+    Scenario(pair: "(Rollback, the person declines the quit)", model: "an undo that can't quit Claude waits for Claude to close, then undoes") { h in
+        await h.standard()
+        h.claude.stale = [B]
+        h.click("Beta")
+        await h.run(until: { h.claude.actions.contains("launch") }, limit: 600)
+        h.claude.quitBehaviour = .promptCancelled
+        await h.run(until: { h.noticeHas("Quit Claude to undo the switch to Beta.") }, limit: 900)
+        h.check(h.noticeHas("Quit Claude to undo the switch to Beta."), "the notice asks to quit Claude: \(h.notice)")
+        let asked = h.quits
+        await h.pass(1800)
+        h.check(h.quits == asked, "no tick asks Claude to quit again: \(h.claude.actions)")
+        h.check(h.noticeHas("Quit Claude to undo the switch to Beta."), "still waiting: \(h.notice)")
+        h.claude.stop()
+        await h.run(until: { h.claude.held == A }, limit: 900)
+        h.check(h.noticeHas("Switch to Beta undone"), "the undo finished: \(h.notice)")
+        h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "back on Alpha with its chat")
+        h.check(SwitchJournal.load() == nil, "the journal is gone")
+    },
     // Bug: a switch away saved S's login at quit even when Claude had not held S settled (fixed in c34dfc4).
     Scenario(pair: "(In use settling, click Switch on T)", model: "6.1: save S's login only if Claude holds S settled; 1: a saved login is taken while Claude held one seat settled") { h in
         await h.standard()
