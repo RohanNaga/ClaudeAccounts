@@ -132,16 +132,28 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// on the app's first look at Claude once the chats left the folder of the seat it quit on.
     var reopensAfterQuit = 0
     private var quitOn: StandSeat?
+    /// Chats Claude is running when it quits: it logs each as cut off by the quit (F3 CutByQuit).
+    var cutOnQuit: Set<String> = []
+    /// The next launch opens on this pair, whatever sign-in was loaded.
+    var opensAsOnce: StandSeat?
+    /// False: a Quit anyway press lands, but the prompt stays and Claude keeps running.
+    var quitAnywayLands = true
     /// Chats on screen, by session id, and what their composer shows.
     var screens: [String: ChatScreen] = [:]
     /// Every "resume" typed, as "<session> <text>".
     private(set) var sent: [String] = []
-    /// Every quit request and launch, in order.
-    private(set) var actions: [String] = []
+    /// Every quit request, prompt press, launch and reopen, in order, with the clock's time.
+    private(set) var timeline: [(what: String, at: Date)] = []
+    var actions: [String] { lock.withLock { timeline.map(\.what) } }
+    /// When each `what` in the timeline happened.
+    func at(_ what: String) -> [Date] { lock.withLock { timeline.filter { $0.what == what }.map(\.at) } }
+    private func did(_ what: String) { lock.withLock { timeline.append((what, clock.now())) } }
 
     // What Claude is doing.
     private(set) var pid: pid_t?
     private(set) var held: StandSeat?
+    /// The seat whose sign-in files this run of Claude started from, named yet or not.
+    private var runsOn: StandSeat?
     private(set) var promptOpen = false
     private var nextPid: pid_t = 90_000
 
@@ -267,9 +279,10 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
 
     /// Claude starts as it would from its own sign-in files, and names (or refuses) the seat.
     func start() {
-        let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; return nextPid }
+        let seat = signInOnDisk()
+        let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; runsOn = seat; return nextPid }
         log("\(ClaudeLog.appStart) }")
-        guard let seat = signInOnDisk() else {
+        guard let seat else {
             if let who = signsInAs { clock.after(60) { [weak self] in self?.signIn(who, pid: p) } }
             return
         }
@@ -298,22 +311,29 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     }
 
     /// Claude stops. A quit, the person's or the app's, writes the cookie file as Claude exits
-    /// (13a.2), so only a copy taken after the quit holds the final bytes. A crash writes nothing.
+    /// (13a.2), so only a copy taken after the quit holds the final bytes, and logs each chat the
+    /// quit cut off. A crash writes nothing. The seat it quit on is the one its files named, so a
+    /// Claude quit before it named a seat still counts as quit on that seat.
     func stop(crashed: Bool = false) {
         let was: (pid: pid_t?, seat: StandSeat?) = lock.withLock { (pid, held) }
-        if !crashed, was.pid != nil, writeMark(in: cookies) != nil {
+        guard was.pid != nil else { return }
+        if !crashed {
+            for chat in cutOnQuit.sorted() { log("\(ClaudeLog.unhealthyCycle)\(chat) (40s, \(ClaudeLog.quitReason))") }
+        }
+        if !crashed, writeMark(in: cookies) != nil {
             let mark = nextMark("quit")
             sqlite(cookies, "UPDATE cookies SET value='\(mark)' WHERE name='\(Self.writeMark)';")
             if let seat = was.seat { lock.withLock { quitMarks[seat] = mark } }
         }
-        lock.withLock { quitOn = held; pid = nil; held = nil; promptOpen = false }
+        lock.withLock { quitOn = held ?? runsOn; pid = nil; held = nil; runsOn = nil; promptOpen = false }
     }
 
     func pids() -> [pid_t] {
         guard installed else { return [] }
         let seat: StandSeat? = lock.withLock { pid == nil && reopensAfterQuit > 0 ? quitOn : nil }
         if let seat, chats(in: seat).isEmpty {
-            lock.withLock { reopensAfterQuit -= 1; quitOn = nil; actions.append("person opened") }
+            lock.withLock { reopensAfterQuit -= 1; quitOn = nil }
+            did("person opened")
             start()
         }
         return lock.withLock { pid.map { [$0] } ?? [] }
@@ -323,7 +343,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     }
 
     func requestQuit(_ p: pid_t) async {
-        lock.withLock { actions.append("quit") }
+        did("quit")
         switch quitBehaviour {
         case .quits: stop()
         case .ignores: break
@@ -336,22 +356,28 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
 
     func launch() async {
         // Launching ends the gap between quit and launch, so it is not a look at Claude.
-        let closed: Bool = lock.withLock { actions.append("launch"); quitOn = nil; return pid == nil }
+        did("launch")
+        let (closed, opensAs): (Bool, StandSeat?) = lock.withLock {
+            defer { opensAsOnce = nil }
+            quitOn = nil; return (pid == nil, opensAsOnce)
+        }
         guard installed, closed else { return }
+        if let opensAs { writeSignIn(opensAs) }
         start()
     }
 
-    func open(link: String) async { lock.withLock { actions.append("open \(link)"); opened.append(clock.now()) } }
+    func open(link: String) async { did("open \(link)") }
     /// When each chat link was opened, on the virtual clock.
-    private(set) var opened: [Date] = []
+    var opened: [Date] { lock.withLock { timeline.filter { $0.what.hasPrefix("open ") }.map(\.at) } }
 
     var trusted: Bool { trustedAX }
     func quitPromptOpen(in owners: [pid_t]) -> Bool { lock.withLock { promptOpen && promptHasQuitButton } }
-    /// Quit anyway quits Claude; Cancel closes the prompt and leaves Claude running.
+    /// Quit anyway quits Claude (unless `quitAnywayLands` is off); Cancel closes the prompt and leaves Claude running.
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool {
         guard trustedAX, lock.withLock({ promptOpen }) else { return false }
         if title == ClaudeUI.quitAnyway && !promptHasQuitButton { return false }
-        lock.withLock { actions.append("pressed \(title)") }
+        did("pressed \(title)")
+        if title == ClaudeUI.quitAnyway && !quitAnywayLands { return true }
         if title == ClaudeUI.cancel { lock.withLock { promptOpen = false } } else { stop() }
         return true
     }
