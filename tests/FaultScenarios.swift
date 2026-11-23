@@ -175,6 +175,11 @@ final class Strike: @unchecked Sendable {
         let want = step.finishes ? "Finished switching to \(targetRow)" : "Switch to \(targetRow) undone"
         h.check(held == (step.finishes ? target : A), "recovery after the kill at \(step.name) ends on \(step.finishes ? targetRow : "Alpha") (section 6)")
         h.check(lines.contains { $0.contains(want) }, "the person sees \"\(want)\" (section 7); saw \(lines)")
+        // Killed before its quit request, the switch changed nothing in Claude: the undo only clears
+        // the journal, and never asks Claude to quit again or relaunches it (decision, 6 Recovery).
+        if step.hook == "quit" {
+            h.check(h.quits == 0 && h.launches == 0, "the undo of a switch killed before its quit asks Claude nothing: \(h.claude.actions)")
+        }
     }
     if fault == .killClaude, step.hook != "quit" {
         h.check(lines.contains { $0.contains("Open Claude to finish switching to \(targetRow)") }, "the parked switch says \"Open Claude to finish switching to \(targetRow).\" (section 7); saw \(lines)")
@@ -334,6 +339,32 @@ let autoFaultScenarios: [Scenario] = [
         await runToEnd(h, lines, limit: 1800)
         checkEnds(h, [("Alpha", A)], chats: ["local_one"], lines: lines.seen)
         h.check(!h.claude.pids().isEmpty, "Claude is left running (8 A)")
+        checkActs(h)
+        // The prompt has no Quit anyway button, so the app recognises no prompt: it presses nothing,
+        // before the kill or in the recovery (decision, 8 B).
+        h.check(!h.claude.actions.contains { $0.hasPrefix("pressed") }, "B: nothing pressed on a prompt the app cannot recognise: \(h.claude.actions)")
+        await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
+    },
+    Scenario(pair: "(Automatic switch at quit, kill the app while Quit anyway doesn't land)",
+             model: "decision: the recovery of an automatic switch stopped at its quit presses Cancel on the prompt it recognises; Recovery: undone before load; 8 A") { h in
+        let lines = await autoStart(h)
+        // The prompt shows its Quit anyway button, but the press leaves it open and Claude running.
+        h.claude.quitBehaviour = .promptUnanswered
+        h.claude.quitAnywayLands = false
+        await startAuto(h)
+        await quitWaiting(h, lines)
+        h.check(h.claude.actions.contains("pressed \(ClaudeUI.quitAnyway)") && h.claude.at("pressed \(ClaudeUI.cancel)").isEmpty,
+                "setup: the switch pressed Quit anyway, the prompt stayed, nothing cancelled yet: \(h.claude.actions)")
+        let killed = h.now
+        h.crashApp(); await h.tick(); await h.settle()
+        await runToEnd(h, lines, limit: 1800)
+        let cancels = h.claude.at("pressed \(ClaudeUI.cancel)")
+        h.check(cancels.count == 1 && cancels.allSatisfy { $0 >= killed } && !h.claude.promptOpen,
+                "the recovery presses Cancel once on the prompt it recognises, so no prompt is left open: \(h.claude.actions), prompt open \(h.claude.promptOpen)")
+        h.check(h.quits == 1 && h.launches == 0, "and asks Claude nothing more: \(h.claude.actions)")
+        checkEnds(h, [("Alpha", A)], chats: ["local_one"], lines: lines.seen)
+        h.check(!h.claude.pids().isEmpty, "Claude is left running (8 A)")
+        h.check(lines.has("Switch to Beta undone"), "the person sees \"Switch to Beta undone.\" (7); saw \(lines.seen)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },

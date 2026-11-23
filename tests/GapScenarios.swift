@@ -393,4 +393,75 @@ let gapScenarios: [Scenario] = [
         h.check(h.resumed("local_one") && h.claude.held == A, "it resumes in place once Alpha resets, before Beta's cool-down ends: typed \(h.claude.sent), holds \(String(describing: h.claude.held)), \(h.claude.actions)")
         h.check(h.claude.at("launch").count == 2, "no second switch, only the switch's launch and the undo's: \(h.claude.actions)")
     },
+
+    // Decisions the third scenario review (ca-reviewer-c, 2026-11-23) found checked only on their happy path.
+    // 19. Decision and 6.7: a manual switch carries every waiting chat, not only those Claude's run shows stopped.
+    Scenario(pair: "(Waiting after a wrap-up, click Switch on T)", model: "decision and 6.7: a manual switch takes the waiting chats with it; the wrapped-up chat gets one resume on T") { h in
+        await h.standard()
+        let reset = h.now.addingTimeInterval(2 * 3600)
+        for s in [B, C] { h.usage.set(s, fiveHour: 100, resetsAt: reset) }
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        // A wrap-up writes no limit line, so the chat waits only on the app's own list.
+        h.claude.logTurnEnded("local_one")
+        h.usage.set(A, fiveHour: 100, resetsAt: reset)
+        await h.pass(120)
+        h.check(h.noticeHas("Every seat is out") && h.claude.actions.isEmpty, "setup: the wrap-up waits, every seat out: \(h.notice), \(h.claude.actions)")
+        h.click("Beta")
+        await h.run(until: { h.claude.held == B && !h.switchInFlight && h.resumed("local_one") }, limit: 600)
+        await h.pass(5 * 60)
+        h.check(h.claude.held == B && h.claude.chats(in: B).contains("local_one"), "the person's switch went to Beta with the chat: \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(h.claude.sent == ["local_one resume"], "the waiting chat gets exactly one resume on Beta: typed \(h.claude.sent), \(h.notice)")
+    },
+
+    // 20. Sections 8 B and 12: a wait that ends in place while a shape is missing names its chats.
+    Scenario(pair: "(Shape missing, the seat in use resets while its chat waits)", model: "8 B and 12: resume is off while a shape is missing; the wait ends in place by naming the chats, as after a switch; nothing typed") { h in
+        await h.standard()
+        // Alpha resets off the 5 min grid, after the automatic switch has given up on Claude's prompt.
+        let resetA = h.now.addingTimeInterval(737)
+        h.usage.set(A, fiveHour: 100, resetsAt: resetA)
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        // The prompt has no Quit anyway button: the automatic switch can't quit Claude, and that shape is missing.
+        h.claude.quitBehaviour = .promptUnanswered
+        h.claude.promptHasQuitButton = false
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.quits > 0 && !h.switchInFlight }, limit: 600)
+        h.check(h.notice == ["Claude didn't quit, so nothing changed."] && h.claude.held == A && h.claude.chats(in: A).contains("local_one"),
+                "setup: the switch gave up and the chat waits on Alpha: \(h.notice), \(h.claude.actions)")
+        let usage = h.usage
+        h.clock.after(resetA.timeIntervalSince(h.now) - 5) { usage.set(A, fiveHour: 0, resetsAt: resetA.addingTimeInterval(5 * 3600)) }
+        let lines = Lines()
+        await h.run(until: { lines.note(h); return lines.has("Couldn't resume") }, limit: 30 * 60)
+        let named = h.now
+        h.check(lines.has("Couldn't resume 1 chat: send it a message."), "once Alpha has room again the waiting chat is named: \(lines.seen)")
+        h.check(named >= resetA, "not before Alpha resets: named \(secs(resetA, named)) after the reset")
+        h.check(h.claude.sent.isEmpty && h.claude.untrustedSends.isEmpty && !h.claude.actions.contains { $0.hasPrefix("open ") },
+                "nothing opened or typed while the shape is missing: typed \(h.claude.sent), \(h.claude.actions)")
+        h.check(h.quits == 1 && h.launches == 0 && h.claude.held == A, "in place, on Alpha: \(h.claude.actions)")
+        h.store.closeNotice()
+        await h.tick()
+        h.check(h.noticeHas(pausedLine), "the pause shows once that line is closed: \(h.notice)")
+        await h.pass(10 * 60)
+        h.check(!h.noticeHas("Couldn't resume") && h.claude.sent.isEmpty, "the chat is named once, and still nothing typed: \(h.notice), typed \(h.claude.sent)")
+    },
+
+    // 21. Decision and 8 B: an automatic undo still answers Claude's prompt with Quit anyway while a shape is missing.
+    Scenario(pair: "(Automatic switch, no Named line, the undo meets Claude's quit prompt)", model: "decision: the rollback's unattended quit presses Quit anyway while a shape miss stands; 6.6 and 8 A: back on Alpha with the chat; 11: the rollback's line, then the pause") { h in
+        await h.standard()
+        // Beta's launch logs no Named line the app knows, and every quit shows Claude's prompt with its
+        // Quit anyway button, which lands.
+        h.claude.namedLineChanged = true
+        h.claude.quitBehaviour = .promptUnanswered
+        let lines = Lines()
+        await startAuto(h)
+        await runToEnd(h, lines, limit: 1800)
+        let presses = h.claude.at("pressed \(ClaudeUI.quitAnyway)"), launches = h.claude.at("launch")
+        h.check(presses.count == 2 && launches.count == 2 && presses[1] > launches[0],
+                "the switch's quit and the undo's quit each press Quit anyway, the undo's after Beta's launch: \(h.claude.actions)")
+        checkEnds(h, [("Alpha", A)], chats: ["local_one"], lines: lines.seen)
+        h.check(h.notice == ["Beta didn't open in time. Back on Alpha."], "the rollback's line holds the notice: \(h.notice)")
+        h.store.closeNotice()
+        await h.tick()
+        h.check(h.noticeHas(pausedLine), "then the pause says why: \(h.notice)")
+        checkActs(h)
+    },
 ]
