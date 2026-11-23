@@ -1,4 +1,8 @@
 import Foundation
+import Darwin
+
+/// Live child processes of this test (the app runs sqlite3 as one).
+func childProcesses() -> Int32 { proc_listchildpids(getpid(), nil, 0) }
 
 // End-to-end scenarios written from the model (claude-accounts-model, sections 6 to 9). Each is
 // named by its (state, event) pair and asserts the outcome and the line the person sees. A pair
@@ -54,18 +58,31 @@ struct Scenario {
         clock.advance(ClaudeTiming.settle + 5)
     }
 
-    func row(_ name: String) -> AccountRecord { store.accounts.first { $0.name == name }! }
 
-    /// Lets the app act on what changed, then moves time a second at a time until `done` holds or
-    /// `limit` seconds of virtual time pass. Nothing here waits on the real clock.
+    /// Lets the app's tasks run until each is asleep on the clock or done, waiting out any real
+    /// process the app started (sqlite3) by polling for its exit.
+    func settle() async {
+        for _ in 0..<200 {
+            for _ in 0..<20 { await Task.yield() }
+            if childProcesses() == 0 { for _ in 0..<20 { await Task.yield() }; if childProcesses() == 0 { return } }
+            usleep(1000)
+        }
+    }
+
+    /// Moves time a second at a time, with one app tick every 15 s as the app's own timer does,
+    /// until `done` holds or `limit` seconds of virtual time pass. Nothing waits on the real clock.
     func run(until done: () -> Bool, limit: TimeInterval = 1800) async {
         var t: TimeInterval = 0
+        await settle()
         while !done() && t < limit {
-            for _ in 0..<20 { await Task.yield() }
+            if Int(t) % 15 == 0 { await tick(); await settle() }
             clock.advance(1); t += 1
+            await settle()
         }
-        for _ in 0..<20 { await Task.yield() }
     }
+
+    /// Runs for `seconds` of virtual time.
+    func pass(_ seconds: TimeInterval) async { await run(until: { false }, limit: seconds) }
 
     func cleanUp() { claude.cleanUp() }
 }
@@ -84,29 +101,30 @@ let scenarios: [Scenario] = [
         try? h.rows([("Alpha", A), ("Beta", B)])
         try? await h.savedLogin("Beta", B)
         try? await h.savedLogin("Alpha", A)
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
         h.claudeHoldsSettled()
-        h.store = Store()
-        h.store.switchTo(h.row("Beta"))
-        h.check(h.store.switching != nil, "the row shows Switching… while the switch runs")
-        await h.run(until: { h.store.switching == nil && h.claude.held == B })
-        h.clock.advance(ClaudeTiming.settle + 5)
-        await h.run(until: { h.store.inUse == B.identity }, limit: 120)
-        h.check(h.claude.held == B, "Claude holds Beta: held \(String(describing: h.claude.held)); the app said \(h.store.message ?? "nothing"); Claude saw \(h.claude.actions)")
-        h.check(h.store.isInUse(h.row("Beta")), "Beta's row is In use")
-        if ProcessInfo.processInfo.environment["DUMP"] != nil { print((try? String(contentsOf: h.claude.logDir.appendingPathComponent(ClaudeFiles.log), encoding: .utf8)) ?? "") }
-        h.check(h.store.hasSavedLogin(h.row("Alpha")), "Alpha's saved login is intact")
+        h.make()
+        await h.tick()
+        h.check(h.state("Beta") == .ready && h.action("Beta") == .switchTo, "Beta is Ready with Switch: \(String(describing: h.state("Beta")))")
+        h.click("Beta")
+        await h.settle()
+        h.check(h.state("Beta") == .switching || !h.notice.filter { $0.hasPrefix("Switching") }.isEmpty, "Beta shows Switching… while the switch runs")
+        await h.run(until: { h.claude.held == B && h.state("Beta") == .inUse }, limit: 300)
+        h.check(h.claude.held == B, "Claude holds Beta: holds \(String(describing: h.claude.held)); notice \(h.notice)")
+        h.check(h.state("Beta") == .inUse, "Beta's row is In use")
+        h.check(h.claude.chats(in: B).contains("local_one"), "the chat moved to Beta's folder")
+        h.check(h.state("Alpha") == .ready, "Alpha keeps its saved login and is Ready: \(String(describing: h.state("Alpha")))")
     },
     Scenario(pair: "(Needs sign-in, Claude refuses (A, O))", model: "7: Refused for (A, O) only; other accounts' seats in O unaffected") { h in
         try? h.rows([("Alpha", A), ("Beta", B), ("Gamma", C)])
         try? await h.savedLogin("Gamma", C)
         try? await h.savedLogin("Alpha", A)
         h.claude.stale = [A]
-        h.claudeHoldsSettled()
-        h.store = Store()
-        await h.run(until: { false }, limit: 5)
-        h.check(h.store.isRefused(h.row("Alpha")), "Alpha shows Needs sign-in after its refusal")
-        h.check(!h.store.isRefused(h.row("Gamma")), "Gamma, another account in the same organization, is not refused")
-        h.check(h.store.hasSavedLogin(h.row("Gamma")), "Gamma keeps its saved login")
+        h.make()
+        h.claude.start()
+        await h.pass(ClaudeTiming.settle + 30)
+        h.check(h.state("Alpha") == .needsSignIn && h.action("Alpha") == .setUp, "Alpha shows Needs sign-in with Set Up: \(String(describing: h.state("Alpha")))")
+        h.check(h.state("Gamma") == .ready && h.action("Gamma") == .switchTo, "Gamma, another account in the same organization, stays Ready with Switch: \(String(describing: h.state("Gamma")))")
     },
     // Section 7 rows still to build (each asserts the outcome and the line in quotes).
     Scenario(pair: "(Needs sign-in, click Set Up on T)", model: "\"Sign in to <T> in Claude.\" then In use, or \"Claude signed in as <X>, not <T>. Back on <S>.\"", body: nil),
