@@ -8,6 +8,12 @@ enum ShownAction: Equatable { case switchTo, setUp }
 
 @MainActor extension Harness {
     func make() { store = Store() }
+    /// A saved login for a seat, taken through the app's own save while Claude is closed.
+    func savedLogin(_ row: String, _ seat: StandSeat) async throws {
+        claude.writeSignIn(seat)
+        do { try await SavedLogins.save(seat.identity) }
+        catch { check(false, "setup: saving \(row)'s login threw \(error)"); throw error }
+    }
     func tick() async { await store.tick() }
     func state(_ row: String) -> ShownState? {
         guard let s = store.seats.first(where: { $0.name == row }) else { return nil }
