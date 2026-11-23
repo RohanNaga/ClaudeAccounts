@@ -124,8 +124,6 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// on the app's first look at Claude once the chats left the folder of the seat it quit on.
     var reopensAfterQuit = 0
     private var quitOn: StandSeat?
-    /// Opens a window of its own right after launch, which a scenario uses for "the person opened Claude".
-    var personOpensClaudeDuringSwitch = 0
     /// Chats on screen, by session id, and what their composer shows.
     var screens: [String: ChatScreen] = [:]
     /// Every "resume" typed, as "<session> <text>".
@@ -230,8 +228,6 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     func logLimitStop(_ chat: String) {
         log("\(ClaudeLog.cycle)\(chat)\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit")
     }
-    func logCutByQuit(_ chat: String) { log("\(ClaudeLog.unhealthyCycle)\(chat) (40s, hadFirstResponse=true, \(ClaudeLog.quitReason))") }
-    func logSignedOut() { log(ClaudeLog.signOut[0]) }
 
     // MARK: Claude running
 

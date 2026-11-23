@@ -3,8 +3,8 @@ import Foundation
 // What the person sees, read from the Store's seats and notice (model, sections 3 and 11). The
 // scenarios assert only through this, so they stay in the model's words.
 
+/// A seat's state without its details, so a scenario compares it with ==.
 enum ShownState: Equatable { case switching, inUse, needsSignIn, out, ready }
-enum ShownAction: Equatable { case switchTo, setUp }
 
 @MainActor extension Harness {
     func make() { store = Store() }
@@ -29,13 +29,7 @@ enum ShownAction: Equatable { case switchTo, setUp }
         case .ready: return .ready
         }
     }
-    func action(_ row: String) -> ShownAction? {
-        switch store.seats.first(where: { $0.name == row })?.action {
-        case .switchTo?: return .switchTo
-        case .setUp?: return .setUp
-        case nil: return nil
-        }
-    }
+    func action(_ row: String) -> SeatAction? { seat(row)?.action }
     /// The notice's short line and its full sentence.
     var notice: [String] { [store.notice?.text, store.notice?.detail].compactMap { $0 } }
     var rowNames: [String] { store.seats.map(\.name) }
@@ -49,7 +43,7 @@ enum ShownAction: Equatable { case switchTo, setUp }
     /// The menu's measures on a screen whose visible part is `screen` points tall, from the same
     /// MenuLayout the drawn menu uses: its height, the height every row would need, and the
     /// pinned part (title bar and notice) that never scrolls.
-    func menu(screen: CGFloat) -> MenuMeasure? {
+    func menu(screen: CGFloat) -> MenuMeasure {
         let notice = store.notice != nil
         return MenuMeasure(height: MenuLayout.height(visibleScreenHeight: screen, seats: store.seats, hasNotice: notice),
                            content: MenuLayout.contentHeight(seats: store.seats, hasNotice: notice),
