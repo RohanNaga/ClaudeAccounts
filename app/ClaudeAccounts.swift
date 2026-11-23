@@ -1572,8 +1572,8 @@ final class Store: ObservableObject {
         let now = Date()
         let all = candidates(now: now)
         let current = accounts.row(for: inUse).flatMap { row in all.first { $0.id == row.id } }
-        // The log's stops belong to the account it names, which is `inUse`.
-        let stopped = !logWatcher.log.stoppedByLimit.isEmpty
+        // The log's stops once Claude settled on the account it names, which is `inUse`.
+        let stopped = !logWatcher.log.stoppedWhileSettled.isEmpty
         // Only look for Claude's process once Claude has stopped a chat; `ps` is the reliable check.
         let decision = AutoSwitchRule.decide(current: current, rows: all, enabled: true, limitStopped: stopped,
                                              claudeRunning: stopped && !ClaudeApp.pids().isEmpty,
@@ -2891,7 +2891,8 @@ enum Entry {
         }
         print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
         print("In use:             \(current?.name ?? "an account this app doesn't know")")
-        print("Stopped for usage:  \(log.stoppedByLimit.count) chat\(log.stoppedByLimit.count == 1 ? "" : "s") in Claude's log")
+        let settledStops = log.stoppedWhileSettled.count
+        print("Stopped for usage:  \(settledStops) chat\(settledStops == 1 ? "" : "s") in Claude's log since it settled on this row")
         // The menu's order is the switch order: down from the row in use, wrapping round to the top.
         let next = current.flatMap { AutoSwitchRule.next(after: $0, in: all, now: now) }
         print("Switch order, as in the menu:")
@@ -2902,7 +2903,7 @@ enum Entry {
         print("Next switch goes to: \(next?.name ?? (current == nil ? "no row: Claude's account isn't one this app knows" : "no row: none other is set up with room"))")
         let last = AutoSwitchLog.lastAttempt()
         print("Last auto attempt:  \(last.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "never")")
-        let stopped = !log.stoppedByLimit.isEmpty
+        let stopped = settledStops > 0
         let decision = AutoSwitchRule.decide(current: current, rows: all, enabled: true, limitStopped: stopped,
                                              claudeRunning: stopped && !ClaudeApp.pids().isEmpty, lastAttempt: last, now: now)
         switch decision {

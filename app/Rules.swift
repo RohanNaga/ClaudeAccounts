@@ -541,6 +541,8 @@ struct LogFollower {
     /// idle and Claude doesn't resume it; it waits for a new message. Retrying the failed message
     /// instead rewinds the chat and starts its transcript over under a new id, without its subagents.
     private(set) var stoppedByLimit: Set<String> = []
+    /// When Claude stopped each chat in `stoppedByLimit`, from the line's time.
+    private var stoppedAt: [String: Date] = [:]
     /// Chats whose turn was still running when Claude quit.
     private(set) var cutByQuit: Set<String> = []
     /// When Claude named the identity it holds, from the line's time; named again after a refusal
@@ -566,7 +568,7 @@ struct LogFollower {
             if line.contains("[LocalSessionManager] Initialization succeeded"),
                let account = Self.field(line, "accountId="), let org = Self.field(line, "orgId=") {
                 let named = Identity(account: account, org: org)
-                if named != identity { endHold(at: Self.time(line)); stoppedByLimit = []; cutByQuit = [] }
+                if named != identity { endHold(at: Self.time(line)); stoppedByLimit = []; stoppedAt = [:]; cutByQuit = [] }
                 let refusedSinceHeld = heldSince.flatMap { since in refusedAt[named].map { $0 >= since } } ?? false
                 if named != identity || heldSince == nil || refusedSinceHeld { heldSince = Self.time(line) }
                 identity = named
@@ -581,19 +583,30 @@ struct LogFollower {
                 identity = nil
                 heldSince = nil
                 stoppedByLimit = []
+                stoppedAt = [:]
                 cutByQuit = []
             } else if line.contains("[CCD CycleHealth] ") {
                 if let id = Self.session(after: "[CCD CycleHealth] healthy cycle for ", in: line) {
                     stoppedByLimit.remove(id)
+                    stoppedAt[id] = nil
                     cutByQuit.remove(id)
                 } else if let id = Self.session(after: "[CCD CycleHealth] unhealthy cycle for ", in: line) {
                     if line.contains("reason=app_quit") { cutByQuit.insert(id) }
                 } else if let id = Self.session(after: "[CCD CycleHealth] ", in: line), line.contains(" api_error ("),
                           Self.outOfUsage.contains(where: { line.contains($0) }) {
                     stoppedByLimit.insert(id)
+                    stoppedAt[id] = Self.time(line)
                 }
             }
         }
+    }
+
+    /// Chats Claude stopped for usage once it had settled on the identity it holds, held for
+    /// SaveRule.steadyHold: only these say that identity is out. A stop sooner after Claude named it
+    /// ends a turn begun before, on the identity it held then, like a refusal before a steady hold.
+    var stoppedWhileSettled: Set<String> {
+        guard let since = heldSince else { return [] }
+        return Set(stoppedAt.filter { $0.value.timeIntervalSince(since) >= SaveRule.steadyHold }.keys)
     }
 
     /// The identity whose login may be saved at `now`: Claude has held it for SaveRule.steadyHold

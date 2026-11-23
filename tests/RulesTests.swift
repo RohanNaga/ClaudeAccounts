@@ -21,6 +21,7 @@ struct RulesTests {
         claudeLog()
         savingLogins()
         refusalsBelongToOneSignIn()
+        stopsCountOnceSettled()
         settingUp()
         quitWatch()
         organizations()
@@ -303,6 +304,25 @@ struct RulesTests {
         check(!setUp(refusedLater, a, savedAt: "10:11:05", at: "11:00:00"),
               "a login saved at that hold doesn't count after the refusal")
         check(setUp(refusedLater, b, savedAt: "10:00:30", at: "11:00:00"), "another account's login in that organization still counts")
+    }
+
+    /// A usage stop counts against the row in use only once Claude has settled on it: a stop within
+    /// a minute of Claude naming it ends a turn begun on what Claude held before. Every stop is still
+    /// kept for resuming the chat after a switch.
+    static func stopsCountOnceSettled() {
+        let start = logLine("10:00:00", "Starting app {")
+        func stop(_ time: String) -> String {
+            logLine(time, "[CCD CycleHealth] local_aaa-1 api_error (success): You've hit your weekly limit")
+        }
+        let fellBack = follow([start, named("10:00:05", accountB, orgA)] + refused("10:00:06", accountB, orgA)
+                              + [named("10:00:20", accountB, personalOrg), stop("10:00:26")])
+        check(fellBack.stoppedWhileSettled.isEmpty, "a stop six seconds after Claude settles on a row doesn't count against it")
+        check(fellBack.stoppedByLimit == ["local_aaa-1"], "the early stop is still kept for resuming the chat")
+        let settled = follow([start, named("10:00:05", accountB, personalOrg), stop("10:01:05")])
+        check(settled.stoppedWhileSettled == ["local_aaa-1"], "a stop once Claude has held the row for a minute counts against it")
+        let healthy = follow([start, named("10:00:05", accountB, personalOrg), stop("10:01:05"),
+                              logLine("10:02:00", "[CCD CycleHealth] healthy cycle for local_aaa-1 (30s)")])
+        check(healthy.stoppedWhileSettled.isEmpty, "a healthy turn afterwards clears the stop")
     }
 
     /// Set Up confirms only once Claude holds the row's own account and organization steadily;
