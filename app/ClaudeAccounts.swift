@@ -130,15 +130,19 @@ enum Keychain {
 
 enum AccountStore {
     /// The rows on disk. A row saved before organizations were tracked takes its organization from its
-    /// saved Claude login, else from its Claude Code login, and a label that shows an email gets its
-    /// default label; this only reads, so --dry-run stays read-only, and the next save keeps it.
+    /// saved Claude login, and a label that shows an email gets its default label; this only reads,
+    /// and the next save keeps it.
     static func load() -> [AccountRecord] {
         guard let data = try? Data(contentsOf: Paths.accountsFile),
               var accounts = AccountsFile.decode(data) else { return [] }
         for i in accounts.indices where accounts[i].orgUuid == nil {
             let profile = LoginFlow.profile(in: accounts[i].configURL)
-            accounts[i].orgUuid = LoginSlot.meta(accounts[i])?.orgFolder ?? profile["organizationUuid"] as? String
-            if accounts[i].orgName == nil { accounts[i].orgName = profile["organizationName"] as? String }
+            // Only a saved login names the organization; without one the row needs sign-in, and
+            // Set Up fills it in (13a.4).
+            accounts[i].orgUuid = LoginSlot.meta(accounts[i])?.orgFolder
+            if accounts[i].orgName == nil, accounts[i].orgUuid != nil, accounts[i].orgUuid == profile["organizationUuid"] as? String {
+                accounts[i].orgName = profile["organizationName"] as? String
+            }
         }
         return accounts.labelled()
     }
@@ -926,7 +930,8 @@ enum Switch {
             }
             if j.step == .move {
                 guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
-                if let from = j.from, from != j.to { try moveChats(from: from, to: j.to, journal: &j) }
+                // A seat whose organization is not known yet has no chat folder until Claude names it.
+                if let from = j.from, from != j.to, !j.to.orgUnknown { try moveChats(from: from, to: j.to, journal: &j) }
                 try step(&j, .load)
             }
         } catch {
@@ -994,16 +999,18 @@ enum Switch {
         let start = launch.addingTimeInterval(-1)
         for e in events.events where e.at >= start {
             switch e.event {
-            case .refused(let s) where s == to: return .refused
+            case .refused(let s) where to.matches(s): return .refused
             case .signedOut where kind != .setUp: return .refused
-            case .named(let s) where s != to:
+            case .named(let s) where !to.matches(s):
                 // A fall-back after the target's refusal is the refusal, read on the next line.
-                if events.events.contains(where: { $0.at >= e.at && $0.event == .refused(to) }) { return .refused }
+                if events.events.contains(where: { r in
+                    if r.at >= e.at, case .refused(let x) = r.event { return to.matches(x) } else { return false }
+                }) { return .refused }
                 return .other(s)
             default: continue
             }
         }
-        if running, let hold = events.hold, hold.seat == to, hold.since >= start, hold.settled(at: now) { return .confirmed }
+        if running, let hold = events.hold, to.matches(hold.seat), hold.since >= start, hold.settled(at: now) { return .confirmed }
         return .waiting
     }
 
@@ -1017,7 +1024,7 @@ enum Switch {
             let now = World.now()
             let running = !ClaudeApp.pids().isEmpty
             let events = ClaudeApp.events()
-            let named = events.hold.map { $0.seat == j.to && $0.since >= launch.addingTimeInterval(-1) } ?? false
+            let named = events.hold.map { j.to.matches($0.seat) && $0.since >= launch.addingTimeInterval(-1) } ?? false
             switch verdict(events, to: j.to, kind: j.kind, since: launch, running: running, now: now) {
             case .confirmed:
                 if let backup = j.backup {
@@ -1390,6 +1397,12 @@ final class Store: ObservableObject {
     /// Counts switches, so an older one's end never clears a newer one's task.
     private var runs = 0
     private var noteUntil: Date?
+    /// When the Mac last woke. Readings taken before it count as stale, and no automatic decision
+    /// runs until every seat has been read since (model, section 7, sleep then wake).
+    private var wokeAt: Date?
+    /// The wait that was already posted, by the time its out signal began, so each wait is
+    /// posted once.
+    private var postedWait: Date?
 
     init() {
         SavedLogins.adopt(accounts)
@@ -1401,7 +1414,27 @@ final class Store: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: Self.tickEvery, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.tick() }
         }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.woke() }
+        }
         Task { await tick() }
+    }
+
+    /// The Mac woke from sleep: every reading is stale from now, each seat is read again, and the
+    /// automatic decision waits for those reads. Tests call this in place of the notification.
+    func woke() {
+        let now = World.now()
+        wokeAt = now
+        for seat in meters.keys { meters[seat]?.wokeSince = now }
+        for row in accounts { if let seat = row.identity { forced.insert(seat); retryAt[seat] = nil } }
+        PairFile<SeatMeters>(name: "meters.json").save(meters)
+        Task { await tick() }
+    }
+
+    /// Every seat has been read, or asked and refused, since the Mac woke.
+    private var readSinceWake: Bool {
+        guard let wokeAt else { return true }
+        return accounts.compactMap(\.identity).allSatisfy { (askedAt[$0] ?? .distantPast) >= wokeAt }
     }
 
     // MARK: The facts
@@ -1594,11 +1627,17 @@ final class Store: ObservableObject {
 
     /// Run the model's decision (section 4) and act on it.
     private func decide() async {
+        guard readSinceWake else { return }
+        wokeAt = nil
         let now = World.now()
         let f = facts(now: now)
-        switch AutoSwitch.decide(f, now: now) {
-        case .none, .wait:
+        let decision = AutoSwitch.decide(f, now: now)
+        if case .wait = decision {} else { postedWait = nil }
+        switch decision {
+        case .none:
             break
+        case .wait(let seat, let at):
+            postWait(f, seat: seat, resumesAt: at)
         case .resumeInPlace:
             guard let seat = f.hold?.seat else { return }
             resumeInPlace(waitingChats(f), on: seat, now: now)
@@ -1609,6 +1648,17 @@ final class Store: ObservableObject {
             let since = roomReadAt[seat] ?? log.events.lastTurnEnd(on: seat) ?? now
             run(to: target, kind: .auto, resume: log.events.turnsEnded(on: seat, since: since))
         }
+    }
+
+    /// Post a wait once (model, section 7): when chats wait and more than one seat could have
+    /// taken them. A single seat that runs out stays quiet (13a.8).
+    private func postWait(_ f: Facts, seat: Identity?, resumesAt: Date?) {
+        guard f.waitingChats > 0, f.rows.compactMap(\.identity).count > 1, let began = f.hold.flatMap({ stops[$0.seat]?.at ?? log.events.lastTurnEnd(on: $0.seat) }),
+              postedWait != began else { return }
+        postedWait = began
+        let when = resumesAt.map { " at \(ClockText.time($0))" } ?? ""
+        let name = seat.flatMap { names[$0] } ?? "a seat"
+        World.claude.notify(title: "Every seat is out", body: "Every seat is out. Chats resume when \(name) resets\(when).")
     }
 
     /// Type "resume" into the chats a wait stopped, now that the seat in use has room again.
@@ -1681,7 +1731,17 @@ final class Store: ObservableObject {
         save(accounts + [record])
     }
 
-    private func record(for seat: Seat) -> AccountRecord? { accounts.first { $0.identity == seat.id } }
+    /// A Set Up of a row whose organization was unknown confirmed: the row takes the organization
+    /// of the pair Claude holds (13a.4), unless that pair is already a row of its own.
+    private func learnOrganization(of target: Identity) {
+        guard let held = log.events.hold?.seat, target.matches(held), !accounts.contains(where: { $0.identity == held }),
+              let i = accounts.firstIndex(where: { $0.seat == target }) else { return }
+        var all = accounts
+        all[i].orgUuid = held.org
+        save(all)
+    }
+
+    private func record(for seat: Seat) -> AccountRecord? { accounts.first { $0.seat == seat.id } }
 
     /// The row the sign-in window signs in again.
     var signInRecord: AccountRecord? { signInTarget.flatMap(record(for:)) }
@@ -1837,11 +1897,13 @@ final class Store: ObservableObject {
     /// The switch itself ended: its line goes in the notice.
     private func switched(_ outcome: SwitchOutcome, run: Int) {
         guard runs == run else { return }
+        let target = switchingTo?.target
         resumeTask = switchTask
         switchTask = nil
         switchingTo = nil
         noteUntil = nil
         observe()
+        if outcome.ok, !outcome.parked, let target, target.orgUnknown { learnOrganization(of: target) }
         if outcome.unrecognised { shapeMissing = true }
         if outcome.parked {
             failure = nil
