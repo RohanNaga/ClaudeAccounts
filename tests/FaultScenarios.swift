@@ -439,7 +439,7 @@ let autoFaultScenarios: [Scenario] = [
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
     Scenario(pair: "(Automatic switch at resume, kill the app)",
-             model: "8 A: the switch is done and its journal cleared before the resume; 8 B: at most one resume per chat") { h in
+             model: "8 A: the switch is done and its journal cleared before the resume; 6.7 and 8 B: the next launch gives the chat its one resume") { h in
         let lines = await autoStart(h, onScreen: false)
         await startAuto(h)
         await h.run(until: { lines.note(h); return h.claude.actions.contains { $0.hasPrefix("open ") } }, limit: 900)
@@ -449,8 +449,25 @@ let autoFaultScenarios: [Scenario] = [
         await h.pass(10 * 60)
         lines.note(h)
         checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
+        h.check(h.claude.sent == ["local_one resume"], "the next launch gives the chat the resume the kill cut short, once (6.7, 8 B); typed \(h.claude.sent), saw \(lines.seen)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
+    },
+    Scenario(pair: "(Automatic switch at resume, kill the app, the chat not on screen)",
+             model: "6.7 and 12: the next launch tries the chat again for resumeFor, then names it") { h in
+        let lines = await autoStart(h, onScreen: false)
+        await startAuto(h)
+        await h.run(until: { lines.note(h); return h.claude.actions.contains { $0.hasPrefix("open ") } }, limit: 900)
+        h.crashApp()
+        let launched = h.now
+        await h.tick(); await h.settle()
+        await h.run(until: { lines.note(h); return lines.has("Couldn't resume") }, limit: ClaudeTiming.resumeFor + 5 * 60)
+        let tried = h.now.timeIntervalSince(launched)
+        h.check(lines.has("Couldn't resume 1 chat: send it a message."), "the chat the killed resume left is named after the next launch (12): \(lines.seen)")
+        h.check(tried >= ClaudeTiming.resumeFor - ClaudeTiming.resumeEvery, "it is tried again for resumeFor first: named after \(Int(tried / 60)) min")
+        h.check(h.claude.sent.isEmpty, "nothing typed into a chat not on screen: \(h.claude.sent)")
+        checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
+        checkActs(h)
     },
     Scenario(pair: "(Automatic switch at resume, kill Claude)",
              model: "7: Claude quits with no switch running; 5 resumeFor: retried every 60 s for 30 min; 8 B: nothing typed into a closed Claude") { h in
