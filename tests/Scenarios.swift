@@ -44,7 +44,8 @@ struct Scenario {
     func savedLogin(_ row: String, _ seat: StandSeat) async throws {
         guard let acct = AccountStore.load().first(where: { $0.name == row }) else { throw SwitchError.inconsistent }
         claude.writeSignIn(seat)
-        try await LoginSlot.capture(acct, as: seat.identity)
+        do { try await LoginSlot.capture(acct, as: seat.identity) }
+        catch { check(false, "setup: saving \(row)'s login threw \(error)"); throw error }
     }
 
     /// Claude opens on its own sign-in files and holds that seat settled.
@@ -74,9 +75,9 @@ enum ClaudeTiming {
     static let settle: TimeInterval = 60
 }
 
-let A = StandSeat(account: "acct-a", org: "org-team")
-let B = StandSeat(account: "acct-b", org: "org-team")
-let C = StandSeat(account: "acct-c", org: "org-team")
+let A = StandSeat(1, org: 1)
+let B = StandSeat(2, org: 1)
+let C = StandSeat(3, org: 1)
 
 let scenarios: [Scenario] = [
     Scenario(pair: "(Ready, click Switch on T)", model: "7: the switch; Switching… then T In use") { h in
@@ -90,8 +91,9 @@ let scenarios: [Scenario] = [
         await h.run(until: { h.store.switching == nil && h.claude.held == B })
         h.clock.advance(ClaudeTiming.settle + 5)
         await h.run(until: { h.store.inUse == B.identity }, limit: 120)
-        h.check(h.claude.held == B, "Claude holds Beta: held \(String(describing: h.claude.held))")
+        h.check(h.claude.held == B, "Claude holds Beta: held \(String(describing: h.claude.held)); the app said \(h.store.message ?? "nothing"); Claude saw \(h.claude.actions)")
         h.check(h.store.isInUse(h.row("Beta")), "Beta's row is In use")
+        if ProcessInfo.processInfo.environment["DUMP"] != nil { print((try? String(contentsOf: h.claude.logDir.appendingPathComponent(ClaudeFiles.log), encoding: .utf8)) ?? "") }
         h.check(h.store.hasSavedLogin(h.row("Alpha")), "Alpha's saved login is intact")
     },
     Scenario(pair: "(Needs sign-in, Claude refuses (A, O))", model: "7: Refused for (A, O) only; other accounts' seats in O unaffected") { h in
