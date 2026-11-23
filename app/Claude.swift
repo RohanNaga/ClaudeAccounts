@@ -24,6 +24,8 @@ protocol ClaudeWorld: Sendable {
     var dataDir: URL { get }
     /// Claude's log folder, holding main.log and its rotations main1.log to main4.log.
     var logDir: URL { get }
+    /// Claude is on this Mac.
+    var installed: Bool { get }
     /// Claude's main executable, which identifies its processes.
     func executable() -> String
     /// Claude's main process ids.
@@ -50,6 +52,11 @@ protocol ClaudeWorld: Sendable {
     func send(_ text: String, session: String, in owners: [pid_t], trace: (String) -> Void) -> ChatComposer.Sent
     /// Seconds since anyone used this Mac's keyboard, mouse or trackpad.
     func idleSeconds() -> TimeInterval
+}
+
+extension ClaudeWorld {
+    /// A stand-in Claude is installed unless its test says otherwise.
+    var installed: Bool { true }
 }
 
 /// The time the app reads and waits on. Tests advance a virtual one instead of sleeping.
@@ -147,6 +154,8 @@ struct RealClaudeWorld: ClaudeWorld {
     var bundleId: String { Self.realBundleId }
     var dataDir: URL { home.appendingPathComponent("Library/Application Support/Claude") }
     var logDir: URL { home.appendingPathComponent("Library/Logs/Claude") }
+
+    var installed: Bool { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) != nil }
 
     func executable() -> String {
         let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId)?.path ?? "/Applications/Claude.app"
