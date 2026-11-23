@@ -43,7 +43,7 @@ final class VirtualClock: AppClock, @unchecked Sendable {
         lock.withLock { sleepers += 1 }
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             after(seconds) { [weak self] in self?.lock.withLock { self?.sleepers -= 1 }; c.resume() }
-            lock.withLock { sleeperSeqs.insert(seq) }
+            _ = lock.withLock { sleeperSeqs.insert(seq) }
         }
     }
     /// The time of the earliest event still to run, so a run can jump straight to it.
