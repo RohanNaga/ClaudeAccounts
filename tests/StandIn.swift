@@ -118,6 +118,8 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var signsInAs: StandSeat?
     /// Every notification the app posted, as "<title>: <body>".
     private(set) var notifications: [String] = []
+    /// Runs as each switch step begins, on the switch's own task: a fault scenario strikes here.
+    var onStep: (@Sendable (String) async -> Void)?
     /// Times the person opens Claude again after a switch quit it, between the quit and the launch:
     /// on the app's first look at Claude once the chats left the folder of the seat it quit on.
     var reopensAfterQuit = 0
@@ -325,6 +327,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     }
     func idleSeconds() -> TimeInterval { 600 }
     func notify(title: String, body: String) { lock.withLock { notifications.append("\(title): \(body)") } }
+    func willStep(_ step: String) async { await onStep?(step) }
 }
 
 /// Meters the scenario sets per seat pair (13a.1), read through the app's own usage seam.
