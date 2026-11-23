@@ -44,6 +44,16 @@ enum ShownAction: Equatable { case switchTo, setUp }
     func move(_ row: String, by step: Int) { check(false, "build 10 has no move by seat") }
     func remove(_ row: String) { if let r = record(row) { store.remove(r) } }
     var firstRun: Bool { store.accounts.isEmpty }
+    /// When the seat's login was last saved: its row's slot.json modification time.
+    func savedAt(_ seat: StandSeat) -> Date? {
+        guard let r = store.accounts.first(where: { $0.accountUuid == seat.account && $0.orgUuid == seat.org }) else { return nil }
+        let meta = LoginSlot.dir(r).appendingPathComponent("slot.json").path
+        return (try? FileManager.default.attributesOfItem(atPath: meta))?[.modificationDate] as? Date
+    }
+    /// Build 10 has no wake handling.
+    func wake() {}
+    /// Build 10 has no fitted menu: it grows past the screen.
+    func menu(screen: CGFloat) -> MenuMeasure? { nil }
     func hasSavedLogin(_ seat: StandSeat) -> Bool { store.accounts.contains { $0.accountUuid == seat.account && $0.orgUuid == seat.org && store.hasSavedLogin($0) } }
     func crashApp() { clock.abandonSleepers(); store = Store() }
     func click(_ row: String) {
