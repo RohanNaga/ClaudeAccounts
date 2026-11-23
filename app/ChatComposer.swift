@@ -307,10 +307,6 @@ struct ChatResumer {
         for chat in wanted where seen.insert(chat.id).inserted { chats.append(chat) }
         guard !chats.isEmpty else { return [] }
         let started = clock.now()
-        if chats.contains(where: \.interrupted) {
-            progress("Waiting for Claude to resume chats…")
-            await poll(ResumeRule.ownPassWait, every: 3) { chats.filter(\.interrupted).allSatisfy(running) }
-        }
         var results: [String: ResumeRule.Result] = [:]
         var sentTo = Set<String>()
         var pass = 1
