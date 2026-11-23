@@ -9,6 +9,13 @@ enum ShownAction: Equatable { case switchTo, setUp }
 
 @MainActor extension Harness {
     func make() { store = Store() }
+    /// A saved login for a seat, taken through build 10's own capture while Claude is closed.
+    func savedLogin(_ row: String, _ seat: StandSeat) async throws {
+        guard let acct = AccountStore.load().first(where: { $0.name == row }) else { throw SwitchError.inconsistent }
+        claude.writeSignIn(seat)
+        do { try await LoginSlot.capture(acct, as: seat.identity) }
+        catch { check(false, "setup: saving \(row)'s login threw \(error)"); throw error }
+    }
     func tick() async { store.checkAccessibility(); store.refresh(); store.considerAutoSwitch() }
     private func record(_ row: String) -> AccountRecord? { store.accounts.first { $0.name == row } }
     func state(_ row: String) -> ShownState? {

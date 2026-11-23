@@ -44,14 +44,6 @@ struct Scenario {
         try AccountStore.save(list)
     }
 
-    /// A saved login for a seat, taken through the app's own capture while Claude is closed.
-    func savedLogin(_ row: String, _ seat: StandSeat) async throws {
-        guard let acct = AccountStore.load().first(where: { $0.name == row }) else { throw SwitchError.inconsistent }
-        claude.writeSignIn(seat)
-        do { try await LoginSlot.capture(acct, as: seat.identity) }
-        catch { check(false, "setup: saving \(row)'s login threw \(error)"); throw error }
-    }
-
     /// Claude opens on its own sign-in files and holds that seat settled.
     func claudeHoldsSettled() {
         claude.start()
