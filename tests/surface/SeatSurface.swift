@@ -8,6 +8,10 @@ enum ShownAction: Equatable { case switchTo, setUp }
 
 @MainActor extension Harness {
     func make() { store = Store() }
+    /// How often the app's own timer runs a tick.
+    var tickEvery: TimeInterval { Store.tickEvery }
+    /// A switch is running, its resume included.
+    var switchInFlight: Bool { store?.switchTask != nil }
     /// A saved login for a seat, taken through the app's own save while Claude is closed.
     func savedLogin(_ row: String, _ seat: StandSeat) async throws {
         claude.writeSignIn(seat)

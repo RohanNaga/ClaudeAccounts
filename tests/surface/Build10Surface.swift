@@ -9,6 +9,10 @@ enum ShownAction: Equatable { case switchTo, setUp }
 
 @MainActor extension Harness {
     func make() { store = Store() }
+    /// How often build 10's timer runs.
+    var tickEvery: TimeInterval { 15 }
+    /// A switch is running.
+    var switchInFlight: Bool { store?.switching != nil }
     /// A saved login for a seat, taken through build 10's own capture while Claude is closed.
     func savedLogin(_ row: String, _ seat: StandSeat) async throws {
         guard let acct = AccountStore.load().first(where: { $0.name == row }) else { throw SwitchError.inconsistent }
