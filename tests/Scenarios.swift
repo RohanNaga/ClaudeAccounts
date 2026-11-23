@@ -202,6 +202,39 @@ let scenarios: [Scenario] = [
         h.check(h.hasSavedLogin(B), "Beta's login is saved once confirmed")
         h.check(h.hasSavedLogin(A), "Alpha's saved login is intact")
     },
+    Scenario(pair: "(Set Up on T, Claude signs in as another row)", model: "7: \"Claude signed in as <X>, not <T>. Back on <S>.\"; 13.1 rolls back, chats never stranded; 1: a login is filed only under the seat Claude held") { h in
+        try? h.rows([("Alpha", A), ("Beta", B), ("Gamma", C)])
+        try? await h.savedLogin("Alpha", A)
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        h.claude.signsInAs = C
+        h.click("Beta")
+        await h.run(until: { h.noticeHas("Back on Alpha") }, limit: 900)
+        h.check(h.noticeHas("Claude signed in as Gamma, not Beta. Back on Alpha."), "the row says why: \(h.notice)")
+        await h.run(until: { h.claude.held == A }, limit: 300)
+        h.check(h.claude.held == A, "rolled back to Alpha: holds \(String(describing: h.claude.held))")
+        h.check(h.claude.chats(in: A).contains("local_one") && !h.claude.chats(in: B).contains("local_one") && !h.claude.chats(in: C).contains("local_one"),
+                "the chat is back in Alpha's folder")
+        h.check(!h.hasSavedLogin(B), "nothing is filed under Beta: Claude never held Beta")
+        h.check(h.state("Beta") == .needsSignIn, "Beta still Needs sign-in: \(String(describing: h.state("Beta")))")
+        h.check(h.hasSavedLogin(A), "Alpha's saved login is intact")
+    },
+    Scenario(pair: "(Set Up on T, the target organization refuses the new sign-in)", model: "6: a refused target rolls back and shows Needs sign-in; 1 and 13a.2: a login is saved only under a settled hold") { h in
+        try? h.rows([("Alpha", A), ("Beta", B)])
+        try? await h.savedLogin("Alpha", A)
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        h.claude.signsInAs = B
+        h.claude.stale = [B]
+        h.click("Beta")
+        await h.run(until: { h.claude.held == A && h.launches >= 2 }, limit: 900)
+        await h.pass(ClaudeTiming.settle + 10)
+        h.check(h.claude.held == A, "rolled back to Alpha: holds \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(h.claude.chats(in: A).contains("local_one"), "the chat is back in Alpha's folder")
+        h.check(!h.hasSavedLogin(B), "nothing is filed under Beta: Claude never held Beta settled")
+        h.check(h.state("Beta") == .needsSignIn, "Beta Needs sign-in: \(String(describing: h.state("Beta")))")
+        h.check(h.hasSavedLogin(A), "Alpha's saved login is intact")
+    },
     Scenario(pair: "(In use, click the row in use)", model: "nothing") { h in
         await h.standard()
         h.check(h.state("Alpha") == .inUse && h.action("Alpha") == nil, "Alpha In use with no action")
