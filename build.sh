@@ -59,6 +59,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature so macOS runs a locally built app without a developer ID.
-codesign --force --sign - "$APP"
+# Sign with the fixed local identity from scripts/make-signing-identity.sh when it exists, so the
+# Accessibility permission survives rebuilds; otherwise ad hoc, which macOS also runs locally.
+IDENTITY="Claude Accounts Local Signing"
+if security find-identity -p codesigning | grep -qF "\"$IDENTITY\""; then
+  echo "Signing with: $IDENTITY"
+  codesign --force --sign "$IDENTITY" "$APP"
+else
+  echo "Signing ad hoc (run scripts/make-signing-identity.sh to keep Accessibility across builds)"
+  codesign --force --sign - "$APP"
+fi
 echo "Built: $APP"

@@ -4,6 +4,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+# build.sh signs with the local identity from scripts/make-signing-identity.sh when this Mac has
+# it; that certificate is for this Mac's own builds and must never reach a public download.
+if security find-identity -p codesigning | grep -qF '"Claude Accounts Local Signing"'; then
+  echo "release.sh: this Mac has the local signing identity, which must not ship; build releases on a Mac without it." >&2
+  exit 1
+fi
+
 "$ROOT/build.sh"
 VERSION="$(defaults read "$ROOT/Claude Accounts.app/Contents/Info.plist" CFBundleShortVersionString)"
 ZIP="$ROOT/dist/ClaudeAccounts-$VERSION.zip"
