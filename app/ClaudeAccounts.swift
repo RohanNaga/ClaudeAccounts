@@ -1273,8 +1273,6 @@ final class Store: ObservableObject {
     private var meters = PairFile<SeatMeters>(name: "meters.json").load()
     private var stops = PairFile<StopMark>(name: "stops.json").load()
     private var failedTargets = PairFile<Date>(name: "failed-targets.json").load()
-    /// The first tick finishes or undoes a switch the app was stopped in.
-    private var recovered = false
     /// When each seat's meters were last asked for, and when the service lets it be asked again.
     private var askedAt: [Identity: Date] = [:]
     private var retryAt: [Identity: Date] = [:]
@@ -1415,11 +1413,9 @@ final class Store: ObservableObject {
         observe()
         // A missing cookie schema is looked at again each tick, so the format seen whole clears it.
         if ShapeMisses.load()[.cookieSchema] != nil, switchTask == nil { try? await LoginSlot.checkCookieSchema(ClaudeApp.cookies) }
-        // At launch, and whenever Claude opens again while a switch is parked (section 6, Recovery).
-        if !recovered || (running && SwitchJournal.load()?.parked == true) {
-            recovered = true
-            recover()
-        }
+        // A journal no switch is running is finished (section 6, Recovery): the one the app was
+        // stopped in, one a confirm couldn't clear, and a parked one once Claude opens again.
+        if let journal = SwitchJournal.load(), !journal.parked || running { recover() }
         await saveSettledHold()
         await readDueMeters()
         publish()
