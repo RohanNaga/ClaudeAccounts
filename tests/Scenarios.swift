@@ -224,8 +224,10 @@ enum ClaudeTiming {
     /// Resume: retry every 60 s for 30 min, then name the chat (section 5, resumeFor).
     static let resumeFor: TimeInterval = 30 * 60
     static let resumeEvery: TimeInterval = 60
-    /// "At once" for a refusal: two of the app's ticks, well inside the 60 s settle (decision 2).
-    static let refusalShows: TimeInterval = 2 * Store.tickEvery
+    /// "At once" for a refusal (decision 2): a fixed bound, not the app's tick. Claude refuses 4 to
+    /// 21 s after it names the organization (section 5), so a refusal held back until the hold's
+    /// 60 s settle shows at least 39 s late; 20 s catches that whatever the app's tick is.
+    static let refusalShows: TimeInterval = 20
 }
 
 let A = StandSeat(1, org: 1)
@@ -427,17 +429,27 @@ let scenarios: [Scenario] = [
     Scenario(pair: "(Waiting, reset time passes)", model: "read the meter, then resume in place or switch") { h in
         await h.standard()
         let now = h.clock.now()
+        // Beta's reset falls off the 5 min background grid, so only the read scheduled at its
+        // reset + 1 min sees the room. An app that switches on the old 100% reading once its
+        // resetsAt is behind never reads Beta between the reset and the quit.
+        let resetB = now.addingTimeInterval(637)
         h.usage.set(A, fiveHour: 100, resetsAt: now.addingTimeInterval(7200))
-        h.usage.set(B, fiveHour: 100, resetsAt: now.addingTimeInterval(600))
+        h.usage.set(B, fiveHour: 100, resetsAt: resetB)
         h.usage.set(C, fiveHour: 100, resetsAt: now.addingTimeInterval(7200))
         await h.pass(ClaudeTiming.meterEvery + 5)
         h.claude.logLimitStop("local_one")
         await h.pass(60)
         h.check(h.noticeHas("Every seat is out"), "waiting first: \(h.notice)")
-        h.clock.after(590) { h.usage.set(B, fiveHour: 0, resetsAt: now.addingTimeInterval(600 + 5 * 3600)) }
+        let usage = h.usage
+        h.clock.after(resetB.timeIntervalSince(h.clock.now()) - 5) { usage.set(B, fiveHour: 0, resetsAt: resetB.addingTimeInterval(5 * 3600)) }
         await h.run(until: { h.claude.held == B && h.resumed("local_one") }, limit: 1200)
         h.check(h.claude.held == B, "Beta's reset read gives it room and the app switches: \(String(describing: h.claude.held)), \(h.notice)")
         h.check(h.resumed("local_one"), "the waiting chat is resumed")
+        let at = { (d: Date?) in d.map { "+\(Int($0.timeIntervalSince(now))) s" } ?? "never" }
+        let firstQuit = h.claude.at("quit").first
+        h.check(firstQuit.map { $0 >= resetB } == true, "the switch starts after Beta resets: first quit \(at(firstQuit)), reset \(at(resetB))")
+        h.check(firstQuit.map { q in h.usage.readsOf(B).contains { $0 >= resetB && $0 <= q } } == true,
+                "Beta's meter is read after its reset and before the first quit: reads \(h.usage.readsOf(B).map { at($0) }), first quit \(at(firstQuit))")
     },
     Scenario(pair: "(Not waiting, reset time passes)", model: "meter re-read, row changes") { h in
         await h.standard()
@@ -761,8 +773,13 @@ let scenarios: [Scenario] = [
         await h.standard()
         h.remove("Alpha")
         await h.run(until: { !h.rowNames.contains("Alpha") }, limit: 60)
+        // The app runs on past a background read and a settle: 13a.6 adds the held seat on its own
+        // only when there are no rows.
+        await h.pass(ClaudeTiming.meterEvery + ClaudeTiming.settle)
+        h.check(!h.rowNames.contains("Alpha"), "the held seat is not added back while other rows remain: \(h.rowNames)")
         h.check(h.claude.held == A, "Claude still holds the pair")
         h.check(h.noticeHas("Claude is on an account not in the list."), "the notice says so: \(h.notice)")
+        h.check(h.store.notice?.action == .addSeat, "the notice offers Add (13a.6): \(String(describing: h.store.notice?.action))")
     },
     Scenario(pair: "(Any, two rows with the same name)", model: "\" · <organization>\", then \" (2)\"; never an email") { h in
         let D = StandSeat(4, org: 2)

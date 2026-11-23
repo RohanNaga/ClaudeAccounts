@@ -59,11 +59,13 @@ let bugScenarios: [Scenario] = [
         for seat in seats { h.usage.set(seat, fiveHour: 20, resetsAt: h.clock.now().addingTimeInterval(3 * 3600)) }
         h.claude.writeSignIn(seats[0])
         h.claudeHoldsSettled(); h.make(); await h.tick(); await h.settle()
-        let screen = NSScreen.main?.visibleFrame.height ?? 0
-        let menu = NSHostingView(rootView: MenuContent(store: h.store))
+        // A 13-inch laptop's visible height (section 11), not the host's screen: on a tall display
+        // an unbounded menu of 30 seats would fit and pass.
+        let screen: CGFloat = 900
+        let menu = NSHostingView(rootView: MenuPanel(seats: h.store.seats, notice: h.store.notice, firstRun: h.store.firstRun,
+                                                     visibleScreenHeight: screen))
         menu.layoutSubtreeIfNeeded()
         let drawn = menu.fittingSize.height
-        h.check(screen > 0, "setup: a screen to measure against")
         h.check(drawn >= 200, "setup: the menu drew its rows: \(drawn) pt")
         h.check(drawn <= screen, "the menu fits the screen: drawn \(drawn) pt, visible screen \(screen) pt, 30 seats")
     },

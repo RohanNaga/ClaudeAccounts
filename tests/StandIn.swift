@@ -44,6 +44,13 @@ final class VirtualClock: AppClock, @unchecked Sendable {
         lock.withLock { t = max(t, end) }
     }
 
+    /// The Mac sleeps for `seconds`: the clock jumps there at once, then everything that fell due
+    /// runs at the new time, the way a woken Mac finds every timer late.
+    func sleepMac(_ seconds: TimeInterval) {
+        lock.withLock { t = t.addingTimeInterval(max(0, seconds)) }
+        advance(0)
+    }
+
     /// The app sleeps until the scenario moves the clock past its deadline; only the scenario
     /// moves time, so every wait in the app lasts exactly as long as the scenario says.
     func sleep(_ seconds: TimeInterval) async {
@@ -142,6 +149,8 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var screens: [String: ChatScreen] = [:]
     /// Every "resume" typed, as "<session> <text>".
     private(set) var sent: [String] = []
+    /// Every send the app tried without Accessibility, as "<session> <text>".
+    private(set) var untrustedSends: [String] = []
     /// Every quit request, prompt press, launch and reopen, in order, with the clock's time.
     private(set) var timeline: [(what: String, at: Date)] = []
     var actions: [String] { lock.withLock { timeline.map(\.what) } }
@@ -382,8 +391,11 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         return true
     }
     func exposeWebContent(of owners: [pid_t]) {}
-    func chatScreen(session: String, in owners: [pid_t]) -> ChatScreen? { lock.withLock { screens[session] } }
+    /// Without Accessibility, Claude's window cannot be read at all.
+    func chatScreen(session: String, in owners: [pid_t]) -> ChatScreen? { trustedAX ? lock.withLock { screens[session] } : nil }
+    /// Without Accessibility nothing can be typed: the attempt is kept, so a check can see the app tried.
     func send(_ text: String, session: String, in owners: [pid_t], trace: (String) -> Void) -> ChatComposer.Sent {
+        guard trustedAX else { lock.withLock { untrustedSends.append("\(session) \(text)") }; return .refused("no Accessibility") }
         guard let s = lock.withLock({ screens[session] }) else { return .busy }
         if s.busy { return .busy }
         if s.draft { return .draft }

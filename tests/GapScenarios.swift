@@ -21,6 +21,17 @@ private enum Spec {
     static let autoQuitWait: TimeInterval = 3 * 60
     /// A relaunched hold settles for 60 s before the decision may act on it.
     static let settle: TimeInterval = 60
+    static let confirmWait: TimeInterval = 3 * 60
+    static let setUpConfirmWait: TimeInterval = 10 * 60
+    static let outWithoutReset: TimeInterval = 5 * 3600
+    /// How late past a deadline the app may act: its confirm loop looks once a second, its tick every few.
+    static let slack: TimeInterval = 10
+}
+
+/// Seconds from `from` to `to`, nil if either is missing.
+private func gap(_ from: Date?, _ to: Date?) -> TimeInterval? {
+    guard let from, let to else { return nil }
+    return to.timeIntervalSince(from)
 }
 
 /// A pair no row names: the account Claude opens on when it ignores the loaded sign-in.
@@ -232,5 +243,132 @@ let gapScenarios: [Scenario] = [
         h.check(h.claude.held == B && h.claude.chats(in: B).isSuperset(of: ["local_one", "local_two"]), "setup: the switch to Beta moved both chats: \(h.claude.chats(in: B)), \(h.notice)")
         h.check(h.claude.sent.filter { $0 == "local_one resume" }.count == 1, "the chat the quit cut off got one \"resume\": \(h.claude.sent)")
         h.check(!h.resumed("local_two"), "the idle chat got nothing: \(h.claude.sent)")
+    },
+
+    // Pairs the second scenario review (ca-reviewer-b, 2026-11-23) found missing.
+    // 11. Section 7 row 2 and section 5 confirmWait: Set Up where nobody signs in.
+    Scenario(pair: "(Set Up on T, nobody signs in)", model: "7: a 10 min timeout rolls back; 5 confirmWait: 10 min for Set Up") { h in
+        try? h.rows([("Alpha", A), ("Beta", B)])
+        try? await h.savedLogin("Alpha", A)
+        h.claude.addChat("local_one", in: A, lastActivity: h.now)
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        h.check(h.action("Beta") == .setUp, "setup: Beta has Set Up: \(String(describing: h.action("Beta")))")
+        let lines = Lines()
+        h.click("Beta")
+        await h.run(until: { lines.note(h); return h.launches >= 1 && lines.has("Sign in to Beta in Claude.") }, limit: 300)
+        h.check(lines.has("Sign in to Beta in Claude."), "the notice asks for the sign-in: \(lines.seen)")
+        await h.run(until: { lines.note(h); return h.quits >= 2 }, limit: Spec.setUpConfirmWait * 2)
+        let waited = gap(h.claude.at("launch").first, h.claude.at("quit").dropFirst().first)
+        h.check(waited.map { $0 >= Spec.setUpConfirmWait && $0 <= Spec.setUpConfirmWait + Spec.slack } == true,
+                "Set Up waits 10 min for the sign-in, then rolls back: rollback quit \(waited.map { "\(Int($0)) s" } ?? "never") after the launch")
+        await runToEnd(h, lines, limit: 900)
+        h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "back on Alpha with its chat: \(String(describing: h.claude.held)), \(h.claude.actions)")
+        h.check(lines.has("Back on Alpha."), "the row says it is back on Alpha: \(lines.seen)")
+        h.check(h.state("Beta") == .needsSignIn && h.hasSavedLogin(A), "Beta still Needs sign-in, Alpha's saved login intact: \(String(describing: h.state("Beta")))")
+        h.check(Limits.setUpConfirmWait == Spec.setUpConfirmWait, "setUpConfirmWait is 10 min: \(Limits.setUpConfirmWait) s")
+    },
+
+    // 12. Section 5 confirmWait: a switch whose target Claude does not name within 3 min.
+    Scenario(pair: "(Switch, Claude names the target too late)", model: "5 confirmWait: 3 min after launch; 6.6: confirmWait passes, roll back") { h in
+        await h.standard()
+        // Claude would name Beta 400 s after it opens: past the wait, so the switch must roll back first.
+        h.claude.nameAfter = 400
+        let lines = Lines()
+        h.click("Beta")
+        await h.run(until: { lines.note(h); return h.quits >= 2 }, limit: 1200)
+        let waited = gap(h.claude.at("launch").first, h.claude.at("quit").dropFirst().first)
+        h.check(waited.map { $0 >= Spec.confirmWait && $0 <= Spec.confirmWait + Spec.slack } == true,
+                "the switch waits 3 min for Claude to name Beta, then rolls back: rollback quit \(waited.map { "\(Int($0)) s" } ?? "never") after the launch")
+        await runToEnd(h, lines, limit: 1200)
+        h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "back on Alpha with its chat: \(String(describing: h.claude.held)), \(h.claude.actions)")
+        // No Named line within 3 min is also section 8's shape miss, so the paused line, not the
+        // rollback's reason, may hold the one notice; the pair asserts the wait, not the wording.
+        h.check(Limits.confirmWait == Spec.confirmWait, "confirmWait is 3 min: \(Limits.confirmWait) s")
+    },
+
+    // 13. Section 4: a settled stop whose reading has no reset ahead keeps the seat out for 5 h.
+    Scenario(pair: "(In use settled, limit stop with no reset ahead)", model: "4 and 5 outWithoutReset: out for 5 h from the stop, then the waiting chat resumes in place") { h in
+        await h.standard()
+        let start = h.now
+        h.usage.set(A, fiveHour: 50, resetsAt: nil)
+        for s in [B, C] { h.usage.set(s, fiveHour: 100, resetsAt: start.addingTimeInterval(8 * 3600)) }
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        h.claude.logLimitStop("local_one")
+        let stop = h.now
+        await h.pass(60)
+        h.check(h.noticeHas("Every seat is out"), "setup: every seat is out, so the chat waits: \(h.notice)")
+        await h.pass(Spec.outWithoutReset - 60 - 5 * 60)
+        h.check(!h.resumed("local_one") && h.claude.actions.isEmpty, "Alpha is still out 4 h 55 min after the stop: typed \(h.claude.sent), \(h.claude.actions)")
+        await h.run(until: { h.resumed("local_one") }, limit: 30 * 60)
+        let after = gap(stop, h.resumed("local_one") ? h.now : nil)
+        h.check(after.map { $0 >= Spec.outWithoutReset && $0 <= Spec.outWithoutReset + ClaudeTiming.meterEvery + ClaudeTiming.meterAfterReset } == true,
+                "the chat resumes once the 5 h are up, not before: \(after.map { "\(Int($0 / 60)) min" } ?? "never") after the stop")
+        h.check(h.claude.at("quit").isEmpty && h.claude.held == A, "in place, on Alpha: \(h.claude.actions)")
+    },
+
+    // 14. Section 7, sleep then wake: an expired confirm first checks the log.
+    Scenario(pair: "(Confirm, the Mac sleeps past the wait)", model: "7: waits are measured against the facts; an expired confirm first checks the log") { h in
+        await h.standard()
+        h.click("Beta")
+        await h.run(until: { h.launches == 1 }, limit: 300)
+        // Claude names Beta 3 s after it opens; the Mac sleeps 10 s in, for 20 min, past the 3 min wait.
+        await h.pass(10)
+        h.check(h.claude.held == B && h.switchInFlight, "setup: Claude named Beta and the confirm is waiting: \(String(describing: h.claude.held))")
+        h.clock.sleepMac(20 * 60)
+        h.wake()
+        await h.tick(); await h.settle()
+        await h.run(until: { !h.switchInFlight }, limit: 300)
+        h.check(h.quits == 1 && h.launches == 1, "the log shows Beta held settled, so no rollback: \(h.claude.actions)")
+        h.check(h.claude.held == B && h.state("Beta") == .inUse && h.claude.chats(in: B).contains("local_one"),
+                "the switch confirms on Beta with the chat: \(String(describing: h.claude.held)), \(h.notice)")
+    },
+
+    // 15. Sections 7 and 12: Accessibility missing, then a manual switch with a stopped chat.
+    Scenario(pair: "(Accessibility not granted, click Switch with a stopped chat)", model: "7: everything works except the quit prompt and typing \"resume\"; 12: the app names the chats that need a message") { h in
+        h.claude.trustedAX = false
+        await h.standard()
+        h.claude.logLimitStop("local_one")
+        await h.pass(60)
+        h.check(h.claude.actions.isEmpty, "setup: no automatic switch without Accessibility: \(h.claude.actions)")
+        let lines = Lines()
+        h.click("Beta")
+        await h.run(until: { lines.note(h); return h.claude.held == B && !h.switchInFlight && lines.has("Couldn't resume") }, limit: Spec.settle + 35 * 60)
+        h.check(h.claude.held == B && h.claude.chats(in: B).contains("local_one"), "the manual switch works: \(String(describing: h.claude.held)), \(h.claude.actions)")
+        h.check(h.claude.sent.isEmpty && h.claude.untrustedSends.isEmpty, "nothing typed, nor tried, without Accessibility: typed \(h.claude.sent), tried \(h.claude.untrustedSends)")
+        h.check(lines.has("Couldn't resume 1 chat: send it a message."), "the chat is named: \(lines.seen)")
+    },
+
+    // 16. Section 5 quitWait: a manual switch has no time limit at Claude's prompt.
+    Scenario(pair: "(Manual quit wait, the prompt stays open past 3 min)", model: "5 quitWait: none for a manual switch; 7: the person quits Claude, go on") { h in
+        await h.standard()
+        h.claude.quitBehaviour = .promptUnanswered
+        let lines = Lines()
+        h.click("Beta")
+        await h.run(until: { lines.note(h); return h.claude.promptOpen }, limit: 120)
+        await h.run(until: { lines.note(h); return !h.switchInFlight }, limit: 3 * Spec.autoQuitWait)
+        h.check(h.switchInFlight && h.claude.promptOpen && h.claude.held == A, "9 min on, the manual switch still waits at the prompt: in flight \(h.switchInFlight), prompt \(h.claude.promptOpen), \(h.claude.actions)")
+        h.check(h.quits == 1 && !h.claude.actions.contains { $0.hasPrefix("pressed") }, "it neither asked again nor pressed the prompt: \(h.claude.actions)")
+        h.check(!lines.has("Switch cancelled"), "it did not give up: \(lines.seen)")
+        h.claude.stop()
+        await h.run(until: { h.claude.held == B && !h.switchInFlight }, limit: 600)
+        h.check(h.claude.held == B && h.claude.chats(in: B).contains("local_one"), "the person's quit carries the switch on to Beta: \(String(describing: h.claude.held)), \(h.notice)")
+    },
+
+    // 17. Decision: colours and the menu-bar display and metric settings stay working.
+    Scenario(pair: "(Menu, colour and menu-bar settings changed)", model: "decision: colours and the menu-bar display and metric stay working until Rohan rules (10)") { h in
+        await h.standard()
+        h.check(h.store.menuBarTitle == "Alpha 20%", "setup: the title shows the seat in use and its 5-hour meter: \(h.store.menuBarTitle)")
+        h.store.settings.metric = .weekly
+        h.check(h.store.menuBarTitle == "Alpha 10%", "the metric setting moves the title to the weekly meter: \(h.store.menuBarTitle)")
+        h.store.settings.display = .gaugePercent
+        h.check(h.store.menuBarTitle == "10%", "the display setting drops the name: \(h.store.menuBarTitle)")
+        h.store.settings.display = .gauge
+        h.check(h.store.menuBarTitle == "", "gauge only shows no text: \(h.store.menuBarTitle)")
+        let colour = { resolvedColors(h.store.accounts.map { ($0.seat.account, $0.color) })[A.account] }
+        if let alpha = h.store.seats.first(where: { $0.name == "Alpha" }) { h.store.recolor(alpha, "#123456") } else { h.check(false, "no row named Alpha") }
+        h.check(colour() == "#123456", "Alpha takes its new colour: \(String(describing: colour()))")
+        h.make(); await h.tick()
+        h.check(colour() == "#123456" && h.store.settings.display == .gauge && h.store.settings.metric == .weekly,
+                "both are kept when the app starts again: colour \(String(describing: colour())), \(h.store.settings.display), \(h.store.settings.metric)")
     },
 ]

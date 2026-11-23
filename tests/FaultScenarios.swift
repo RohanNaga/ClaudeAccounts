@@ -348,11 +348,15 @@ let autoFaultScenarios: [Scenario] = [
         // The prompt had no Quit anyway button: a missing shape turns resume off, and one line says so.
         h.check(h.claude.sent.isEmpty, "B: no resume typed while the quit button's shape is missing (8); typed \(h.claude.sent)")
         h.check(lines.has(pausedLine), "B: one line says switching on its own is paused (8); saw \(lines.seen)")
+        // Ruling on 22cef17: with resume off, the chats are named instead.
+        await h.run(until: { lines.note(h); return lines.has("Couldn't resume") }, limit: ClaudeTiming.settle + 35 * 60)
+        h.check(lines.has("Couldn't resume 1 chat: send it a message."), "the stopped chat is named while the shape miss stands (8, 12); saw \(lines.seen)")
+        h.check(h.claude.sent.isEmpty, "still nothing typed: \(h.claude.sent)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
     Scenario(pair: "(Automatic switch at quit, a failed read)",
-             model: "6.7: the chat a limit stopped gets one resume; 7: else \"Couldn't resume 1 chat\"; 8 B: never acts on an unread log") { h in
+             model: "6.7: the chat a limit stopped, on screen and idle, gets one resume; 8 B: never acts on an unread log") { h in
         let lines = await autoStart(h)
         let strike = autoStrike(h, at: "quit", .failedRead)
         await startAuto(h)
@@ -362,8 +366,10 @@ let autoFaultScenarios: [Scenario] = [
         h.check(strike.fired, "the log was unreadable at the quit")
         checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
         await h.run(until: { lines.note(h); return h.resumed("local_one") || lines.has("Couldn't resume") }, limit: 1800)
-        h.check(h.resumed("local_one") || lines.has("Couldn't resume 1 chat"),
-                "the stopped chat gets one resume, or one line names it (6.7, 7); typed \(h.claude.sent), saw \(lines.seen)")
+        // The chat is on screen and idle, so 6.7 gives it one resume; "Couldn't resume" is only for
+        // a chat that is not on screen (7).
+        h.check(h.claude.sent == ["local_one resume"], "the stopped chat on screen gets exactly one resume (6.7); typed \(h.claude.sent), saw \(lines.seen)")
+        h.check(!lines.has("Couldn't resume"), "a chat on screen is never named instead: \(lines.seen)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
