@@ -54,6 +54,7 @@ struct Scenario {
         clock = VirtualClock(start: Date())
         claude = try StandInClaude(clock: clock)
         try World.install(claude, clock: clock)
+        usage.clock = clock
         Usage.install(usage)
     }
 
@@ -81,10 +82,13 @@ struct Scenario {
 
     /// Lets the app's tasks run until each is asleep on the clock or done: no real child process, no other thread at work,
     /// (the app runs sqlite3) and no change to the clock's schedule and no switch awake, over three rounds of yields.
-    /// The app's tasks off the main actor run on other threads, so a short real pause lets them in.
+    /// The app's file work runs on other threads and as real child processes, so this is the one wait
+    /// on the product's own response: a short poll, never a sleep. The virtual clock does not move
+    /// while it waits. If the app is still working after `settleRounds`, the scenario fails: a check
+    /// made then (above all "nothing happened") could pass only because the app's work never ran.
     func settle() async {
         var quiet = 0, last = clock.activity
-        for _ in 0..<2000 {
+        for _ in 0..<Harness.settleRounds {
             for _ in 0..<20 { await Task.yield() }
             let now = clock.activity
             // A switch that is not asleep on the clock is mid-step (copying, moving, sqlite3).
@@ -93,8 +97,12 @@ struct Scenario {
             last = now
             usleep(200)
         }
-        if Harness.trace { print("trace: settle gave up, children \(childProcesses()), busy \(busyThreads()), activity \(clock.activity) vs \(last), asleep \(clock.asleep)") }
+        check(false, "the app never went quiet at +\(Int(clock.now().timeIntervalSince(started))) s virtual: children \(childProcesses()), busy threads \(busyThreads()), switch awake \(switchInFlight && clock.asleep == 0), schedule changing \(clock.activity != last)")
     }
+    /// Rounds of yields before settle gives up (each round a few hundred microseconds of real time).
+    static let settleRounds = 20_000
+    /// When the scenario began, on the virtual clock.
+    var started: Date { clock.start }
 
     /// HARNESS_TRACE=1 prints each jump of the clock and any settle that gave up.
     static let trace = ProcessInfo.processInfo.environment["HARNESS_TRACE"] != nil
@@ -139,11 +147,11 @@ struct Scenario {
         await tick(); await settle()
     }
 
-    /// `n` rows, one account each, named "Row 1"..."Row n"; Claude holds Row 1 settled.
-    func manyRows(_ n: Int) async {
+    /// `n` rows, one account each, named "Row 1"..."Row n"; Claude holds Row `held` settled.
+    func manyRows(_ n: Int, holding held: Int = 1) async {
         let seats = (1...n).map { StandSeat($0, org: 1) }
         try? rows(seats.enumerated().map { ("Row \($0.offset + 1)", $0.element) })
-        try? await savedLogin("Row 1", seats[0])
+        try? await savedLogin("Row \(held)", seats[held - 1])
         for seat in seats { usage.set(seat, fiveHour: 20, resetsAt: clock.now().addingTimeInterval(3600)) }
         claudeHoldsSettled(); make()
         await tick(); await settle()
@@ -211,6 +219,13 @@ struct MenuMeasure { let height, content, pinned, margin, row: CGFloat }
 enum ClaudeTiming {
     static let settle: TimeInterval = 60
     static let meterEvery: TimeInterval = 5 * 60
+    /// A read is scheduled for each reset time plus this (section 4).
+    static let meterAfterReset: TimeInterval = 60
+    /// Resume: retry every 60 s for 30 min, then name the chat (section 5, resumeFor).
+    static let resumeFor: TimeInterval = 30 * 60
+    static let resumeEvery: TimeInterval = 60
+    /// "At once" for a refusal: two of the app's ticks, well inside the 60 s settle (decision 2).
+    static let refusalShows: TimeInterval = 2 * Store.tickEvery
 }
 
 let A = StandSeat(1, org: 1)
@@ -235,6 +250,9 @@ let scenarios: [Scenario] = [
         h.check(h.state("Beta") == .inUse, "Beta's row is In use")
         h.check(h.claude.chats(in: B).contains("local_one"), "the chat moved to Beta's folder")
         h.check(h.state("Alpha") == .ready, "Alpha keeps its saved login and is Ready: \(String(describing: h.state("Alpha")))")
+        // 13a.2: Claude writes its cookies as it quits, so the save must copy them after the quit.
+        let quitMark = h.claude.quitMarks[A]
+        h.check(quitMark != nil && h.savedMark(A) == quitMark, "Alpha's saved login holds the cookies Claude wrote at its quit (\(String(describing: quitMark))), not an earlier copy: \(String(describing: h.savedMark(A)))")
     },
     Scenario(pair: "(Needs sign-in, Claude refuses (A, O))", model: "7: Refused for (A, O) only; other accounts' seats in O unaffected") { h in
         try? h.rows([("Alpha", A), ("Beta", B), ("Gamma", C)])
@@ -243,8 +261,10 @@ let scenarios: [Scenario] = [
         h.claude.stale = [A]
         h.make()
         h.claude.start()
-        await h.pass(ClaudeTiming.settle + 30)
-        h.check(h.state("Alpha") == .needsSignIn && h.action("Alpha") == .setUp, "Alpha shows Needs sign-in with Set Up: \(String(describing: h.state("Alpha")))")
+        // Decision 2: a refusal counts at once; the 60 s settle is only for saving and blaming.
+        await h.pass(h.claude.nameAfter + h.claude.refuseAfter + ClaudeTiming.refusalShows)
+        h.check(h.state("Alpha") == .needsSignIn && h.action("Alpha") == .setUp, "Alpha shows Needs sign-in with Set Up within \(Int(ClaudeTiming.refusalShows)) s of the refusal: \(String(describing: h.state("Alpha")))")
+        await h.pass(ClaudeTiming.settle)
         h.check(h.state("Gamma") == .ready && h.action("Gamma") == .switchTo, "Gamma, another account in the same organization, stays Ready with Switch: \(String(describing: h.state("Gamma")))")
     },
     // Section 7 rows still to build (each asserts the outcome and the line in quotes).
@@ -318,7 +338,8 @@ let scenarios: [Scenario] = [
         h.check(h.claude.sent.filter { $0.hasPrefix("local_one") }.count == 1, "exactly one resume")
         h.check(h.state("Alpha") == .out, "Alpha shows Out after its settled stop: \(String(describing: h.state("Alpha")))")
         await h.run(until: { !h.claude.notifications.isEmpty }, limit: 120)
-        h.check(h.claude.notifications.contains("Switched to Beta: Switched to Beta: Alpha is out. 1 chat resumed."), "the notification: \(h.claude.notifications)")
+        // Recorded as "<title>: <body>": the person reads spec 7's line once, the title never repeated.
+        h.check(h.claude.notifications == ["Switched to Beta: Alpha is out. 1 chat resumed."], "the one notification reads \"Switched to <T>: <S> is out. N chats resumed.\": \(h.claude.notifications)")
     },
     Scenario(pair: "(In use settling, limit stop before settle)", model: "not counted against S; chat still resumed; nothing shown") { h in
         await h.standard()
@@ -368,7 +389,9 @@ let scenarios: [Scenario] = [
         await h.pass(3 * ClaudeTiming.meterEvery)
         let posted = h.claude.notifications.filter { $0.hasPrefix("Every seat is out") }
         h.check(posted.count == 1, "one notification for the whole wait: \(h.claude.notifications)")
-        h.check(posted.first?.contains("Chats resume when") == true, "it names when chats resume: \(posted)")
+        let at = DateFormatter.localizedString(from: reset, dateStyle: .none, timeStyle: .short)
+        h.check(posted.first.map { $0.hasPrefix("Every seat is out: Chats resume when ") && $0.hasSuffix(" resets at \(at).") } == true,
+                "it reads \"Every seat is out: Chats resume when <seat> resets at <time>.\", the title once: \(posted)")
         h.check(h.claude.actions.isEmpty, "no switch: \(h.claude.actions)")
     },
     Scenario(pair: "(One seat out, out signal)", model: "13a.8: \"<seat> is out. Chats resume when it resets at <time>.\" no switch, no notification") { h in
@@ -419,12 +442,20 @@ let scenarios: [Scenario] = [
     Scenario(pair: "(Not waiting, reset time passes)", model: "meter re-read, row changes") { h in
         await h.standard()
         let now = h.clock.now()
-        h.usage.set(B, fiveHour: 100, resetsAt: now.addingTimeInterval(600))
+        // The reset falls off the 5 min background grid (reads at +300, +600), and so does its read.
+        let reset = now.addingTimeInterval(430), due = reset.addingTimeInterval(ClaudeTiming.meterAfterReset)
+        h.usage.set(B, fiveHour: 100, resetsAt: reset)
         await h.pass(400)
         h.check(h.state("Beta") == .out, "Beta Out before its reset: \(String(describing: h.state("Beta")))")
-        h.usage.set(B, fiveHour: 0, resetsAt: now.addingTimeInterval(600 + 5 * 3600))
-        await h.run(until: { h.state("Beta") == .ready }, limit: 400)
-        h.check(h.state("Beta") == .ready, "the reset is re-read and Beta is Ready: \(String(describing: h.state("Beta")))")
+        // After the reset the five-hour meter is empty but the weekly one is now full: only a read
+        // shows that. An app that lets Out end by the clock alone shows Ready instead.
+        h.usage.set(B, fiveHour: 0, weekly: 100, resetsAt: reset.addingTimeInterval(5 * 3600))
+        await h.run(until: { h.usage.readsOf(B).contains { $0 >= due } }, limit: 120)
+        let read = h.usage.readsOf(B).first { $0 >= due }
+        h.check(read.map { $0.timeIntervalSince(due) <= Store.tickEvery } == true, "Beta is read at its reset + 1 min, not on the next background read: read at \(read.map { "+\(Int($0.timeIntervalSince(now))) s" } ?? "never"), due +\(Int(due.timeIntervalSince(now))) s")
+        await h.settle()
+        h.check(h.percents("Beta") == [0, 100], "the meters change to the new reading: \(h.percents("Beta"))")
+        h.check(h.state("Beta") == .out, "the new reading keeps Beta Out (weekly full): \(String(describing: h.state("Beta")))")
         h.check(h.claude.actions.isEmpty, "no switch")
     },
     Scenario(pair: "(In use, meter reads 100% with no turn ended)", model: "Out on the row, no switch") { h in
@@ -444,9 +475,12 @@ let scenarios: [Scenario] = [
         try? await h.savedLogin("Alpha", A)
         h.claude.stale = [A]
         h.make(); h.claude.start()
-        await h.pass(ClaudeTiming.settle + 30)
-        h.check(h.state("Alpha · Home") == .inUse, "the personal row is In use: \(String(describing: h.state("Alpha · Home"))), rows \(h.rowNames)")
-        h.check(h.state("Alpha · Team") == .needsSignIn, "the refused row Needs sign-in: \(String(describing: h.state("Alpha · Team")))")
+        // Decision 2: the refusal and the fall-back show at once, not after a settle.
+        await h.pass(h.claude.nameAfter + h.claude.refuseAfter + ClaudeTiming.refusalShows)
+        h.check(h.state("Alpha · Home") == .inUse, "the personal row is In use within \(Int(ClaudeTiming.refusalShows)) s of the refusal: \(String(describing: h.state("Alpha · Home"))), rows \(h.rowNames)")
+        h.check(h.state("Alpha · Team") == .needsSignIn, "the refused row Needs sign-in within \(Int(ClaudeTiming.refusalShows)) s of the refusal: \(String(describing: h.state("Alpha · Team")))")
+        await h.pass(ClaudeTiming.settle)
+        h.check(h.state("Alpha · Home") == .inUse && h.state("Alpha · Team") == .needsSignIn, "and both stay so once the hold settles")
     },
     Scenario(pair: "(No switch, Claude quits or crashes)", model: "\"Claude isn't running.\" Switch still works and opens Claude") { h in
         await h.standard()
@@ -554,8 +588,15 @@ let scenarios: [Scenario] = [
         await h.run(until: { h.claude.held == B }, limit: 600)
         // The resume starts after the confirm (a settled hold) and retries for 30 min.
         await h.run(until: { h.noticeHas("Couldn't resume") }, limit: ClaudeTiming.settle + 35 * 60)
+        let gaveUp = h.clock.now()
         h.check(h.claude.actions.contains { $0.hasPrefix("open ") }, "the chat was opened by its link: \(h.claude.actions)")
         h.check(h.noticeHas("Couldn't resume 1 chat: send it a message."), "after 30 min the chat is named: \(h.notice)")
+        // Not sooner: the app keeps trying for the whole 30 min (resumeFor) before it names the chat.
+        let tried = h.claude.opened.first.map { gaveUp.timeIntervalSince($0) } ?? 0
+        h.check(tried >= ClaudeTiming.resumeFor - ClaudeTiming.resumeEvery && tried <= ClaudeTiming.resumeFor + 2 * ClaudeTiming.resumeEvery,
+                "it gives up 30 min after it first opened the chat, not sooner: after \(Int(tried / 60)) min")
+        h.check(Limits.resumeFor == ClaudeTiming.resumeFor && Limits.resumeEvery == ClaudeTiming.resumeEvery,
+                "resumeFor is 30 min, retried every 60 s: \(Limits.resumeFor) s, \(Limits.resumeEvery) s")
     },
     Scenario(pair: "(Any, Accessibility not granted)", model: "\"Allow Accessibility so Claude Accounts can switch on its own and resume chats.\"") { h in
         h.claude.trustedAX = false
@@ -732,12 +773,15 @@ let scenarios: [Scenario] = [
         h.check(h.claude.held == C, "Beta is skipped as an automatic target: \(String(describing: h.claude.held))")
     },
     Scenario(pair: "(Any, more rows than fit)", model: "cards scroll; title and notice pinned; row in use visible (MenuLayout seam)") { h in
-        await h.manyRows(30)
+        // The row in use sits low, past what the menu shows unscrolled, so "visible on open" needs the scroll.
+        await h.manyRows(30, holding: 25)
         let m = h.menu(screen: 600)
         h.check(m.height <= 600 - m.margin, "the menu stays on a 600 pt screen: \(m.height)")
         h.check(m.content > m.height, "the cards scroll: they need \(m.content), the menu is \(m.height)")
         h.check(m.height - m.pinned >= 3 * m.row, "the pinned title bar and notice leave room for at least three rows")
-        h.check(h.state("Row 1") == .inUse, "the row in use is a row of the menu: \(String(describing: h.state("Row 1")))")
+        h.check(h.state("Row 25") == .inUse, "Row 25 is in use: \(String(describing: h.state("Row 25")))")
+        let top = h.cardTop("Row 25")
+        h.check(top.map { $0 > m.height - m.pinned } == true, "Row 25's card starts below the unscrolled cards: at \(String(describing: top)) of a \(m.height - m.pinned) pt viewport")
     },
     // Section 6 steps, section 8 invariants and section 9 cases.
     Scenario(pair: "(Switch step 2, quit prompt cancelled)", model: "\"Switch cancelled\", nothing changed") { h in
