@@ -218,57 +218,15 @@ enum AccountsFile {
 // MARK: - Usage
 
 /// One usage window from Claude's usage service: how much of it is used and when it resets.
-struct UsageWindow: Equatable, Codable {
+struct UsageWindow: Equatable {
     /// Percent used as the usage service reports it, unrounded; "out" is decided on this.
     let utilization: Double
     let resetsAt: Date?
-
-    /// Rounded, for display only.
-    var pct: Int { Int(utilization.rounded()) }
-
-    private enum CodingKeys: String, CodingKey { case utilization, pct, resetsAt }
 
     init(utilization: Double, resetsAt: Date?) {
         self.utilization = utilization
         self.resetsAt = resetsAt
     }
-
-    /// A cache written before the unrounded value was kept has only `pct`.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        utilization = try c.decodeIfPresent(Double.self, forKey: .utilization) ?? Double(c.decode(Int.self, forKey: .pct))
-        resetsAt = try c.decodeIfPresent(Date.self, forKey: .resetsAt)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(utilization, forKey: .utilization)
-        try c.encode(pct, forKey: .pct)
-        try c.encodeIfPresent(resetsAt, forKey: .resetsAt)
-    }
-
-    /// Relative and absolute together: "in 2 h 05 m · 13:10" today, "in 2 days · Sep 27, 13:00"
-    /// further out, and "No reset pending" for a window that hasn't started.
-    var resetText: String {
-        guard let date = resetsAt else { return "No reset pending" }
-        let secs = date.timeIntervalSinceNow
-        if secs <= 0 { return "Resetting now" }
-        let f = DateFormatter()
-        let relative: String
-        if secs < 24 * 3600 {
-            let h = Int(secs) / 3600, m = (Int(secs) % 3600) / 60
-            relative = h > 0 ? "in \(h) h \(String(format: "%02d", m)) m" : "in \(max(m, 1)) min"
-            f.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm" : "EEE HH:mm"
-        } else {
-            let days = Int((secs / 86400).rounded())
-            relative = "in \(days) day\(days == 1 ? "" : "s")"
-            f.dateFormat = "MMM d, HH:mm"
-        }
-        return "\(relative) · \(f.string(from: date))"
-    }
-
-    /// A reset this close means the account frees up soon, which is when switching to it pays off.
-    var resetsSoon: Bool { resetsAt.map { $0.timeIntervalSinceNow > 0 && $0.timeIntervalSinceNow <= 15 * 60 } ?? false }
 
     /// One window of the usage response, such as its `five_hour` object. Nil when the response has
     /// no such window: the object is missing or null, or its utilization is null. Claude's own
@@ -285,21 +243,6 @@ struct UsageWindow: Equatable, Codable {
         if let d = f.date(from: s) { return d }
         f.formatOptions = [.withInternetDateTime]
         return f.date(from: s)
-    }
-}
-
-/// What a row's meters and the menu bar gauge show.
-enum MeterRule {
-    /// The 5-hour meter shows unless a reading says the account has no 5-hour window: Claude's
-    /// usage service leaves that window out for a plan without the limit, and Claude's own usage
-    /// panels then show no 5-hour row. A reading with no weekly window either carries no such
-    /// signal, so the meter still shows rather than hide a real limit.
-    static func showsFiveHour(fiveHour: UsageWindow?, weekly: UsageWindow?) -> Bool { fiveHour != nil || weekly == nil }
-
-    /// The window the menu bar gauge follows: the chosen limit, or the weekly one for an account
-    /// without a 5-hour window.
-    static func gauge(_ metric: UsageMetric, fiveHour: UsageWindow?, weekly: UsageWindow?) -> UsageWindow? {
-        metric == .fiveHour ? fiveHour ?? weekly : weekly
     }
 }
 
@@ -768,11 +711,6 @@ struct ClaudeEvents {
 
     func lastTurnEnd(on seat: Identity) -> Date? {
         events.last { e in if case .turnEnded = e.event { return e.held == seat && e.settled }; return false }?.at
-    }
-
-    /// The last settled LimitStop on `seat`.
-    func lastLimitStop(on seat: Identity) -> Date? {
-        events.last { e in if case .limitStop = e.event { return e.held == seat && e.settled }; return false }?.at
     }
 
     static func event<S: StringProtocol>(_ line: S, held: Identity?) -> LogEvent? {

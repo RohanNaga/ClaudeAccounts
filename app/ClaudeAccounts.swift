@@ -30,9 +30,6 @@ enum API {
     static let keychainPrefix = "Claude Code-credentials"
     /// Renew when the access token has less than this left, so a poll never races expiry.
     static let refreshMargin: TimeInterval = 10 * 60
-    /// A login has a fixed deadline about four weeks out that renewals don't extend; ask
-    /// for a fresh sign-in this long before it lapses.
-    static let signInWarning: TimeInterval = 24 * 3600
 }
 
 // MARK: - Process helpers
@@ -73,7 +70,6 @@ struct Credential: Decodable {
     let accessToken: String
     let expiresAt: Double
     let refreshTokenExpiresAt: Double?
-    let subscriptionType: String?
 }
 
 enum Keychain {
@@ -221,22 +217,13 @@ extension AppSettings {
 
 // MARK: - Usage
 
+/// One read of a seat's usage.
 enum AccountState: Equatable {
-    case loading
-    case ok(plan: String?, fiveHour: UsageWindow?, weekly: UsageWindow?, loginExpiresAt: Date?)
-    case needsLogin(String)
-    case error(String)
-    /// The usage service asked us to wait; nothing has been read for this account yet.
+    case ok(fiveHour: UsageWindow?, weekly: UsageWindow?)
+    /// The usage service asked us to wait.
     case rateLimited(until: Date)
-
-    /// Signed out, or within a day of the login's fixed deadline.
-    var needsSignIn: Bool {
-        switch self {
-        case .needsLogin: return true
-        case .ok(_, _, _, let expires?): return expires.timeIntervalSinceNow < API.signInWarning
-        default: return false
-        }
-    }
+    /// No login, a refused login, or a failed request: the last reading stays and goes stale.
+    case unreadable
 }
 
 /// Reads one account's usage. Production asks the usage service with the account's own login;
@@ -277,10 +264,10 @@ enum Usage {
         // Past the fixed deadline no renewal can succeed, so skip straight to asking.
         if let stored = await Keychain.credential(service: acct.keychainService),
            let deadline = stored.refreshTokenExpiresAt, deadline / 1000 < World.now().timeIntervalSince1970 {
-            return .needsLogin("Login expired.")
+            return .unreadable
         }
         guard let cred = await freshCredential(acct) else {
-            return .needsLogin("No stored login.")
+            return .unreadable
         }
         var req = URLRequest(url: API.usage, timeoutInterval: 15)
         req.setValue("Bearer " + cred.accessToken, forHTTPHeaderField: "Authorization")
@@ -288,20 +275,14 @@ enum Usage {
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if code == 401 { return .needsLogin("Login was rejected.") }
             if code == 429 {
                 let wait = ((resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init) ?? 300
                 return .rateLimited(until: World.now().addingTimeInterval(wait))
             }
-            guard code == 200, let body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return .error("Usage service answered HTTP \(code).")
-            }
-            return .ok(plan: cred.subscriptionType,
-                       fiveHour: UsageWindow(body["five_hour"]),
-                       weekly: UsageWindow(body["seven_day"]),
-                       loginExpiresAt: cred.refreshTokenExpiresAt.map { Date(timeIntervalSince1970: $0 / 1000) })
+            guard code == 200, let body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return .unreadable }
+            return .ok(fiveHour: UsageWindow(body["five_hour"]), weekly: UsageWindow(body["seven_day"]))
         } catch {
-            return .error(error.localizedDescription)
+            return .unreadable
         }
     }
 }
@@ -410,20 +391,6 @@ enum ClaudeApp {
         guard let last = data.lastIndex(of: UInt8(ascii: "\n")) else { return ("", offset) }
         let whole = data[data.startIndex...last]
         return (String(decoding: whole, as: UTF8.self), offset + UInt64(whole.count))
-    }
-
-    /// Everything Claude logged after `mark`, following main.log across a rotation.
-    static func logText(since mark: LogMark) -> String {
-        if logMark().inode == mark.inode { return readLines(log, from: mark.offset).text }
-        let rotated = ClaudeFiles.rotations.map { logDir.appendingPathComponent(ClaudeFiles.rotatedLog($0)) }
-            .first { logMark($0).inode == mark.inode }
-        return (rotated.map { readLines($0, from: mark.offset).text } ?? "") + readLines(log, from: 0).text
-    }
-
-    /// The log of Claude's current run (or its last one, once it has quit), across a rotation.
-    static func currentRunText() -> String {
-        let text = readLines(logDir.appendingPathComponent(ClaudeFiles.rotatedLog(1)), from: 0).text + readLines(log, from: 0).text
-        return text.range(of: ClaudeLog.appStart, options: .backwards).map { String(text[$0.lowerBound...]) } ?? text
     }
 
     /// Claude's last two log files read in order as the model's events (F3).
@@ -626,12 +593,6 @@ enum SavedLogins {
     }
 
     static func remove(_ seat: Identity) { try? FileManager.default.removeItem(at: dir(seat)) }
-
-    /// A row's saved login Claude still accepts: saved, and not refused since (model, section 3).
-    static func usable(_ row: AccountRecord, refusedAt: (Identity) -> Date?) -> Identity? {
-        guard let seat = row.identity, let at = savedAt(seat), !(refusedAt(seat).map { $0 > at } ?? false) else { return nil }
-        return seat
-    }
 
     /// Bring each row's login from the old per-row slot into its pair's folder, once.
     static func adopt(_ rows: [AccountRecord]) {
@@ -1550,7 +1511,7 @@ final class Store: ObservableObject {
     /// which goes stale on its own. The first reading after a stop sets that stop's reset.
     private func record(_ state: AccountState, for seat: Identity, at readAt: Date) {
         switch state {
-        case .ok(_, let fh, let wk, _):
+        case .ok(let fh, let wk):
             let before = meters[seat]?.readAt ?? .distantPast
             if let last = meters[seat], !last.showsFull, let at = last.readAt { roomReadAt[seat] = at }
             let reading = SeatMeters(fiveHour: fh.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
@@ -1565,7 +1526,7 @@ final class Store: ObservableObject {
             }
         case .rateLimited(let until):
             retryAt[seat] = until
-        case .loading, .needsLogin, .error:
+        case .unreadable:
             break
         }
     }
@@ -1795,12 +1756,6 @@ final class Store: ObservableObject {
 
     /// Switch Claude to a seat with no saved login, at its sign-in page.
     func setUp(_ seat: Seat) { run(to: seat.id, kind: .setUp) }
-
-    /// Wait for the switch in progress, and the resume after it, to end.
-    func finishSwitch() async {
-        await switchTask?.value
-        await resumeTask?.value
-    }
 
     /// Each seat's row label, for the switch's lines.
     private var names: [Identity: String] { Dictionary(seats.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a }) }
