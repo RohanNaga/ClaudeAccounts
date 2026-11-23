@@ -598,6 +598,14 @@ struct SeatMeters: Equatable, Codable {
     func isFresh(at now: Date) -> Bool { wokeSince == nil && (readAt.map { now.timeIntervalSince($0) < Limits.freshness } ?? false) }
     func isStale(at now: Date) -> Bool { readAt != nil && !isFresh(at: now) }
 
+    /// Fresh, and no reset of its own has passed since it was read: the only reading the automatic
+    /// switch acts on. Once a reset passes, the seat is read again before anything is decided on it
+    /// (model, section 7: reset time passes, read the meter, then resume in place or switch).
+    func isCurrent(at now: Date) -> Bool {
+        guard isFresh(at: now), let readAt else { return false }
+        return ![fiveHour, weekly].contains { m in m?.resetsAt.map { $0 > readAt && $0 <= now } ?? false }
+    }
+
     /// "not read yet", "read 40 min ago", or nil while fresh.
     func readText(at now: Date) -> String? {
         guard let readAt else { return "not read yet" }
@@ -717,6 +725,16 @@ struct ClaudeEvents {
         return Set(last.compactMap { chat, e in
             if case .limitStop = e.event, e.held == seat { return chat } else { return nil }
         })
+    }
+
+    /// When the log last said anything of `chat`: a turn that ended, a usage stop or a cut by quit.
+    func lastWord(of chat: String) -> Date? {
+        events.last { e in
+            switch e.event {
+            case .turnEnded(let c), .limitStop(let c), .cutByQuit(let c): return c == chat
+            default: return false
+            }
+        }?.at
     }
 
     func lastTurnEnd(on seat: Identity) -> Date? {
@@ -881,18 +899,18 @@ enum AutoSwitch {
     }
 
     /// Claude itself showed the settled seat in use is done: a settled limit stop (recorded as a
-    /// StopMark), or a settled turn end followed by a later reading at 100. A meter alone never is.
+    /// StopMark), or a settled turn end followed by a later, current reading at 100. A meter alone never is.
     static func isDone(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
         if let mark = f.stops[seat], mark.until > now { return true }
         guard let ended = f.log.lastTurnEnd(on: seat), let m = f.meters[seat], let readAt = m.readAt,
-              ClaudeEvents.readAfter(ended, readAt: readAt), m.isFresh(at: now), m.showsFull else { return false }
+              ClaudeEvents.readAfter(ended, readAt: readAt), m.isCurrent(at: now), m.showsFull else { return false }
         return true
     }
 
-    /// A fresh reading with room, taken once the seat's last stop had run out (section 4: the reset
-    /// is read a minute later, then the chats resume). A stop mark running out is not room by itself.
+    /// A current reading with room, taken once the seat's last stop had run out (section 4: the
+    /// reset is read a minute later, then the chats resume). A stop mark running out is not room by itself.
     static func hasRoom(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
-        guard let m = f.meters[seat], let readAt = m.readAt, m.isFresh(at: now), !m.showsFull else { return false }
+        guard let m = f.meters[seat], let readAt = m.readAt, m.isCurrent(at: now), !m.showsFull else { return false }
         return readAt >= f.stops[seat]?.until ?? .distantPast
     }
 
@@ -912,11 +930,11 @@ enum AutoSwitch {
         return ordered.compactMap(\.identity)
     }
 
-    /// In that order, the first Ready seat with a fresh reading that has not failed as a target
+    /// In that order, the first Ready seat with a current reading that has not failed as a target
     /// within coolDown.
     static func target(from: Identity, _ f: Facts, now: Date) -> Identity? {
         order(from: from, f).first { s in
-            seatState(s, f, now: now) == .ready && (f.meters[s]?.isFresh(at: now) ?? false)
+            seatState(s, f, now: now) == .ready && (f.meters[s]?.isCurrent(at: now) ?? false)
                 && !(f.failedTargets[s].map { now.timeIntervalSince($0) < Limits.coolDown } ?? false)
         }
     }

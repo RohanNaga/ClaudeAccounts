@@ -35,13 +35,11 @@ enum API {
 // MARK: - Process helpers
 
 enum ClaudeCLI {
-    /// The CLI isn't on a menu bar app's PATH, so look in the usual install locations.
+    /// The CLI isn't on a menu bar app's PATH, so look in the usual install locations. A test
+    /// world looks only under its own home, so no test can find the Mac's real CLI.
     static var path: String? {
-        let candidates = [
-            Paths.home.appendingPathComponent(".local/bin/claude").path,
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude",
-        ]
+        let own = Paths.home.appendingPathComponent(".local/bin/claude").path
+        let candidates = World.isTest ? [own] : [own, "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
@@ -346,7 +344,7 @@ enum ClaudeApp {
             case .wait(let what):
                 if what != shown { shown = what; progress(what) }
             case .cancel:
-                _ = World.claude.pressQuitPrompt(ClaudeUI.cancel, in: running)
+                cancelQuitPrompt(in: running)
                 return QuitResult(outcome: .failed, answered: watch.answeredAt != nil)
             case .answer:
                 if World.claude.pressQuitPrompt(ClaudeUI.quitAnyway, in: running) {
@@ -360,6 +358,14 @@ enum ClaudeApp {
                 firstTry = firstTry ?? World.now()
             }
         }
+    }
+
+    /// Press Cancel on Claude's quit prompt, an automatic switch giving up on its quit. Only a
+    /// prompt found by its Quit anyway button is pressed: a window the app doesn't recognise as
+    /// the prompt is left to the person (section 8 B).
+    static func cancelQuitPrompt(in owners: [pid_t]) {
+        guard World.claude.quitPromptOpen(in: owners) else { return }
+        _ = World.claude.pressQuitPrompt(ClaudeUI.cancel, in: owners)
     }
 
     static func launch() async { await World.claude.launch() }
@@ -650,6 +656,9 @@ struct SwitchOutcome: Equatable {
     var notResumed: [String] = []
     /// Another switch started during the resume and carries its chats on.
     var superseded = false
+    /// The chats this switch set out to resume. One that did not confirm hands them back, so they
+    /// travel on to the next try.
+    var resume: Set<String> = []
 }
 
 /// One switch at a time across the whole Mac.
@@ -741,9 +750,9 @@ enum Switch {
         let to: Identity
         /// Each seat's row label; a pair with no row reads "another account".
         let names: [Identity: String]
-        /// Chats an automatic switch resumes, from the log as the Store read it before the quit: those
-        /// stopped for usage on the seat in use and the wrapped-up ones. A failed read at the quit, or
-        /// a retry after an undone switch, keeps them.
+        /// Chats that wait for this switch: those the seat in use's out signal stopped (usage stops
+        /// and wrap-ups), kept by the Store from the decision through every failed try. A failed
+        /// read at the quit keeps them.
         var resume: Set<String> = []
         func name(_ id: Identity?) -> String { id.flatMap { names[$0] } ?? "another account" }
     }
@@ -805,12 +814,12 @@ enum Switch {
         case .declined:
             SwitchJournal.clear()
             unlock()
-            return SwitchOutcome(ok: false, text: "Switch cancelled.")
+            return SwitchOutcome(ok: false, text: "Switch cancelled.", resume: r.resume)
         case .failed:
             SwitchJournal.clear()
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
             unlock()
-            return SwitchOutcome(ok: false, text: "Claude didn't quit, so nothing changed.")
+            return SwitchOutcome(ok: false, text: "Claude didn't quit, so nothing changed.", resume: r.resume)
         }
         // The run that just ended names the chats that were working: stopped for usage or cut by the quit.
         let ended = ClaudeApp.events().stoppedChats
@@ -847,6 +856,7 @@ enum Switch {
     private static func finish(_ outcome: SwitchOutcome, _ j: SwitchJournal, _ r: Request, progress: @escaping Progress,
                                switched: @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome {
         var outcome = outcome
+        outcome.resume = Set(j.resume)
         let generation = SwitchLock.generation()
         let folder = ClaudeApp.folder(j.to)
         let chats = outcome.ok && !outcome.parked
@@ -854,7 +864,8 @@ enum Switch {
                                   stoppedByLimit: Set(j.resume), cutByQuit: [])
             : []
         outcome.toResume = chats.count
-        // While a Claude shape is missing, resume is off (section 8 B): the chats are named instead.
+        // While a Claude shape is missing, resume is off (section 8 B): nothing is opened, typed or
+        // pressed in Claude, and the chats are named instead, the same for every kind of switch.
         if !ShapeMisses.load().isEmpty { outcome.notResumed = chats.map(\.title) }
         unlock()
         await switched(outcome)
@@ -1037,10 +1048,12 @@ enum Switch {
     private static func rollback(_ j: inout SwitchJournal, _ r: Request, progress: @escaping Progress) async -> SwitchOutcome {
         await World.claude.willStep("rollback")
         // Before load with no chat moved, Claude's files are as it left them: there is nothing to
-        // put back, so Claude is not asked to quit again, only opened if it is closed.
+        // put back, so Claude is not asked to quit again, only opened if it is closed. An automatic
+        // switch stopped at its quit may have left Claude's prompt open with nobody to answer it.
         if j.step < .load, j.moves.isEmpty {
             SwitchJournal.clear()
-            if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
+            let running = ClaudeApp.pids()
+            if running.isEmpty { await ClaudeApp.launch() } else if j.kind == .auto { ClaudeApp.cancelQuitPrompt(in: running) }
             return SwitchOutcome(ok: true, text: "Back on \(r.name(j.from)).")
         }
         progress("Going back to \(r.name(j.from))…")
@@ -1215,13 +1228,8 @@ enum ShapeMisses {
         try? data.write(to: url, options: .atomic)
     }
 
-    /// When the app last relied on a shape and found it missing, in this process. A switch that
-    /// met a missing shape lets the paused line, which says why, stand in for its failure line.
-    nonisolated(unsafe) private(set) static var lastMet: Date?
-
     /// `shape` was relied on and was not there. A Named line logged from `since` on clears it.
     static func missed(_ shape: ClaudeShape, since: Date = World.now()) {
-        lastMet = World.now()
         var misses = load()
         guard misses[shape] == nil else { return }
         misses[shape] = since
@@ -1312,8 +1320,12 @@ final class Store: ObservableObject {
     private var savedHold: Hold?
     /// When each seat was last read with room: turns that ended after it ended as the seat ran out.
     private var roomReadAt: [Identity: Date] = [:]
-    /// Chats already resumed in place, so a wait resumes each stopped chat once.
-    private var resumed: Set<String> = []
+    /// Chats resumed in place, each with when, so a wait resumes each stopped chat once.
+    private var resumed: [String: Date] = [:]
+    /// The chats the seat in use's out signal stopped, each with when it began to wait. They go
+    /// with every switch request, from the decision through each failed try, until a switch
+    /// confirms or they resume in place.
+    private var waiting: [String: Date] = [:]
     private var switchingTo: SwitchFacts?
     private var failure: String?
     private var success: (text: String, until: Date)?
@@ -1332,8 +1344,6 @@ final class Store: ObservableObject {
     /// The wait that was already posted, by the time its out signal began, so each wait is
     /// posted once.
     private var waitPosted = false
-    /// When the running switch started, to tell whether it met a missing shape.
-    private var startedAt: Date?
     /// What the diagnostics file last recorded, so each publish logs only what changed.
     private var logged: Diagnostics.Snapshot?
 
@@ -1394,10 +1404,11 @@ final class Store: ObservableObject {
         return f
     }
 
-    /// Chats of the current run that Claude stopped for usage and that were not resumed yet.
+    /// Chats that wait for a seat with room: those Claude stopped for usage in its current run and
+    /// those the out signal stopped, through any undone switch, that were not resumed yet.
     private func waitingChats(_ f: Facts) -> Set<String> {
         guard f.hold != nil else { return [] }
-        return f.log.stoppedChats.byLimit.subtracting(resumed)
+        return f.log.stoppedChats.byLimit.union(waiting.keys).subtracting(resumed.keys)
     }
 
     /// Rebuild the rows and the notice from the facts.
@@ -1410,11 +1421,7 @@ final class Store: ObservableObject {
         for (kind, fields) in Diagnostics.changes(from: logged, to: snap) { Diagnostics.record(kind, fields) }
         logged = snap
         let waitLine = switchTask == nil ? SwitchJournal.load().flatMap { $0.waitLine(names[$0.to] ?? "a seat") } : nil
-        // A switch that met a missing shape failed because of it: while that miss stands, the
-        // paused line says why, and the failure line shows once it clears.
-        let metMiss = ShapeMisses.lastMet.map { $0 >= startedAt ?? .distantFuture } ?? false
-        notice = AppState.notice(f, now: now, failure: metMiss && !f.claude.missing.isEmpty ? nil : failure,
-                                 success: success?.text, finishing: waitLine)
+        notice = AppState.notice(f, now: now, failure: failure, success: success?.text, finishing: waitLine)
     }
 
     var firstRun: Bool { accounts.isEmpty }
@@ -1465,6 +1472,10 @@ final class Store: ObservableObject {
         log.poll()
         ShapeMisses.clearNamed(seenIn: log.events)
         recordStops()
+        // A chat that ran again since it began to wait, or since it was resumed, is done with both.
+        let events = log.events
+        waiting = waiting.filter { (events.lastWord(of: $0.key) ?? .distantPast) <= $0.value }
+        resumed = resumed.filter { (events.lastWord(of: $0.key) ?? .distantPast) <= $0.value }
     }
 
     /// Each settled usage stop becomes the seat's stop mark, with the reset of the reading taken
@@ -1599,19 +1610,28 @@ final class Store: ObservableObject {
         case .none:
             break
         case .wait(let seat, let at):
-            postWait(f, seat: seat, resumesAt: at)
+            if let held = f.hold?.seat { stopped(on: held, now: now) }
+            postWait(facts(now: now), seat: seat, resumesAt: at)
         case .resumeInPlace:
             guard let seat = f.hold?.seat else { return }
             resumeInPlace(waitingChats(f), on: seat, now: now)
         case .switchTo(let target):
             // The switch runs on its own task; a failed target sends the decision round again.
             guard switchTask == nil, let seat = f.hold?.seat else { return }
-            // With no reading with room on record, only the turn that set off the last read counts.
-            let since = roomReadAt[seat] ?? log.events.lastTurnEnd(on: seat) ?? now
+            stopped(on: seat, now: now)
             // Which of Claude's two signals set it off (model, section 4), for the diagnostics file.
             let trigger = (stops[seat].map { $0.until > now } ?? false) ? "limitStop" : "wrapUp"
-            let resume = log.events.stoppedForUsage(on: seat).union(log.events.turnsEnded(on: seat, since: since))
-            run(to: target, kind: .auto, resume: resume, trigger: trigger)
+            run(to: target, kind: .auto, trigger: trigger)
+        }
+    }
+
+    /// The seat in use is done: the chats its out signal stopped begin to wait, those Claude
+    /// stopped for usage on it and the turns a wrap-up ended (model, section 6, step 7).
+    private func stopped(on seat: Identity, now: Date) {
+        // With no reading with room on record, only the turn that set off the last read counts.
+        let since = roomReadAt[seat] ?? log.events.lastTurnEnd(on: seat) ?? now
+        for chat in log.events.stoppedForUsage(on: seat).union(log.events.turnsEnded(on: seat, since: since)) where waiting[chat] == nil {
+            waiting[chat] = now
         }
     }
 
@@ -1629,7 +1649,7 @@ final class Store: ObservableObject {
     /// Type "resume" into the chats a wait stopped, now that the seat in use has room again.
     private func resumeInPlace(_ chats: Set<String>, on seat: Identity, now: Date) {
         guard !chats.isEmpty else { return }
-        resumed.formUnion(chats)
+        for chat in chats { resumed[chat] = now; waiting[chat] = nil }
         let folder = ClaudeApp.folder(seat)
         let moved = chats.compactMap { ChatResume.chat(folder.appendingPathComponent($0 + ".json")) }
         let resumer = ChatResume.resumer(in: folder, reopenedAt: now.timeIntervalSince1970 * 1000, progress: { _ in })
@@ -1801,9 +1821,10 @@ final class Store: ObservableObject {
     /// Each seat's row label, for the switch's lines.
     private var names: [Identity: String] { Dictionary(seats.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a }) }
 
-    /// Run one switch; a second request while one runs is refused with a notice.
+    /// Run one switch, taking the waiting chats with it; a second request while one runs is
+    /// refused with a notice.
     @discardableResult
-    private func run(to target: Identity, kind: SwitchJournal.Kind, resume: Set<String> = [], trigger: String? = nil) -> Task<Void, Never> {
+    private func run(to target: Identity, kind: SwitchJournal.Kind, trigger: String? = nil) -> Task<Void, Never> {
         if let busy = switchTask {
             let to = switchingTo?.target ?? SwitchJournal.load()?.to
             let line = "Already switching to \(to.flatMap { names[$0] } ?? "a seat")."
@@ -1820,7 +1841,7 @@ final class Store: ObservableObject {
         let rows = accounts.map(\.seat)
         Diagnostics.record(.switchStarted, ["type": kind.rawValue, "from": from.map { rows.firstIndex(of: $0) ?? -1 } ?? NSNull(),
                                             "to": rows.firstIndex(of: target) ?? -1, "trigger": trigger ?? NSNull()])
-        let request = Switch.Request(kind: kind, to: target, names: names, resume: resume)
+        let request = Switch.Request(kind: kind, to: target, names: names, resume: Set(waiting.keys))
         return start(target) { progress, switched in await Switch.run(request, progress: progress, switched: switched) } then: { outcome in
             if kind == .auto { self.autoFinished(outcome, from: from, to: target) }
         }
@@ -1845,7 +1866,6 @@ final class Store: ObservableObject {
                        then: @escaping (SwitchOutcome) -> Void) -> Task<Void, Never> {
         failure = nil
         success = nil
-        startedAt = World.now()
         runs += 1
         let run = runs
         switchingTo = SwitchFacts(target: target, step: "Starting…")
@@ -1892,10 +1912,15 @@ final class Store: ObservableObject {
         if outcome.ok, !outcome.parked, let target, target.orgUnknown { learnOrganization(of: target) }
         Diagnostics.record(.switchEnded, ["state": Diagnostics.outcomeName(outcome),
                                           "to": target.flatMap { t in accounts.firstIndex { $0.seat == t } } ?? -1])
+        // A confirmed switch took the chats it set out to resume; any other end hands them back.
+        let now = World.now()
+        for chat in outcome.resume {
+            if outcome.ok, !outcome.parked { waiting[chat] = nil } else if waiting[chat] == nil { waiting[chat] = now }
+        }
         if outcome.parked {
             failure = nil
         } else if outcome.ok {
-            if !outcome.text.isEmpty { success = (outcome.text, World.now() + Self.successFor) }
+            if !outcome.text.isEmpty { success = (outcome.text, now + Self.successFor) }
         } else if !outcome.text.isEmpty {
             failure = outcome.detail.map { "\(outcome.text) \($0)" } ?? outcome.text
         }
@@ -2062,11 +2087,14 @@ final class LoginFlow: ObservableObject {
     /// (a target's own, or another organization of a known account) is pre-selected on the
     /// sign-in page through Claude Code's `forceLoginOrgUUID` setting in that login's folder.
     func start(reauth target: AccountRecord? = nil, organization: String? = nil, email: String? = nil) {
-        guard let cli = ClaudeCLI.path else { phase = .failed("Claude Code isn't installed. Install it, then try again."); return }
+        let prefill = target?.email ?? email
+        // Pre-filling the email steers the browser to the right Google account.
+        let args = ["auth", "login", "--claudeai"] + (prefill.map { ["--email", $0] } ?? [])
+        // The one program the app starts outside runProcess, so it passes the same gate.
+        guard let cli = ClaudeCLI.path, World.permits(cli, args) else { phase = .failed("Claude Code isn't installed. Install it, then try again."); return }
         let id = target?.id ?? "acct-" + UUID().uuidString.prefix(8).lowercased()
         let dir = target?.configURL ?? Paths.loginsDir.appendingPathComponent(id)
         let org = target?.orgUuid ?? organization
-        let prefill = target?.email ?? email
         reauth = target
         phase = .starting
         output = ""
@@ -2090,8 +2118,7 @@ final class LoginFlow: ObservableObject {
 
             let p = Process()
             p.executableURL = URL(fileURLWithPath: cli)
-            // Pre-filling the email steers the browser to the right Google account.
-            p.arguments = ["auth", "login", "--claudeai"] + (prefill.map { ["--email", $0] } ?? [])
+            p.arguments = args
             p.environment = ClaudeCLI.env(configDir: dir)
             let inPipe = Pipe(), outPipe = Pipe()
             p.standardInput = inPipe
