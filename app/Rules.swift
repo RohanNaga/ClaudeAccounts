@@ -884,12 +884,10 @@ enum AutoSwitch {
     enum Status: Equatable {
         case on, offAccessibility, offShapeMissing(ClaudeShape), offByPerson
 
-        /// A wait still ends in place. A shape miss pauses switching on its own, not that end:
-        /// the chats are then named instead of typed into, as after a switch (section 8 B).
-        var endsWaits: Bool {
-            if case .offShapeMissing = self { return true }
-            return self == .on
-        }
+        /// A wait still ends in place unless the person turned automatic switching off. A pause
+        /// (a shape miss, or no Accessibility) stops switching on its own, not that end: the
+        /// resume step then names the chats instead of typing into them (sections 8 B and 12).
+        var endsWaits: Bool { self != .offByPerson }
     }
 
     static func status(_ f: Facts) -> Status {

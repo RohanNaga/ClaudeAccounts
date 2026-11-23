@@ -649,16 +649,20 @@ struct SwitchOutcome: Equatable {
     var detail: String? = nil
     /// The journal stays and waits on Claude: to open, to confirm the switch, or to close, to undo it.
     var parked = false
-    /// The chats the switch set out to resume, and the ones it got running.
-    var toResume = 0
-    var resumed = 0
-    /// Each stopped chat still waiting, by title.
-    var notResumed: [String] = []
-    /// Another switch started during the resume and carries its chats on.
-    var superseded = false
     /// The chats this switch set out to resume. One that did not confirm hands them back, so they
     /// travel on to the next try.
     var resume: Set<String> = []
+    /// How the resume of the chats a confirmed switch brought over ended.
+    var resumeEnd = ResumeEnd()
+}
+
+/// How one resume ended, after a switch or in place.
+struct ResumeEnd: Equatable {
+    var resumed = 0
+    /// The chats still not running, by title: each needs a message from the person.
+    var notResumed: [String] = []
+    /// Another switch started and carries the chats not yet settled on.
+    var superseded = false
 }
 
 /// One switch at a time across the whole Mac.
@@ -863,26 +867,34 @@ enum Switch {
             ? ResumeRule.toResume(((try? ClaudeApp.openSessionRecords(in: folder)) ?? []).compactMap(ChatResume.chat),
                                   stoppedByLimit: Set(j.resume), cutByQuit: [])
             : []
-        outcome.toResume = chats.count
-        // While a Claude shape is missing, resume is off (section 8 B): nothing is opened, typed or
-        // pressed in Claude, and the chats are named instead, the same for every kind of switch.
-        if !ShapeMisses.load().isEmpty { outcome.notResumed = chats.map(\.title) }
         unlock()
         await switched(outcome)
-        guard !chats.isEmpty, outcome.notResumed.isEmpty else { return outcome }
-        var resumer = ChatResume.resumer(in: folder, reopenedAt: (j.launchedAt ?? World.now()).timeIntervalSince1970 * 1000,
-                                         progress: progress)
+        outcome.resumeEnd = await resume(chats, in: folder, reopenedAt: j.launchedAt ?? World.now(), progress: progress, generation: generation)
+        return outcome
+    }
+
+    /// The one resume step (section 6, step 7), after a switch and when a wait ends in place:
+    /// `chats`, whose records are in `folder`, Claude having reopened at `reopenedAt`. When typing
+    /// can't work, a Claude shape missing (8 B) or no Accessibility (7), nothing is opened, typed or
+    /// pressed in Claude, and every chat is named instead (12). Otherwise each chat the resume gives
+    /// up on is named. A switch that starts during it, a new `generation`, takes over the chats not
+    /// yet settled and resumes them after its own confirm.
+    static func resume(_ chats: [MovedChat], in folder: URL, reopenedAt: Date, progress: @escaping Progress,
+                       generation: String = SwitchLock.generation()) async -> ResumeEnd {
+        guard !chats.isEmpty else { return ResumeEnd() }
+        guard ShapeMisses.load().isEmpty, World.claude.trusted else { return ResumeEnd(notResumed: chats.map(\.title)) }
+        var resumer = ChatResume.resumer(in: folder, reopenedAt: reopenedAt.timeIntervalSince1970 * 1000, progress: progress)
         resumer.current = { SwitchLock.generation() == generation }
-        carried = Set(chats.map(\.id))
+        let ids = Set(chats.map(\.id))
+        carried.formUnion(ids)
         resumer.settled = { carried.remove($0) }
         let reports = await resumer.run(chats)
         // A resume no switch overtook leaves nothing to carry: what it gave up on is named instead.
-        if resumer.current() { carried = [] }
-        outcome.resumed = reports.filter(\.result.runningAgain).count
-        outcome.superseded = reports.contains { $0.result == .notResumed(ChatResumer.superseded) }
-        outcome.notResumed = reports.filter { !$0.result.runningAgain && $0.result != .notResumed(ChatResumer.superseded) }
-            .map(\.chat.title)
-        return outcome
+        if resumer.current() { carried.subtract(ids) }
+        let superseded = ResumeRule.Result.notResumed(ChatResumer.superseded)
+        return ResumeEnd(resumed: reports.filter(\.result.runningAgain).count,
+                         notResumed: reports.filter { !$0.result.runningAgain && $0.result != superseded }.map(\.chat.title),
+                         superseded: reports.contains { $0.result == superseded })
     }
 
     /// Steps save to confirm, from wherever the journal stands.
@@ -1646,16 +1658,17 @@ final class Store: ObservableObject {
         World.claude.notify(title: "Every seat is out", body: "Chats resume when \(name) resets\(when).")
     }
 
-    /// Type "resume" into the chats a wait stopped, now that the seat in use has room again. While a
-    /// Claude shape is missing nothing is typed: the chats are named instead, as after a switch (8 B).
+    /// The chats a wait stopped get the resume step, now that the seat in use has room again; the
+    /// ones it can't get running are named, as after a switch.
     private func resumeInPlace(_ chats: Set<String>, on seat: Identity, now: Date) {
         guard !chats.isEmpty else { return }
         for chat in chats { resumed[chat] = now; waiting[chat] = nil }
-        guard ShapeMisses.load().isEmpty else { return needMessage(chats.count) }
         let folder = ClaudeApp.folder(seat)
-        let moved = chats.compactMap { ChatResume.chat(folder.appendingPathComponent($0 + ".json")) }
-        let resumer = ChatResume.resumer(in: folder, reopenedAt: now.timeIntervalSince1970 * 1000, progress: { _ in })
-        Task { _ = await resumer.run(moved) }
+        let moved = chats.sorted().compactMap { ChatResume.chat(folder.appendingPathComponent($0 + ".json")) }
+        Task {
+            resumeEnded(await Switch.resume(moved, in: folder, reopenedAt: now, progress: { _ in }))
+            publish()
+        }
     }
 
     /// Turn Auto-Switch on or off. Turning it on is a click by the person at the Mac, so this is
@@ -1890,7 +1903,7 @@ final class Store: ObservableObject {
             let outcome = await body(progress, switched)
             // A switch that ended before confirm (cancelled, refused, failed) reports here.
             if !ended.set { self.switched(outcome, run: run) }
-            if outcome.toResume > 0 { self.resumeEnded(outcome) }
+            self.resumeEnded(outcome.resumeEnd)
             then(outcome)
             if self.runs == run { self.resumeTask = nil }
             self.publish()
@@ -1929,16 +1942,12 @@ final class Store: ObservableObject {
         publish()
     }
 
-    /// The chats a switch brought over were resumed: name any that still need a message.
-    private func resumeEnded(_ outcome: SwitchOutcome) {
-        guard !outcome.superseded else { return }
-        needMessage(outcome.notResumed.count)
-    }
-
-    /// One line names the stopped chats the app could not get running: the person sends them a
-    /// message (sections 7 and 12).
-    private func needMessage(_ n: Int) {
-        guard n > 0 else { return }
+    /// A resume ended, after a switch or in place: one line names the stopped chats the app could
+    /// not get running, so the person sends them a message (sections 7 and 12). A resume another
+    /// switch overtook names nothing: that switch carries its chats on.
+    private func resumeEnded(_ end: ResumeEnd) {
+        let n = end.notResumed.count
+        guard !end.superseded, n > 0 else { return }
         failure = "Couldn't resume \(n) chat\(n == 1 ? "" : "s"): send \(n == 1 ? "it" : "them") a message."
     }
 
@@ -1947,7 +1956,7 @@ final class Store: ObservableObject {
     private func autoFinished(_ outcome: SwitchOutcome, from: Identity?, to: Identity) {
         let name = { (s: Identity?) in s.flatMap { self.names[$0] } ?? "The seat in use" }
         if outcome.ok {
-            World.claude.notify(title: "Switched to \(name(to))", body: "\(name(from)) is out. \(outcome.resumed) chat\(outcome.resumed == 1 ? "" : "s") resumed.")
+            World.claude.notify(title: "Switched to \(name(to))", body: "\(name(from)) is out. \(outcome.resumeEnd.resumed) chat\(outcome.resumeEnd.resumed == 1 ? "" : "s") resumed.")
             return
         }
         guard !outcome.parked else { return }
