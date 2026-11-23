@@ -63,10 +63,12 @@ struct Scenario {
     }
 
     /// Writes the person's rows (F9), one per seat, in menu order.
-    func rows(_ seats: [(String, StandSeat)], orgNames: [String]? = nil) throws {
+    /// Rows listed in `noOrg` are old rows saved before organizations were kept (13a.4).
+    func rows(_ seats: [(String, StandSeat)], orgNames: [String]? = nil, noOrg: Set<Int> = []) throws {
         let list = seats.enumerated().map { i, s in
             AccountRecord(id: "row\(i)", name: s.0, color: "blue", configDir: claude.root.appendingPathComponent("cli/row\(i)").path,
-                          keychainService: "test-row\(i)", email: nil, accountUuid: s.1.account, orgName: orgNames?[i] ?? "Team", orgUuid: s.1.org)
+                          keychainService: "test-row\(i)", email: nil, accountUuid: s.1.account,
+                          orgName: noOrg.contains(i) ? nil : orgNames?[i] ?? "Team", orgUuid: noOrg.contains(i) ? nil : s.1.org)
         }
         try AccountStore.save(list)
     }
@@ -137,11 +139,27 @@ struct Scenario {
         await tick(); await settle()
     }
 
+    /// `n` rows, one account each, named "Row 1"..."Row n"; Claude holds Row 1 settled.
+    func manyRows(_ n: Int) async {
+        let seats = (1...n).map { StandSeat($0, org: 1) }
+        try? rows(seats.enumerated().map { ("Row \($0.offset + 1)", $0.element) })
+        try? await savedLogin("Row 1", seats[0])
+        for seat in seats { usage.set(seat, fiveHour: 20, resetsAt: clock.now().addingTimeInterval(3600)) }
+        claudeHoldsSettled(); make()
+        await tick(); await settle()
+    }
+
     func noticeHas(_ text: String) -> Bool { notice.contains { $0.contains(text) } }
     var quits: Int { claude.actions.filter { $0 == "quit" }.count }
     var launches: Int { claude.actions.filter { $0 == "launch" }.count }
     func resumed(_ chat: String) -> Bool { claude.sent.contains("\(chat) resume") }
 }
+
+/// The part of section 8's one line every shape miss shares, whatever names the cause.
+let pausedLine = "Switching on its own is paused."
+
+/// The menu's measures, as the drawn menu takes them (section 11).
+struct MenuMeasure { let height, content, pinned, margin, row: CGFloat }
 
 /// The model's constants (section 5), as the scenarios assume them.
 enum ClaudeTiming {
@@ -292,6 +310,51 @@ let scenarios: [Scenario] = [
         h.check(h.claude.actions.isEmpty, "no switch when every seat is out: \(h.claude.actions)")
         h.check(h.noticeHas("Every seat is out. Chats resume when") && h.noticeHas(DateFormatter.localizedString(from: reset, dateStyle: .none, timeStyle: .short)), "the waiting line names the reset: \(h.notice)")
     },
+    Scenario(pair: "(Every seat out, a second stop in the same wait)", model: "13a.8: one notification per wait, \"Every seat is out\"") { h in
+        await h.standard()
+        h.claude.addChat("local_two", in: A, lastActivity: h.clock.now())
+        let reset = h.clock.now().addingTimeInterval(2 * 3600)
+        for s in [A, B, C] { h.usage.set(s, fiveHour: 100, resetsAt: reset) }
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        h.claude.logLimitStop("local_one")
+        await h.pass(120)
+        h.claude.logLimitStop("local_two")
+        await h.pass(3 * ClaudeTiming.meterEvery)
+        let posted = h.claude.notifications.filter { $0.hasPrefix("Every seat is out") }
+        h.check(posted.count == 1, "one notification for the whole wait: \(h.claude.notifications)")
+        h.check(posted.first?.contains("Chats resume when") == true, "it names when chats resume: \(posted)")
+        h.check(h.claude.actions.isEmpty, "no switch: \(h.claude.actions)")
+    },
+    Scenario(pair: "(One seat out, out signal)", model: "13a.8: \"<seat> is out. Chats resume when it resets at <time>.\" no switch, no notification") { h in
+        try? h.rows([("Alpha", A)])
+        try? await h.savedLogin("Alpha", A)
+        let reset = h.clock.now().addingTimeInterval(2 * 3600)
+        h.usage.set(A, fiveHour: 100, resetsAt: reset)
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        h.claude.logLimitStop("local_one")
+        await h.pass(300)
+        let at = DateFormatter.localizedString(from: reset, dateStyle: .none, timeStyle: .short)
+        h.check(h.noticeHas("Alpha is out. Chats resume when it resets at \(at)."), "the one-seat waiting line: \(h.notice)")
+        h.check(h.claude.notifications.isEmpty, "no notification with one seat: \(h.claude.notifications)")
+        h.check(h.claude.actions.isEmpty, "no switch attempt: \(h.claude.actions)")
+    },
+    Scenario(pair: "(Old row with no organization, click Set Up)", model: "13a.4: shows Needs sign-in, never dropped; Set Up confirms on the account in any organization and fills it in; no chats move") { h in
+        try? h.rows([("Alpha", A), ("Beta", B)], noOrg: [1])
+        try? await h.savedLogin("Alpha", A)
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        h.check(h.rowNames.contains("Beta"), "the row with no organization is kept: \(h.rowNames)")
+        h.check(h.state("Beta") == .needsSignIn && h.action("Beta") == .setUp, "it shows Needs sign-in with Set Up: \(String(describing: h.state("Beta")))")
+        h.claude.signsInAs = B
+        h.click("Beta")
+        await h.run(until: { h.claude.held == B && h.hasSavedLogin(B) && !h.switchInFlight }, limit: 900)
+        h.check(h.claude.held == B && h.state("Beta") == .inUse, "Set Up confirmed on Beta's account: \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(h.hasSavedLogin(B), "the login is saved under the organization Claude named")
+        h.check(h.claude.chats(in: A).contains("local_one") && !h.claude.chats(in: B).contains("local_one"), "no chats moved, since the target folder was unknown")
+        h.check(h.hasSavedLogin(A), "Alpha's saved login is intact")
+    },
     Scenario(pair: "(Waiting, reset time passes)", model: "read the meter, then resume in place or switch") { h in
         await h.standard()
         let now = h.clock.now()
@@ -409,13 +472,17 @@ let scenarios: [Scenario] = [
     },
     Scenario(pair: "(Any, sleep then wake)", model: "meters stale then re-read; no automatic decision until a fresh read") { h in
         await h.standard()
-        h.clock.advance(2 * 3600)
-        h.usage.fail(B); h.usage.fail(C)
+        // A short sleep: the readings taken before it are minutes old, young enough to look fresh
+        // by age alone. A settled limit stop lands while the Mac sleeps; the reads after the wake fail.
+        h.check(h.meterText("Beta") == nil, "before the sleep Beta's meter is fresh: \(String(describing: h.meterText("Beta")))")
+        h.clock.advance(3 * 60)
         h.claude.logLimitStop("local_one")
-        h.check(h.meterText("Beta") != nil, "after the sleep Beta's meter reads stale before any tick: \(String(describing: h.meterText("Beta")))")
+        h.usage.fail(B); h.usage.fail(C)
+        h.wake()
         await h.tick(); await h.settle()
-        await h.pass(60)
-        h.check(h.claude.actions.isEmpty, "no automatic decision without a fresh read: \(h.claude.actions)")
+        h.check(h.meterText("Beta") != nil, "the wake marks Beta's meter stale, and a failed read leaves it so: \(String(describing: h.meterText("Beta")))")
+        await h.pass(ClaudeTiming.meterEvery)
+        h.check(h.claude.actions.isEmpty, "no switch on a pre-sleep reading, and none until a fresh read: \(h.claude.actions)")
         h.usage.set(B, fiveHour: 10, resetsAt: h.clock.now().addingTimeInterval(3600))
         await h.run(until: { h.claude.held == B }, limit: 600)
         h.check(h.claude.held == B, "the fresh read makes Beta the target: \(String(describing: h.claude.held))")
@@ -475,16 +542,80 @@ let scenarios: [Scenario] = [
         h.check(h.state("Alpha") == .needsSignIn && h.state("Beta") == .needsSignIn, "every seat Needs sign-in")
         h.check(h.action("Alpha") == .setUp && h.action("Beta") == .setUp, "Set Up on each row")
     },
-    Scenario(pair: "(Any, unknown Claude version or shape mismatch)", model: "\"Claude updated to a version this app hasn't checked. Switching on its own is paused.\"") { h in
-        h.claude.claudeVersion = "99.0.0"
+    // Section 8: a shape the app does not recognise. Each one turns automatic switching off with one
+    // line, leaves manual Switch working where it is safe, and clears once the shape is seen whole.
+    Scenario(pair: "(Shape missing, no Named line after a launch)", model: "8: automatic off with one line; manual Switch kept; clears when Claude names a seat again") { h in
         await h.standard()
-        h.check(h.noticeHas("Claude updated to a version this app hasn't checked. Switching on its own is paused."), "the paused line: \(h.notice)")
+        h.claude.namedLineChanged = true
+        h.click("Beta")
+        await h.run(until: { h.noticeHas(pausedLine) && !h.switchInFlight }, limit: 1800)
+        h.check(h.noticeHas(pausedLine), "a launch with no Named line pauses automatic switching, in one line: \(h.notice)")
+        h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "confirm could not read the log, so it rolled back to Alpha with the chat: \(String(describing: h.claude.held))")
+        h.check(h.hasSavedLogin(A) && h.hasSavedLogin(B), "every saved login intact")
+        let quits = h.quits
         h.claude.logLimitStop("local_one")
         await h.pass(300)
-        h.check(h.claude.actions.isEmpty, "no automatic switch on an unrecognised Claude: \(h.claude.actions)")
+        h.check(h.quits == quits, "no automatic switch while the shape is missing: \(h.claude.actions)")
+        h.check(h.action("Beta") == .switchTo, "manual Switch still offered")
+        h.claude.namedLineChanged = false
         h.click("Beta")
-        await h.run(until: { h.claude.held == B }, limit: 300)
-        h.check(h.claude.held == B, "manual Switch still works")
+        await h.run(until: { h.claude.held == B && h.state("Beta") == .inUse && !h.switchInFlight }, limit: 600)
+        h.check(h.claude.held == B, "manual Switch works once Claude names the seat: \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(!h.noticeHas(pausedLine), "the Named line seen whole clears the pause: \(h.notice)")
+        await h.pass(ClaudeTiming.settle + 5)
+        h.usage.set(B, fiveHour: 100, resetsAt: h.clock.now().addingTimeInterval(3600))
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held != nil && h.claude.held != B }, limit: 900)
+        h.check(h.claude.held == A || h.claude.held == C, "automatic switching is back on: \(String(describing: h.claude.held)), \(h.claude.actions)")
+    },
+    Scenario(pair: "(Shape missing, quit prompt without Quit anyway)", model: "8: automatic off with one line, nothing changed; a person's Switch still works; clears when the prompt shows its button") { h in
+        await h.standard()
+        h.claude.quitBehaviour = .promptUnanswered
+        h.claude.promptHasQuitButton = false
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.noticeHas(pausedLine) && !h.switchInFlight }, limit: 1800)
+        h.check(h.noticeHas(pausedLine), "a prompt without its button pauses automatic switching, in one line: \(h.notice)")
+        h.check(h.claude.held == A && !h.claude.pids().isEmpty && h.claude.chats(in: A).contains("local_one"), "nothing changed: Claude still runs on Alpha with the chat")
+        h.check(!h.claude.actions.contains("pressed \(ClaudeUI.quitAnyway)"), "the app never pressed a button it could not find: \(h.claude.actions)")
+        let quits = h.quits
+        h.claude.logLimitStop("local_one")
+        await h.pass(600)
+        h.check(h.quits == quits, "no automatic switch while the shape is missing: \(h.claude.actions)")
+        // A person answers the prompt themselves, so a manual Switch is safe.
+        h.claude.quitBehaviour = .promptThenQuit
+        h.click("Beta")
+        await h.run(until: { h.claude.held == B && !h.switchInFlight }, limit: 600)
+        h.check(h.claude.held == B, "manual Switch still works: \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(h.noticeHas(pausedLine), "a prompt still without its button keeps the pause: \(h.notice)")
+        h.claude.promptHasQuitButton = true
+        h.click("Alpha")
+        await h.run(until: { h.claude.held == A && !h.switchInFlight }, limit: 600)
+        h.check(!h.noticeHas(pausedLine), "the prompt seen with its button clears the pause: \(h.notice)")
+        h.claude.quitBehaviour = .promptUnanswered
+        await h.pass(ClaudeTiming.settle + 5)
+        h.usage.set(A, fiveHour: 100, resetsAt: h.clock.now().addingTimeInterval(3600))
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held != nil && h.claude.held != A }, limit: 900)
+        h.check(h.claude.actions.contains("pressed \(ClaudeUI.quitAnyway)") && h.claude.held != A, "automatic switching is back on: \(h.claude.actions)")
+    },
+    Scenario(pair: "(Shape missing, cookie format changed)", model: "8: automatic off with one line; no login saved or loaded in a format the app has not seen; clears when the format is the recorded one") { h in
+        await h.standard()
+        h.claude.cookieSchema = "99"
+        h.claude.writeSignIn(A)
+        await h.pass(ClaudeTiming.meterEvery)
+        h.click("Beta")
+        await h.run(until: { !h.switchInFlight }, limit: 900)
+        h.check(h.noticeHas(pausedLine), "an unseen cookie format pauses automatic switching, in one line: \(h.notice)")
+        h.check(h.claude.held == A || h.claude.held == B, "Claude ends signed in to Alpha or Beta (8 A): holds \(String(describing: h.claude.held)), running \(!h.claude.pids().isEmpty), \(h.claude.actions)")
+        h.check(h.hasSavedLogin(A) && h.hasSavedLogin(B), "every saved login intact")
+        let quits = h.quits
+        h.claude.logLimitStop("local_one")
+        await h.pass(300)
+        h.check(h.quits == quits, "no automatic switch while the format is unseen: \(h.claude.actions)")
+        h.claude.cookieSchema = ClaudeFiles.cookieSchemaVersion
+        h.claude.writeSignIn(h.claude.held)
+        await h.pass(ClaudeTiming.meterEvery)
+        h.check(!h.noticeHas(pausedLine), "the recorded format seen again clears the pause: \(h.notice)")
     },
     Scenario(pair: "(Any, row renamed or reordered)", model: "display and automatic order only") { h in
         await h.standard()
@@ -533,7 +664,14 @@ let scenarios: [Scenario] = [
         await h.run(until: { h.claude.held != A && h.claude.held != nil }, limit: 600)
         h.check(h.claude.held == C, "Beta is skipped as an automatic target: \(String(describing: h.claude.held))")
     },
-    Scenario(pair: "(Any, more rows than fit)", model: "cards scroll; title and notice pinned; row in use visible (MenuLayout seam)", body: nil),
+    Scenario(pair: "(Any, more rows than fit)", model: "cards scroll; title and notice pinned; row in use visible (MenuLayout seam)") { h in
+        await h.manyRows(30)
+        guard let m = h.menu(screen: 600) else { h.check(false, "this build has no fitted menu"); return }
+        h.check(m.height <= 600 - m.margin, "the menu stays on a 600 pt screen: \(m.height)")
+        h.check(m.content > m.height, "the cards scroll: they need \(m.content), the menu is \(m.height)")
+        h.check(m.height - m.pinned >= 3 * m.row, "the pinned title bar and notice leave room for at least three rows")
+        h.check(h.state("Row 1") == .inUse, "the row in use is a row of the menu: \(String(describing: h.state("Row 1")))")
+    },
     // Section 6 steps, section 8 invariants and section 9 cases.
     Scenario(pair: "(Switch step 2, quit prompt cancelled)", model: "\"Switch cancelled\", nothing changed") { h in
         await h.standard()
@@ -586,7 +724,15 @@ let scenarios: [Scenario] = [
         await h.run(until: { h.claude.held == P }, limit: 300)
         h.check(h.claude.held == P && h.claude.chats(in: P).contains("local_one"), "switching moves the chats between them")
     },
-    Scenario(pair: "(Any Mac, twenty rows)", model: "cards scroll, compact rows; height within 900 pt and 1400 pt screens", body: nil),
+    Scenario(pair: "(Any Mac, twenty rows)", model: "cards scroll, compact rows; height within 900 pt and 1400 pt screens") { h in
+        await h.manyRows(20)
+        guard let short = h.menu(screen: 900), let tall = h.menu(screen: 1400) else { h.check(false, "this build has no fitted menu"); return }
+        // The cards scroll only when they need more than the screen gives; compact rows may fit.
+        h.check(short.height <= 900 - short.margin && short.height == min(short.content, 900 - short.margin), "on 900 pt the menu fits, scrolling only past the screen: \(short.height) of \(short.content)")
+        h.check(tall.height <= 1400 - tall.margin, "on 1400 pt the menu fits: \(tall.height)")
+        // Compact: every row but the one in use is one line; the one in use adds at most three meter lines.
+        h.check(tall.content <= tall.pinned + 20 * tall.row + 19 * 6 + 3 * 18 + 6, "twenty compact rows: \(tall.content)")
+    },
 ]
 
 @main
@@ -594,8 +740,12 @@ enum ScenarioRun {
     @MainActor static func main() async {
         setvbuf(stdout, nil, _IOLBF, 0)
         var passed = 0, failed = 0, pending = 0
+        // One pair by its exact name (each.sh), else every pair whose name contains the argument.
         let only = CommandLine.arguments.dropFirst().first
-        for s in scenarios where only == nil || s.pair.contains(only!) {
+        let all = scenarios + bugScenarios
+        if only == "--list" { all.forEach { print($0.pair) }; exit(0) }
+        let exact = all.contains { $0.pair == only }
+        for s in all where only == nil || (exact ? s.pair == only : s.pair.contains(only!)) {
             guard let body = s.body else { print("PEND \(s.pair): \(s.model)"); pending += 1; continue }
             guard let h = try? Harness() else { print("FAIL \(s.pair): the stand-in could not be installed"); failed += 1; continue }
             await body(h)

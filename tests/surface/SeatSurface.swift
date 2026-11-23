@@ -46,7 +46,20 @@ enum ShownAction: Equatable { case switchTo, setUp }
     func move(_ row: String, by step: Int) { if let s = seat(row) { store.move(s, by: step, organization: false) } else { check(false, "no row named \(row)") } }
     func remove(_ row: String) { if let s = seat(row) { store.remove(s) } else { check(false, "no row named \(row)") } }
     var firstRun: Bool { store.firstRun }
-    func hasSavedLogin(_ seat: StandSeat) -> Bool { SavedLogins.savedAt(seat.identity) != nil }
+    /// The menu's measures on a screen whose visible part is `screen` points tall, from the same
+    /// MenuLayout the drawn menu uses: its height, the height every row would need, and the
+    /// pinned part (title bar and notice) that never scrolls.
+    func menu(screen: CGFloat) -> MenuMeasure? {
+        let notice = store.notice != nil
+        return MenuMeasure(height: MenuLayout.height(visibleScreenHeight: screen, seats: store.seats, hasNotice: notice),
+                           content: MenuLayout.contentHeight(seats: store.seats, hasNotice: notice),
+                           pinned: MenuLayout.chrome(hasNotice: notice), margin: MenuLayout.screenMargin, row: MenuLayout.line)
+    }
+    func hasSavedLogin(_ seat: StandSeat) -> Bool { savedAt(seat) != nil }
+    /// When the seat's login was last saved, so a scenario can tell it was left untouched.
+    func savedAt(_ seat: StandSeat) -> Date? { SavedLogins.savedAt(seat.identity) }
+    /// The Mac wakes from sleep (the app's NSWorkspace.didWakeNotification).
+    func wake() { store.woke() }
     /// The app is quit or crashes: its parked tasks never wake, and a new app starts on the same files.
     func crashApp() { clock.abandonSleepers(); Switch.abandonForTest(); store = Store() }
     func click(_ row: String) {
