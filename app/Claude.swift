@@ -53,8 +53,6 @@ protocol ClaudeWorld: Sendable {
     func send(_ text: String, session: String, in owners: [pid_t], trace: (String) -> Void) -> ChatComposer.Sent
     /// Seconds since anyone used this Mac's keyboard, mouse or trackpad.
     func idleSeconds() -> TimeInterval
-    /// Claude's version from its bundle's Info.plist (F2), or nil when it can't be read.
-    func version() -> String?
     /// Post a notification on this Mac: an automatic outcome the person may not be watching.
     func notify(title: String, body: String)
 }
@@ -209,10 +207,6 @@ struct RealClaudeWorld: ClaudeWorld {
     func idleSeconds() -> TimeInterval {
         CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
     }
-    func version() -> String? {
-        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else { return nil }
-        return Bundle(url: app)?.infoDictionary?["CFBundleShortVersionString"] as? String
-    }
     func notify(title: String, body: String) { Notify.post(title, body) }
 }
 
@@ -265,26 +259,6 @@ enum Notify {
         let done = DispatchSemaphore(value: 0)
         center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { _ in done.signal() }
         _ = done.wait(timeout: .now() + 5)
-    }
-}
-
-// MARK: - The versions the app was checked against
-
-/// The Claude versions whose files, log lines and windows the app's assumptions were recorded on
-/// (model, section 8). Any other version pauses switching on its own; a manual switch still works.
-enum ClaudeContract {
-    static let recordedVersions: Set<String> = ["6.28899.6"]
-
-    /// Claude's version counts as checked when its major version is one the shapes were recorded
-    /// on (main's ruling, 2026-11-23). The run-time shape checks catch a change inside a major
-    /// version: no Named line after a launch, or a quit prompt without its button (model, section 8).
-    static func recognises(_ version: String?) -> Bool {
-        guard let major = version.flatMap(majorVersion) else { return false }
-        return recordedVersions.compactMap(majorVersion).contains(major)
-    }
-
-    private static func majorVersion(_ version: String) -> String? {
-        version.split(separator: ".").first.map(String.init).flatMap { Int($0) != nil ? $0 : nil }
     }
 }
 

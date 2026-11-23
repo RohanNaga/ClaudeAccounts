@@ -327,12 +327,11 @@ enum ClaudeApp {
 
     static func windowIDs(_ owners: [pid_t]) -> Set<Int> { World.claude.windowIDs(owners) }
 
-    /// How one quit request ended, whether Quit anyway was pressed, and whether an open prompt
-    /// had no button the app knows: a shape this Claude doesn't match (model, section 8).
+    /// How one quit request ended, and whether Quit anyway was pressed. A prompt found by its
+    /// Quit anyway button shows that shape whole; a new window without it is a missing shape.
     struct QuitResult {
         var outcome: QuitWatch.Outcome
         var answered = false
-        var promptWithoutButton = false
     }
 
     /// Quit the way ⌘Q does, then wait until the process is gone, so Claude has flushed its
@@ -349,23 +348,25 @@ enum ClaudeApp {
         var watch = QuitWatch(unattended: unattended, canAnswer: World.claude.trusted, started: World.now())
         var firstTry: Date?
         var shown: String?
-        var noButton = false
+        var buttonSeen = false
         while true {
             await World.sleep(0.5)
             let alive = !pids().isEmpty
+            // Accessibility finds the prompt by its Quit anyway button; a window Claude opened
+            // after the request also counts, which covers a prompt without that button.
+            let found = alive && World.claude.quitPromptOpen(in: running)
+            if found, !buttonSeen { buttonSeen = true; ShapeMisses.seen(.quitButton) }
             let seen = QuitObservation(
                 claudeRunning: alive,
-                // Accessibility finds the prompt by its Quit anyway button; a window Claude opened
-                // after the request also counts, which covers a prompt without that button.
-                promptOpen: alive && (World.claude.quitPromptOpen(in: running) || !windowIDs(running).subtracting(windowsBefore).isEmpty))
+                promptOpen: found || (alive && !windowIDs(running).subtracting(windowsBefore).isEmpty))
             switch watch.step(seen, now: World.now()) {
             case .done(let outcome):
-                return QuitResult(outcome: outcome, answered: watch.answeredAt != nil, promptWithoutButton: noButton)
+                return QuitResult(outcome: outcome, answered: watch.answeredAt != nil)
             case .wait(let what):
                 if what != shown { shown = what; progress(what) }
             case .cancel:
                 _ = World.claude.pressQuitPrompt(ClaudeUI.cancel, in: running)
-                return QuitResult(outcome: .failed, answered: watch.answeredAt != nil, promptWithoutButton: noButton)
+                return QuitResult(outcome: .failed, answered: watch.answeredAt != nil)
             case .answer:
                 if World.claude.pressQuitPrompt(ClaudeUI.quitAnyway, in: running) {
                     watch.answered(at: World.now())
@@ -373,7 +374,7 @@ enum ClaudeApp {
                 } else if World.now().timeIntervalSince(firstTry ?? World.now()) > QuitPrompt.findTimeout {
                     // A new window with no Quit anyway button is not a prompt this app answers.
                     watch.canAnswer = false
-                    noButton = true
+                    ShapeMisses.missed(.quitButton)
                 }
                 firstTry = firstTry ?? World.now()
             }
@@ -491,6 +492,15 @@ enum LoginSlot {
         await sqlite(db, "select value from meta where key='version';").out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// The cookie database has the schema whose rows the app copies; otherwise it is never touched.
+    static func checkCookieSchema(_ db: URL) async throws {
+        guard await cookieVersion(db) == ClaudeFiles.cookieSchemaVersion else {
+            ShapeMisses.missed(.cookieSchema)
+            throw SwitchError.cookieSchemaChanged
+        }
+        ShapeMisses.seen(.cookieSchema)
+    }
+
 }
 
 /// The app's copy of Claude's sign-in for each seat (F4), filed under the seat's pair in
@@ -558,7 +568,7 @@ enum SavedLogins {
         guard await LoginSlot.sqlite(source, "pragma quick_check;").out.trimmingCharacters(in: .whitespacesAndNewlines) == "ok" else {
             throw SwitchError.sqlite("Claude's cookie database failed its integrity check")
         }
-        guard await LoginSlot.cookieVersion(source) == ClaudeFiles.cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
+        try await LoginSlot.checkCookieSchema(source)
         let cookies = new.appendingPathComponent("cookies.db")
         let res = await LoginSlot.sqlite(cookies, "ATTACH \(LoginSlot.quoted(source)) AS c; CREATE TABLE cookies AS SELECT * FROM c.cookies WHERE host_key IN \(ClaudeFiles.cookieHosts);")
         guard res.status == 0 else { throw SwitchError.sqlite(res.err) }
@@ -605,7 +615,7 @@ enum SavedLogins {
             values = copy.meta.config
             insert = "ATTACH \(LoginSlot.quoted(copy.folder.appendingPathComponent("cookies.db"))) AS s; "
         }
-        guard await LoginSlot.cookieVersion(ClaudeApp.cookies) == ClaudeFiles.cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
+        try await LoginSlot.checkCookieSchema(ClaudeApp.cookies)
         let sql = insert + "BEGIN; DELETE FROM main.cookies WHERE host_key IN \(ClaudeFiles.cookieHosts); "
             + (seat == nil ? "" : "INSERT INTO main.cookies SELECT * FROM s.cookies; ") + "COMMIT;"
         let res = await LoginSlot.sqlite(ClaudeApp.cookies, sql)
@@ -649,7 +659,7 @@ enum SwitchError: LocalizedError {
         switch self {
         case .noSlot(let name): return "\(name) isn't set up in Claude yet; use Set Up on its row first."
         case .notSignedIn: return "Claude isn't signed in, so there was no login to save."
-        case .cookieSchemaChanged: return "Claude's cookie format changed in an update; switching is paused until this app is updated."
+        case .cookieSchemaChanged: return "\(ClaudeShape.cookieSchema.why)."
         case .sqlite(let err): return "Could not update Claude's cookies: \(err.prefix(160))"
         case .quitFailed: return "Claude is running again, so nothing more was changed."
         case .inconsistent: return "Claude's settings name a different account than its log. Open and quit Claude once, then try again."
@@ -672,9 +682,6 @@ struct SwitchOutcome: Equatable {
     var notResumed: [String] = []
     /// Another switch started during the resume and carries its chats on.
     var superseded = false
-    /// Claude didn't match a recorded shape: no Named line after a launch, or a quit prompt without
-    /// its button. Switching on its own pauses until Claude's version changes (model, section 8).
-    var unrecognised = false
 }
 
 /// One switch at a time across the whole Mac.
@@ -818,7 +825,7 @@ enum Switch {
             SwitchJournal.clear()
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
             unlock()
-            return SwitchOutcome(ok: false, text: "Claude didn't quit, so nothing changed.", unrecognised: quit.promptWithoutButton)
+            return SwitchOutcome(ok: false, text: "Claude didn't quit, so nothing changed.")
         }
         // The run that just ended names the chats that were working: stopped for usage or cut by the quit.
         let ended = ClaudeApp.events().stoppedChats
@@ -1012,12 +1019,13 @@ enum Switch {
                         try? j.save()
                         return SwitchOutcome(ok: false, text: "Open Claude to finish switching to \(r.name(j.to)).", parked: true)
                     }
-                    var late = await rolledBack(&j, r, "\(r.name(j.to)) didn't open in time.", progress: progress)
-                    // Claude ran the whole wait and named nobody: its log no longer has the shape the app reads.
-                    late.unrecognised = !events.events.contains { e in
-                        if case .named = e.event { return e.at >= launch.addingTimeInterval(-1) } else { return false }
-                    }
-                    return late
+                    // Claude ran the whole wait and named nobody: its log lacks the line the app reads.
+                    // A Set Up's wait is the person's to sign in, so a silent one says nothing.
+                    let since = launch.addingTimeInterval(-1)
+                    if j.kind != .setUp, !events.events.contains(where: { e in
+                        if case .named = e.event { return e.at >= since } else { return false }
+                    }) { ShapeMisses.missed(.namedLine, since: since) }
+                    return await rolledBack(&j, r, "\(r.name(j.to)) didn't open in time.", progress: progress)
                 }
             }
             await World.sleep(1)
@@ -1183,6 +1191,55 @@ struct PairFile<Value: Codable> {
     }
 }
 
+/// The Claude shapes found missing, each with the time from which seeing it clears the miss
+/// (model, section 8). Kept on disk, so the pause outlasts a restart of the app and `--status`
+/// reads it. Each place that relies on a shape reports it here, missing or whole.
+enum ShapeMisses {
+    private static var url: URL { Paths.stateDir.appendingPathComponent("shape-misses.json") }
+
+    static func load() -> [ClaudeShape: Date] {
+        guard let data = try? Data(contentsOf: url),
+              let raw = try? JSONDecoder().decode([String: Date].self, from: data) else { return [:] }
+        return Dictionary(uniqueKeysWithValues: raw.compactMap { k, v in ClaudeShape(rawValue: k).map { ($0, v) } })
+    }
+
+    private static func save(_ misses: [ClaudeShape: Date]) {
+        try? FileManager.default.createDirectory(at: Paths.stateDir, withIntermediateDirectories: true)
+        guard let data = try? JSONEncoder().encode(Dictionary(uniqueKeysWithValues: misses.map { ($0.key.rawValue, $0.value) })) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// When the app last relied on a shape and found it missing, in this process. A switch that
+    /// met a missing shape lets the paused line, which says why, stand in for its failure line.
+    nonisolated(unsafe) private(set) static var lastMet: Date?
+
+    /// `shape` was relied on and was not there. A Named line logged from `since` on clears it.
+    static func missed(_ shape: ClaudeShape, since: Date = World.now()) {
+        lastMet = World.now()
+        var misses = load()
+        guard misses[shape] == nil else { return }
+        misses[shape] = since
+        save(misses)
+        Diagnostics.record(.shape, ["shape": shape.rawValue, "state": "missing"])
+    }
+
+    /// `shape` was seen whole: the miss, if any, clears.
+    static func seen(_ shape: ClaudeShape) {
+        var misses = load()
+        guard misses.removeValue(forKey: shape) != nil else { return }
+        save(misses)
+        Diagnostics.record(.shape, ["shape": shape.rawValue, "state": "seen"])
+    }
+
+    /// The Named miss clears once the log has a Named line from the miss's start on.
+    static func clearNamed(seenIn events: ClaudeEvents) {
+        guard let since = load()[.namedLine] else { return }
+        if events.events.contains(where: { e in if case .named = e.event { return e.at >= since } else { return false } }) {
+            seen(.namedLine)
+        }
+    }
+}
+
 /// Claude's log read in order into `ClaudeEvents`, reading only what is new and following
 /// main.log across a rotation. A log it can't follow is read again from main1.log.
 struct LogReader {
@@ -1238,10 +1295,6 @@ final class Store: ObservableObject {
     private var log = LogReader()
     private var running = false
     private var trusted = World.claude.trusted
-    /// Claude's version as last read, and whether a shape the app reads went missing at run time
-    /// on that version (model, section 8). A new version clears the miss.
-    private var claudeVersion: String?
-    private var shapeMissing = false
     private var meters = PairFile<SeatMeters>(name: "meters.json").load()
     private var stops = PairFile<StopMark>(name: "stops.json").load()
     private var failedTargets = PairFile<Date>(name: "failed-targets.json").load()
@@ -1274,7 +1327,9 @@ final class Store: ObservableObject {
     private var wokeAt: Date?
     /// The wait that was already posted, by the time its out signal began, so each wait is
     /// posted once.
-    private var postedWait: Date?
+    private var waitPosted = false
+    /// When the running switch started, to tell whether it met a missing shape.
+    private var startedAt: Date?
     /// What the diagnostics file last recorded, so each publish logs only what changed.
     private var logged: Diagnostics.Snapshot?
 
@@ -1319,8 +1374,7 @@ final class Store: ObservableObject {
         var f = Facts()
         f.rows = accounts.inMenuOrder
         let installed = World.claude.installed
-        f.claude = ClaudeFacts(installed: installed, running: running,
-                               recognised: !installed || (ClaudeContract.recognises(claudeVersion) && !shapeMissing))
+        f.claude = ClaudeFacts(installed: installed, running: running, missing: installed ? Set(ShapeMisses.load().keys) : [])
         f.log = log.events
         f.saved = Dictionary(accounts.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
         f.meters = meters
@@ -1379,6 +1433,8 @@ final class Store: ObservableObject {
         ticking = true
         defer { ticking = false }
         observe()
+        // A missing cookie schema is looked at again each tick, so the format seen whole clears it.
+        if ShapeMisses.load()[.cookieSchema] != nil, switchTask == nil { try? await LoginSlot.checkCookieSchema(ClaudeApp.cookies) }
         // At launch, and whenever Claude opens again while a switch is parked (section 6, Recovery).
         if !recovered || (running && SwitchJournal.load()?.parked == true) {
             recovered = true
@@ -1396,9 +1452,8 @@ final class Store: ObservableObject {
         accounts = AccountStore.load().labelled()
         running = !ClaudeApp.pids().isEmpty
         trusted = World.claude.trusted
-        let version = World.claude.version()
-        if version != claudeVersion { claudeVersion = version; shapeMissing = false }
         log.poll()
+        ShapeMisses.clearNamed(seenIn: log.events)
         recordStops()
     }
 
@@ -1529,7 +1584,7 @@ final class Store: ObservableObject {
         let now = World.now()
         let f = facts(now: now)
         let decision = AutoSwitch.decide(f, now: now)
-        if case .wait = decision {} else { postedWait = nil }
+        if case .wait = decision {} else { waitPosted = false }
         switch decision {
         case .none:
             break
@@ -1550,11 +1605,11 @@ final class Store: ObservableObject {
     }
 
     /// Post a wait once (model, section 7): when chats wait and more than one seat could have
-    /// taken them. A single seat that runs out stays quiet (13a.8).
+    /// taken them. The wait lasts while the decision stays a wait, so a second stop inside it
+    /// posts nothing. A single seat that runs out stays quiet (13a.8).
     private func postWait(_ f: Facts, seat: Identity?, resumesAt: Date?) {
-        guard f.waitingChats > 0, f.rows.compactMap(\.identity).count > 1, let began = f.hold.flatMap({ stops[$0.seat]?.at ?? log.events.lastTurnEnd(on: $0.seat) }),
-              postedWait != began else { return }
-        postedWait = began
+        guard f.waitingChats > 0, f.rows.compactMap(\.identity).count > 1, !waitPosted else { return }
+        waitPosted = true
         let when = resumesAt.map { " at \(ClockText.time($0))" } ?? ""
         let name = seat.flatMap { names[$0] } ?? "a seat"
         World.claude.notify(title: "Every seat is out", body: "Every seat is out. Chats resume when \(name) resets\(when).")
@@ -1779,6 +1834,7 @@ final class Store: ObservableObject {
                        then: @escaping (SwitchOutcome) -> Void) -> Task<Void, Never> {
         failure = nil
         success = nil
+        startedAt = World.now()
         runs += 1
         let run = runs
         switchingTo = SwitchFacts(target: target, step: "Starting…")
@@ -1825,12 +1881,12 @@ final class Store: ObservableObject {
         if outcome.ok, !outcome.parked, let target, target.orgUnknown { learnOrganization(of: target) }
         Diagnostics.record(.switchEnded, ["state": Diagnostics.outcomeName(outcome),
                                           "to": target.flatMap { t in accounts.firstIndex { $0.seat == t } } ?? -1])
-        if outcome.unrecognised { shapeMissing = true }
         if outcome.parked {
             failure = nil
         } else if outcome.ok {
             if !outcome.text.isEmpty { success = (outcome.text, World.now() + Self.successFor) }
-        } else if !outcome.text.isEmpty {
+        } else if !outcome.text.isEmpty, !(ShapeMisses.lastMet.map { $0 >= startedAt ?? .distantFuture } ?? false) {
+            // A switch that met a missing shape failed because of it: the paused line says why.
             failure = outcome.detail.map { "\(outcome.text) \($0)" } ?? outcome.text
         }
         publish()
@@ -1866,7 +1922,7 @@ final class Store: ObservableObject {
 /// -1 for a pair that is not a row). It never holds names, emails, ids or tokens, and it never
 /// leaves the Mac. Only the values typed here can be written, so nothing else can slip in.
 enum Diagnostics {
-    enum Kind: String { case claude, hold, seat, decision, switchStarted, switchEnded, woke }
+    enum Kind: String { case claude, hold, seat, decision, switchStarted, switchEnded, woke, shape }
 
     /// What the app showed at one publish: the parts whose changes are logged.
     struct Snapshot: Equatable {
@@ -1921,7 +1977,7 @@ enum Diagnostics {
 
     /// The outcome of a switch as one state name.
     static func outcomeName(_ o: SwitchOutcome) -> String {
-        o.parked ? "parked" : o.ok ? "done" : o.unrecognised ? "unrecognised" : "undone"
+        o.parked ? "parked" : o.ok ? "done" : "undone"
     }
 
     /// Append one line. A failed write is dropped: diagnostics never stop the app.
@@ -2219,7 +2275,7 @@ enum StatusReport {
         var f = Facts()
         f.rows = AccountStore.load().inMenuOrder
         f.claude = ClaudeFacts(installed: installed, running: !ClaudeApp.pids().isEmpty,
-                               recognised: !installed || ClaudeContract.recognises(World.claude.version()))
+                               missing: installed ? Set(ShapeMisses.load().keys) : [])
         f.log = log.events
         f.saved = Dictionary(f.rows.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
         f.meters = meters
@@ -2246,7 +2302,7 @@ enum StatusReport {
         switch AutoSwitch.status(f) {
         case .on: auto = "on"
         case .offAccessibility: auto = "off, Accessibility is not granted to this process"
-        case .offUnrecognised: auto = "off, this Claude version is not one the app has checked"
+        case .offShapeMissing(let shape): auto = "off, because \(shape.why)"
         case .offByPerson: auto = "off, turned off in the menu"
         }
         out += "Automatic switching: \(auto)\n"
