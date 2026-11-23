@@ -20,6 +20,7 @@ struct RulesTests {
         autoSwitch()
         claudeLog()
         savingLogins()
+        refusalsBelongToOneSignIn()
         settingUp()
         quitWatch()
         organizations()
@@ -237,10 +238,10 @@ struct RulesTests {
         check(fellBack.steady(at: clock("10:01:09")) == nil, "the individual organization is not saved before a minute")
         check(fellBack.steady(at: clock("10:01:10")) == personal, "the individual organization is saved once held for a minute")
         check(SaveRule.steadyHold == 60, "the hold is 60 s, three times the slowest fall-back seen")
-        check(!SaveRule.counts(savedAt: clock("10:00:05"), refusedAt: fellBack.refusedAt[orgA]),
+        check(!SaveRule.counts(savedAt: clock("10:00:05"), refusedAt: fellBack.refusal(of: org, at: clock("10:05:00"))),
               "a login saved before Claude refused its organization doesn't count")
-        check(SaveRule.counts(savedAt: clock("10:05:00"), refusedAt: fellBack.refusedAt[orgA])
-              && SaveRule.counts(savedAt: clock("10:05:00"), refusedAt: fellBack.refusedAt[personalOrg]),
+        check(SaveRule.counts(savedAt: clock("10:05:00"), refusedAt: fellBack.refusal(of: org, at: clock("10:05:00")))
+              && SaveRule.counts(savedAt: clock("10:05:00"), refusedAt: fellBack.refusal(of: personal, at: clock("10:05:00"))),
               "a login saved after the refusal counts, and an organization never refused counts")
         let signedInAgain = follow([start, named("10:00:05", accountA, orgA)] + refused("10:00:06", accountA, orgA)
                                    + [named("10:00:10", accountA, personalOrg), named("10:20:00", accountA, orgA)])
@@ -250,6 +251,58 @@ struct RulesTests {
         check(renamed.steady(at: clock("10:01:05")) == org, "Claude naming the same organization again keeps its hold")
         check(follow([start, named("10:00:05", accountA, orgA), "2026-01-01 10:00:20 [info] Navigated to /logout"])
                 .steady(at: clock("10:05:00")) == nil, "a sign-out ends the hold")
+    }
+
+    /// A refusal is of one account's sign-in to an organization, and counts until Claude next holds
+    /// that account and organization steadily. Several accounts share a team organization, so one
+    /// account's refusal never touches another's saved login; a row whose saved login matches reads
+    /// set up once Claude has held it since; a refusal after the last steady hold still counts.
+    static func refusalsBelongToOneSignIn() {
+        let start = logLine("10:00:00", "Starting app {")
+        let a = Identity(account: accountA, org: orgA), b = Identity(account: accountB, org: orgA)
+        func setUp(_ log: LogFollower, _ id: Identity, savedAt: String, at now: String) -> Bool {
+            SaveRule.counts(savedAt: clock(savedAt), refusedAt: log.refusal(of: id, at: clock(now)))
+        }
+
+        // An old refusal, then a steady hold: the login is saved, reads set up, and the row loses
+        // the new-sign-in text.
+        let heldAgain = follow([start, named("10:00:05", accountA, orgA)] + refused("10:00:06", accountA, orgA)
+                               + [named("10:00:10", accountA, personalOrg), logLine("10:30:00", "Starting app {"),
+                                  named("10:30:05", accountA, orgA)])
+        check(heldAgain.refusal(of: a, at: clock("10:31:04")) == clock("10:00:06"),
+              "the refusal still counts before Claude has held the organization for a minute")
+        check(heldAgain.steady(at: clock("10:31:05")) == a && heldAgain.refusal(of: a, at: clock("10:31:05")) == nil,
+              "held for a minute after an old refusal, the login is saved and the refusal no longer counts")
+        check(setUp(heldAgain, a, savedAt: "09:00:00", at: "10:31:05"),
+              "a saved login of that sign-in reads set up once Claude has held it steadily since the refusal")
+        let movedOn = follow([start, named("10:00:05", accountA, orgA)] + refused("10:00:06", accountA, orgA)
+                             + [named("10:20:00", accountA, orgA), named("10:21:00", accountA, personalOrg),
+                                logLine("11:00:00", "Starting app {"), named("11:00:05", accountB, orgA)])
+        check(movedOn.refusal(of: a, at: clock("11:30:00")) == nil && setUp(movedOn, a, savedAt: "09:00:00", at: "11:30:00"),
+              "a steady hold that has ended still clears the refusal before it, whatever Claude holds now")
+
+        // Another account's refusal of the same organization: this row's saved login still reads
+        // set up, and it isn't told to sign in again.
+        let othersRefused = follow([start, named("10:00:05", accountA, orgA), logLine("10:05:00", "Starting app {"),
+                                    named("10:05:05", accountB, orgA)] + refused("10:05:06", accountB, orgA)
+                                   + [named("10:05:10", accountB, personalOrg)])
+        check(othersRefused.refusal(of: a, at: clock("10:30:00")) == nil && setUp(othersRefused, a, savedAt: "10:05:00", at: "10:30:00"),
+              "another account's refusal of the same organization leaves this row set up")
+        check(othersRefused.refusal(of: b, at: clock("10:30:00")) == clock("10:05:06")
+              && !setUp(othersRefused, b, savedAt: "10:05:00", at: "10:30:00"),
+              "the refused account's own login saved before its refusal doesn't count")
+        check(othersRefused.refusal(of: nil, at: clock("10:30:00")) == nil, "a row with no organization yet is never refused")
+
+        // A refusal after the last steady hold still counts, for that account only.
+        let refusedLater = follow([start, named("10:00:05", accountA, orgA), named("10:00:06", accountB, orgA),
+                                   logLine("10:10:00", "Starting app {"), named("10:10:05", accountA, orgA),
+                                   logLine("10:20:00", "Starting app {"), named("10:20:05", accountA, orgA)]
+                                  + refused("10:20:06", accountA, orgA) + [named("10:20:10", accountA, personalOrg)])
+        check(refusedLater.refusal(of: a, at: clock("11:00:00")) == clock("10:20:06"),
+              "a refusal after the last steady hold still counts")
+        check(!setUp(refusedLater, a, savedAt: "10:11:05", at: "11:00:00"),
+              "a login saved at that hold doesn't count after the refusal")
+        check(setUp(refusedLater, b, savedAt: "10:00:30", at: "11:00:00"), "another account's login in that organization still counts")
     }
 
     /// Set Up confirms only once Claude holds the row's own account and organization steadily;
