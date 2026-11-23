@@ -1,0 +1,276 @@
+import Foundation
+
+// A stand-in Claude on a virtual clock. It keeps Claude's files in a temporary folder, writes
+// Claude's log lines in the shapes app/Claude.swift names, and answers quit, launch and the
+// window questions the way the model (section 6) says Claude does. Nothing here waits: sleeping
+// on the clock moves time forward and runs whatever the stand-in had scheduled by then.
+
+/// Time that moves only when someone sleeps on it or the scenario advances it.
+final class VirtualClock: AppClock, @unchecked Sendable {
+    private let lock = NSLock()
+    private var t: Date
+    private var due: [(at: Date, seq: Int, run: () -> Void)] = []
+    private var seq = 0
+    init(start: Date) { t = start }
+
+    func now() -> Date { lock.withLock { t } }
+
+    /// Runs `run` once the clock reaches `seconds` from now.
+    func after(_ seconds: TimeInterval, _ run: @escaping () -> Void) {
+        lock.withLock { seq += 1; due.append((t.addingTimeInterval(seconds), seq, run)) }
+    }
+
+    /// Moves the clock forward, running each scheduled event at its own time, in order.
+    func advance(_ seconds: TimeInterval) {
+        let end = now().addingTimeInterval(max(0, seconds))
+        while true {
+            let next: (at: Date, seq: Int, run: () -> Void)? = lock.withLock {
+                guard let i = due.indices.filter({ due[$0].at <= end }).min(by: { (due[$0].at, due[$0].seq) < (due[$1].at, due[$1].seq) }) else { return nil }
+                let e = due.remove(at: i)
+                t = max(t, e.at)
+                return e
+            }
+            guard let e = next else { break }
+            e.run()
+        }
+        lock.withLock { t = max(t, end) }
+    }
+
+    func sleep(_ seconds: TimeInterval) async {
+        advance(seconds)
+        await Task.yield()
+    }
+}
+
+/// One seat: an account in an organization. Ids are placeholders, never real ones.
+struct StandSeat: Hashable, CustomStringConvertible {
+    let account: String
+    let org: String
+    var identity: Identity { Identity(account: account, org: org) }
+    var tag: String { "\(account)/\(org)" }
+    var description: String { tag }
+}
+
+/// How Claude answers a request to quit.
+enum QuitBehaviour { case quits, promptThenQuit, promptCancelled, promptUnanswered, ignores }
+
+final class StandInClaude: ClaudeWorld, @unchecked Sendable {
+    let root: URL
+    let clock: VirtualClock
+    private let lock = NSLock()
+
+    var home: URL { root.appendingPathComponent("home") }
+    var stateDir: URL { root.appendingPathComponent("state") }
+    var bundleId: String { "test.stand-in.claude" }
+    var dataDir: URL { root.appendingPathComponent("claude-data") }
+    var logDir: URL { root.appendingPathComponent("claude-logs") }
+    func executable() -> String { root.appendingPathComponent("Claude.app/Contents/MacOS/Claude").path }
+
+    // What the scenario sets.
+    var installed = true
+    var trustedAX = true
+    var quitBehaviour: QuitBehaviour = .quits
+    /// Seats whose saved sign-in Claude now calls too old: it names them, then refuses and falls back.
+    var stale: Set<StandSeat> = []
+    /// Each account's personal organization, where Claude falls back after a refusal.
+    var personal: [String: String] = [:]
+    /// Seconds from launch to the Named line, and from Named to a refusal (4 to 21 s seen).
+    var nameAfter: TimeInterval = 3
+    var refuseAfter: TimeInterval = 12
+    /// Set Up: who the person signs in as once Claude asks (nil: nobody signs in).
+    var signsInAs: StandSeat?
+    /// Opens a window of its own right after launch, which a scenario uses for "the person opened Claude".
+    var personOpensClaudeDuringSwitch = 0
+    /// Chats on screen, by session id, and what their composer shows.
+    var screens: [String: ChatScreen] = [:]
+    /// Every "resume" typed, as "<session> <text>".
+    private(set) var sent: [String] = []
+    /// Every quit request and launch, in order.
+    private(set) var actions: [String] = []
+
+    // What Claude is doing.
+    private(set) var pid: pid_t?
+    private(set) var held: StandSeat?
+    private(set) var promptOpen = false
+    private var nextPid: pid_t = 90_000
+
+    init(clock: VirtualClock) throws {
+        self.clock = clock
+        root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("stand-in-\(getpid())-\(UUID().uuidString.prefix(8))")
+        for d in [home, stateDir, dataDir, logDir] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        try FileManager.default.createDirectory(at: URL(fileURLWithPath: executable()).deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: logDir.appendingPathComponent(ClaudeFiles.log).path, contents: Data())
+    }
+
+    func cleanUp() { try? FileManager.default.removeItem(at: root) }
+
+    // MARK: Claude's files
+
+    var cookies: URL { dataDir.appendingPathComponent(ClaudeFiles.cookies) }
+    var config: URL { dataDir.appendingPathComponent(ClaudeFiles.config) }
+
+    /// Writes Claude's sign-in as `seat` (nil: signed out), the way Claude does after a sign-in.
+    func writeSignIn(_ seat: StandSeat?) {
+        try? FileManager.default.removeItem(at: cookies)
+        let value = seat?.tag ?? ""
+        let sql = "CREATE TABLE cookies(name TEXT, value TEXT); " + (seat == nil ? "" : "INSERT INTO cookies VALUES('\(ClaudeFiles.signInCookie)','\(value)');")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        p.arguments = [cookies.path, sql]
+        try? p.run(); p.waitUntilExit()
+        var cfg: [String: Any] = [:]
+        if let seat { cfg[ClaudeFiles.lastKnownAccount] = seat.account; cfg["oauth:tokenCache"] = "placeholder" }
+        try? JSONSerialization.data(withJSONObject: cfg).write(to: config)
+    }
+
+    /// The seat Claude's sign-in files name now (what the next launch signs in as).
+    func signInOnDisk() -> StandSeat? {
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        p.arguments = [cookies.path, "SELECT value FROM cookies WHERE name='\(ClaudeFiles.signInCookie)'"]
+        p.standardOutput = out; p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return nil }
+        p.waitUntilExit()
+        let v = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = v.split(separator: "/").map(String.init)
+        return parts.count == 2 ? StandSeat(account: parts[0], org: parts[1]) : nil
+    }
+
+    /// A chat record in a seat's folder.
+    func addChat(_ id: String, in seat: StandSeat, lastActivity: Date) {
+        let dir = dataDir.appendingPathComponent(ClaudeFiles.sessions).appendingPathComponent(seat.account).appendingPathComponent(seat.org)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let rec: [String: Any] = [ClaudeFiles.sessionId: id, ClaudeFiles.title: "chat", ClaudeFiles.isArchived: false,
+                                  ClaudeFiles.lastActivityAt: lastActivity.timeIntervalSince1970 * 1000]
+        try? JSONSerialization.data(withJSONObject: rec).write(to: dir.appendingPathComponent("\(id).json"))
+    }
+
+    /// The chat ids in a seat's folder.
+    func chats(in seat: StandSeat) -> Set<String> {
+        let dir = dataDir.appendingPathComponent(ClaudeFiles.sessions).appendingPathComponent(seat.account).appendingPathComponent(seat.org)
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        return Set(names.filter { $0.hasSuffix(".json") }.map { String($0.dropLast(5)) })
+    }
+
+    // MARK: Claude's log
+
+    private static let stamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = ClaudeLog.timeFormat; f.locale = Locale(identifier: "en_US_POSIX"); return f
+    }()
+
+    func log(_ body: String) {
+        let line = "\(Self.stamp.string(from: clock.now())) [info] \(body)\n"
+        let h = try? FileHandle(forWritingTo: logDir.appendingPathComponent(ClaudeFiles.log))
+        _ = try? h?.seekToEnd(); try? h?.write(contentsOf: Data(line.utf8)); try? h?.close()
+    }
+
+    func logNamed(_ s: StandSeat) { log("\(ClaudeLog.identity) \(ClaudeLog.accountField)\(s.account) \(ClaudeLog.orgField)\(s.org)") }
+    func logRefused(_ s: StandSeat) { log("[auth] \(ClaudeLog.refusal) cacheKey=\(s.account):\(s.org) \(ClaudeLog.orgField)\(s.org)") }
+    func logTurnEnded(_ chat: String) { log("\(ClaudeLog.healthyCycle)\(chat) (12s, hadFirstResponse=true)") }
+    func logLimitStop(_ chat: String) {
+        log("\(ClaudeLog.cycle)\(chat)\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit")
+    }
+    func logCutByQuit(_ chat: String) { log("\(ClaudeLog.unhealthyCycle)\(chat) (40s, hadFirstResponse=true, \(ClaudeLog.quitReason))") }
+    func logSignedOut() { log(ClaudeLog.signOut[0]) }
+
+    // MARK: Claude running
+
+    /// Claude starts as it would from its own sign-in files, and names (or refuses) the seat.
+    func start() {
+        let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; return nextPid }
+        log("\(ClaudeLog.appStart) version: 1.0.0 }")
+        guard let seat = signInOnDisk() else {
+            if let who = signsInAs { clock.after(60) { [weak self] in self?.signIn(who, pid: p) } }
+            return
+        }
+        clock.after(nameAfter) { [weak self] in self?.name(seat, pid: p) }
+    }
+
+    private func name(_ seat: StandSeat, pid p: pid_t) {
+        guard pid == p else { return }
+        lock.withLock { held = seat }
+        logNamed(seat)
+        guard stale.contains(seat) else { return }
+        clock.after(refuseAfter) { [weak self] in
+            guard let self, self.pid == p else { return }
+            self.logRefused(seat)
+            let fallback = StandSeat(account: seat.account, org: self.personal[seat.account] ?? "personal-\(seat.account)")
+            self.lock.withLock { self.held = fallback }
+            self.logNamed(fallback)
+        }
+    }
+
+    /// The person signs in at Claude's sign-in page.
+    func signIn(_ seat: StandSeat, pid p: pid_t? = nil) {
+        guard p == nil || pid == p else { return }
+        writeSignIn(seat)
+        name(seat, pid: pid ?? 0)
+    }
+
+    /// Claude stops: a crash, or the person quitting it.
+    func stop() { lock.withLock { pid = nil; held = nil; promptOpen = false } }
+
+    func pids() -> [pid_t] { installed ? lock.withLock { pid.map { [$0] } ?? [] } : [] }
+    func windowIDs(_ owners: [pid_t]) -> Set<Int> {
+        lock.withLock { pid == nil ? [] : (promptOpen ? [1, 2] : [1]) }
+    }
+
+    func requestQuit(_ p: pid_t) async {
+        lock.withLock { actions.append("quit") }
+        switch quitBehaviour {
+        case .quits: stop()
+        case .ignores: break
+        case .promptThenQuit, .promptCancelled, .promptUnanswered:
+            lock.withLock { promptOpen = true }
+            if quitBehaviour == .promptThenQuit { clock.after(5) { [weak self] in self?.stop() } }
+            if quitBehaviour == .promptCancelled { clock.after(5) { [weak self] in self?.lock.withLock { self?.promptOpen = false } } }
+        }
+    }
+
+    func launch() async {
+        lock.withLock { actions.append("launch") }
+        guard installed, pids().isEmpty else { return }
+        start()
+    }
+
+    func open(link: String) async { lock.withLock { actions.append("open \(link)") } }
+
+    var trusted: Bool { trustedAX }
+    func quitPromptOpen(in owners: [pid_t]) -> Bool { lock.withLock { promptOpen } }
+    func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool {
+        guard trustedAX, lock.withLock({ promptOpen }) else { return false }
+        lock.withLock { actions.append("pressed \(title)") }
+        stop()
+        return true
+    }
+    func exposeWebContent(of owners: [pid_t]) {}
+    func chatScreen(session: String, in owners: [pid_t]) -> ChatScreen? { lock.withLock { screens[session] } }
+    func send(_ text: String, session: String, in owners: [pid_t], trace: (String) -> Void) -> ChatComposer.Sent {
+        guard let s = lock.withLock({ screens[session] }) else { return .busy }
+        if s.busy { return .busy }
+        if s.draft { return .draft }
+        lock.withLock { sent.append("\(session) \(text)"); screens[session]?.busy = true }
+        return .pressed("Send")
+    }
+    func idleSeconds() -> TimeInterval { 600 }
+}
+
+/// Meters the scenario sets per account, read through the app's own usage seam.
+final class StandInUsage: UsageReader, @unchecked Sendable {
+    private let lock = NSLock()
+    private var meters: [String: AccountState] = [:]
+    private(set) var reads: [String] = []
+    func set(_ account: String, fiveHour: Double, weekly: Double = 10, resetsAt: Date?) {
+        lock.withLock {
+            meters[account] = .ok(plan: "max", fiveHour: UsageWindow(utilization: fiveHour, resetsAt: resetsAt),
+                                  weekly: UsageWindow(utilization: weekly, resetsAt: resetsAt?.addingTimeInterval(86_400 * 3)), loginExpiresAt: nil)
+        }
+    }
+    func fail(_ account: String) { lock.withLock { meters[account] = .error("can't read") } }
+    func state(for acct: AccountRecord) async -> AccountState {
+        lock.withLock {
+            reads.append(acct.accountUuid ?? "?")
+            return meters[acct.accountUuid ?? ""] ?? .error("not read yet")
+        }
+    }
+}
