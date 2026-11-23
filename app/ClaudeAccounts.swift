@@ -1403,6 +1403,8 @@ final class Store: ObservableObject {
     /// The wait that was already posted, by the time its out signal began, so each wait is
     /// posted once.
     private var postedWait: Date?
+    /// What the diagnostics file last recorded, so each publish logs only what changed.
+    private var logged: Diagnostics.Snapshot?
 
     init() {
         SavedLogins.adopt(accounts)
@@ -1425,6 +1427,7 @@ final class Store: ObservableObject {
     func woke() {
         let now = World.now()
         wokeAt = now
+        Diagnostics.record(.woke)
         for seat in meters.keys { meters[seat]?.wokeSince = now }
         for row in accounts { if let seat = row.identity { forced.insert(seat); retryAt[seat] = nil } }
         PairFile<SeatMeters>(name: "meters.json").save(meters)
@@ -1470,6 +1473,9 @@ final class Store: ObservableObject {
         if let s = success, s.until <= now { success = nil }
         if let until = noteUntil, until <= now { noteUntil = nil; switchingTo?.note = nil }
         seats = Seats.build(f, now: now)
+        let snap = Diagnostics.snapshot(f, seats: seats, decision: AutoSwitch.decide(f, now: now), now: now)
+        for (kind, fields) in Diagnostics.changes(from: logged, to: snap) { Diagnostics.record(kind, fields) }
+        logged = snap
         let parked = SwitchJournal.load().flatMap { $0.parked && switchTask == nil ? names[$0.to] ?? "a seat" : nil }
         notice = AppState.notice(f, now: now, failure: failure, success: success?.text, finishing: parked)
     }
@@ -1646,7 +1652,9 @@ final class Store: ObservableObject {
             guard switchTask == nil, let seat = f.hold?.seat else { return }
             // With no reading with room on record, only the turn that set off the last read counts.
             let since = roomReadAt[seat] ?? log.events.lastTurnEnd(on: seat) ?? now
-            run(to: target, kind: .auto, resume: log.events.turnsEnded(on: seat, since: since))
+            // Which of Claude's two signals set it off (model, section 4), for the diagnostics file.
+            let trigger = (stops[seat].map { $0.until > now } ?? false) ? "limitStop" : "wrapUp"
+            run(to: target, kind: .auto, resume: log.events.turnsEnded(on: seat, since: since), trigger: trigger)
         }
     }
 
@@ -1821,7 +1829,7 @@ final class Store: ObservableObject {
 
     /// Run one switch; a second request while one runs is refused with a notice.
     @discardableResult
-    private func run(to target: Identity, kind: SwitchJournal.Kind, resume: Set<String> = []) -> Task<Void, Never> {
+    private func run(to target: Identity, kind: SwitchJournal.Kind, resume: Set<String> = [], trigger: String? = nil) -> Task<Void, Never> {
         if let busy = switchTask {
             let to = switchingTo?.target ?? SwitchJournal.load()?.to
             let line = "Already switching to \(to.flatMap { names[$0] } ?? "a seat")."
@@ -1835,6 +1843,9 @@ final class Store: ObservableObject {
             return busy
         }
         let from = log.events.hold?.seat
+        let rows = accounts.map(\.seat)
+        Diagnostics.record(.switchStarted, ["type": kind.rawValue, "from": from.map { rows.firstIndex(of: $0) ?? -1 } ?? NSNull(),
+                                            "to": rows.firstIndex(of: target) ?? -1, "trigger": trigger ?? NSNull()])
         let request = Switch.Request(kind: kind, to: target, names: names, resume: resume)
         return start(target) { progress, switched in await Switch.run(request, progress: progress, switched: switched) } then: { outcome in
             if kind == .auto { self.autoFinished(outcome, from: from, to: target) }
@@ -1904,6 +1915,8 @@ final class Store: ObservableObject {
         noteUntil = nil
         observe()
         if outcome.ok, !outcome.parked, let target, target.orgUnknown { learnOrganization(of: target) }
+        Diagnostics.record(.switchEnded, ["state": Diagnostics.outcomeName(outcome),
+                                          "to": target.flatMap { t in accounts.firstIndex { $0.seat == t } } ?? -1])
         if outcome.unrecognised { shapeMissing = true }
         if outcome.parked {
             failure = nil
@@ -1935,6 +1948,96 @@ final class Store: ObservableObject {
         PairFile<Date>(name: "failed-targets.json").save(failedTargets)
         World.claude.notify(title: "Didn't switch to \(name(to))", body: failure ?? outcome.text)
         Task { await self.tick() }
+    }
+}
+
+// MARK: - Diagnostics
+
+/// The local diagnostics file the release soak is counted from (model, section 14). Each line is
+/// one event: its kind, the clock's time, state names and row indexes (0-based, in menu order;
+/// -1 for a pair that is not a row). It never holds names, emails, ids or tokens, and it never
+/// leaves the Mac. Only the values typed here can be written, so nothing else can slip in.
+enum Diagnostics {
+    enum Kind: String { case claude, hold, seat, decision, switchStarted, switchEnded, woke }
+
+    /// What the app showed at one publish: the parts whose changes are logged.
+    struct Snapshot: Equatable {
+        var claude = "notRunning"
+        var hold: Int?
+        var seats: [String] = []
+        var decision = "none"
+    }
+
+    /// Past this size the file moves to diagnostics.1.jsonl, so it holds at least the last few
+    /// weeks of a heavy user's events and never grows without bound.
+    static let rotateAt = 4 * 1024 * 1024
+    static var url: URL { Paths.stateDir.appendingPathComponent("diagnostics.jsonl") }
+
+    /// The lines that take `before` to `after`.
+    static func changes(from before: Snapshot?, to after: Snapshot) -> [(Kind, [String: Any])] {
+        var out: [(Kind, [String: Any])] = []
+        if before?.claude != after.claude { out.append((.claude, ["state": after.claude])) }
+        if before.map({ $0.hold != after.hold }) ?? (after.hold != nil) { out.append((.hold, ["row": after.hold ?? NSNull()])) }
+        for (i, state) in after.seats.enumerated() where before.map({ i >= $0.seats.count || $0.seats[i] != state }) ?? true {
+            out.append((.seat, ["row": i, "state": state]))
+        }
+        if before?.decision != after.decision { out.append((.decision, ["state": after.decision])) }
+        return out
+    }
+
+    static func snapshot(_ f: Facts, seats: [Seat], decision: AutoSwitch.Decision, now: Date) -> Snapshot {
+        let rows = f.rows.map(\.seat)
+        var snap = Snapshot()
+        snap.claude = !f.claude.installed ? "notInstalled" : !f.claude.running ? "notRunning"
+            : f.hold.map { $0.settled(at: now) ? "settled" : "settling" } ?? "holdingNothing"
+        snap.hold = f.hold.map { h in rows.firstIndex(of: h.seat) ?? -1 }
+        snap.seats = seats.map { stateName($0.state) }
+        switch decision {
+        case .none: snap.decision = "none"
+        case .switchTo: snap.decision = "switch"
+        case .wait: snap.decision = "wait"
+        case .resumeInPlace: snap.decision = "resumeInPlace"
+        }
+        return snap
+    }
+
+    static func stateName(_ s: SeatState) -> String {
+        switch s {
+        case .switching: return "switching"
+        case .inUse: return "inUse"
+        case .needsSignIn: return "needsSignIn"
+        case .out: return "out"
+        case .ready: return "ready"
+        }
+    }
+
+    /// The outcome of a switch as one state name.
+    static func outcomeName(_ o: SwitchOutcome) -> String {
+        o.parked ? "parked" : o.ok ? "done" : o.unrecognised ? "unrecognised" : "undone"
+    }
+
+    /// Append one line. A failed write is dropped: diagnostics never stop the app.
+    static func record(_ kind: Kind, _ fields: [String: Any] = [:]) {
+        var line = fields
+        line["kind"] = kind.rawValue
+        line["at"] = ISO8601DateFormatter().string(from: World.now())
+        guard JSONSerialization.isValidJSONObject(line),
+              var data = try? JSONSerialization.data(withJSONObject: line, options: [.sortedKeys]) else { return }
+        data.append(0x0A)
+        let fm = FileManager.default
+        if let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int, size > rotateAt {
+            let old = Paths.stateDir.appendingPathComponent("diagnostics.1.jsonl")
+            try? fm.removeItem(at: old)
+            try? fm.moveItem(at: url, to: old)
+        }
+        if !fm.fileExists(atPath: url.path) {
+            try? fm.createDirectory(at: Paths.stateDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            fm.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
     }
 }
 

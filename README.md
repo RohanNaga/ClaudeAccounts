@@ -112,7 +112,7 @@ header's `···` menu turns the automatic part off.
 
 | Where | What | When |
 |---|---|---|
-| `~/Library/Application Support/ClaudeAccounts` | Everything the app keeps: accounts, per-account Claude Code logins (each pinned to its organization by a `forceLoginOrgUUID` line in its own `settings.json`), saved Claude logins, backups, settings, the usage cache | Always |
+| `~/Library/Application Support/ClaudeAccounts` | Everything the app keeps: accounts, per-account Claude Code logins (each pinned to its organization by a `forceLoginOrgUUID` line in its own `settings.json`), saved Claude logins, backups, settings, the usage cache, and `diagnostics.jsonl`: one line per change of Claude's state, a row's state, the automatic decision or a switch, with its time, state names and row numbers only, never a name, email, id or token. It never leaves the Mac | Always |
 | Login keychain | One `Claude Code-credentials-<hash>` item per account, written by Claude Code | Adding or signing in to an account |
 | `api.anthropic.com/api/oauth/usage` | Each account's usage, about once a minute | Always; this is the only network traffic |
 | `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Written only on **Switch** or **Set Up**, with Claude quit; the account in use's cookie rows and keys are also read (copied into its saved login) once Claude has stayed on it for a minute; the folder names in `claude-code-sessions` are also read to find an account's other organizations |
