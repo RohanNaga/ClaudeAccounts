@@ -307,10 +307,10 @@ struct MenuActions {
     /// Colours every row of the seat's account.
     var recolor: (Seat, String) -> Void = { _, _ in }
     /// Shows (true) or folds away (false) an account's organizations, by account id.
-    /// Nil leaves the account's name as plain text, with nothing to fold.
-    var showOrganizations: ((String, Bool) -> Void)? = nil
+    var showOrganizations: (String, Bool) -> Void = { _, _ in }
     var setDisplay: (MenuBarDisplay) -> Void = { _ in }
     var setMetric: (UsageMetric) -> Void = { _ in }
+    var setSwitchOrder: (SwitchOrder) -> Void = { _ in }
 
     static let none = MenuActions()
 }
@@ -323,6 +323,7 @@ struct MenuHeader {
     var updatedAt: Date?
     var display = MenuBarDisplay.gaugeNamePercent
     var metric = UsageMetric.fiveHour
+    var switchOrder = SwitchOrder.topToBottom
 }
 
 /// What the person chose for how accounts look: colours, folded accounts, and which names they
@@ -426,7 +427,10 @@ struct TitleBar: View {
                 }
                 Divider()
                 Toggle("Auto-Switch When Out", isOn: Binding(get: { header.autoSwitch }, set: { actions.setAutoSwitch($0) }))
-                    .help("When Claude stops a chat because the seat in use is out of usage, quit Claude, reopen it on the next seat in this menu's order that has room, and send \u{201C}resume\u{201D} to the chats that were working")
+                    .help("When Claude stops a chat because the seat in use is out of usage, quit Claude, reopen it on the seat marked Next, and send \u{201C}resume\u{201D} to the chats that were working")
+                Picker("Switch Order", selection: Binding(get: { header.switchOrder }, set: { actions.setSwitchOrder($0) })) {
+                    ForEach(SwitchOrder.allCases) { Text($0.title).tag($0) }
+                }
                 Toggle("Open at Login", isOn: Binding(get: { header.openAtLogin }, set: { _ in actions.toggleOpenAtLogin() }))
                 Divider()
                 Button("Quit Claude Accounts") { NSApp.terminate(nil) }.keyboardShortcut("q")
@@ -507,14 +511,16 @@ struct AccountCard: View {
             if let hex = looks.color(first) { ColorDot(hex: hex) }
             if renaming {
                 RenameField(current: first.accountName, renaming: $renaming) { actions.rename(first, $0, false) }
-            } else if let fold = actions.showOrganizations {
+            } else {
                 Button {
-                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { fold(account, folded) }
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { actions.showOrganizations(account, folded) }
                 } label: {
                     HStack(spacing: 6) {
                         Text(first.accountName).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
                         Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                             .rotationEffect(.degrees(folded ? 0 : 90))
+                        // Folded away, the account holding the next seat carries its mark.
+                        if folded && seats.contains(where: \.isNext) { NextMark() }
                         Spacer(minLength: 4)
                     }
                     .contentShape(Rectangle())
@@ -526,11 +532,6 @@ struct AccountCard: View {
                 .accessibilityAddTraits(.isHeader)
                 // Folded away, the account in use still says so.
                 if folded && inUse { Badge(text: "In use") }
-                menu
-            } else {
-                Text(first.accountName).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
-                    .accessibilityAddTraits(.isHeader)
-                Spacer()
                 menu
             }
         }
@@ -562,6 +563,14 @@ struct MoveItems: View {
             Button("Move Up") { actions.move(seat, -1, organization) }.disabled(!up)
             Button("Move Down") { actions.move(seat, 1, organization) }.disabled(!down)
         }
+    }
+}
+
+/// The mark on the seat the automatic switch goes to next, so the switch order shows in the menu.
+struct NextMark: View {
+    var body: some View {
+        Text("Next").font(.caption.weight(.semibold)).foregroundStyle(.tint).fixedSize()
+            .help("Auto-switch goes here next when Claude stops a chat for usage. Switch Order in the title's ··· menu, and Move Up and Move Down in a row's ··· menu, change it.")
     }
 }
 
@@ -611,6 +620,7 @@ struct SeatRow: View {
             RenameField(current: title, renaming: $renaming) { actions.rename(seat, $0, inCard) }
         } else {
             name
+            if seat.isNext { NextMark() }
             Spacer(minLength: 4)
             status
             actionButton
@@ -733,7 +743,8 @@ struct MenuContent: View {
         MenuPanel(seats: store.seats, notice: store.notice, firstRun: store.firstRun, visibleScreenHeight: screenHeight,
                   header: MenuHeader(refreshing: store.loading, autoSwitch: store.settings.autoSwitch,
                                      openAtLogin: store.openAtLogin, updatedAt: store.lastUpdated,
-                                     display: store.settings.display, metric: store.settings.metric),
+                                     display: store.settings.display, metric: store.settings.metric,
+                                     switchOrder: store.settings.switchOrder),
                   looks: looks, actions: actions)
             .onAppear {
                 // The menu opens under its menu bar item, where the pointer is.
@@ -762,7 +773,8 @@ struct MenuContent: View {
                     toggleOpenAtLogin: { store.toggleOpenAtLogin() },
                     recolor: { store.recolor($0, $1) },
                     showOrganizations: { store.setShowsOrganizations(of: $0, $1) },
-                    setDisplay: { store.settings.display = $0 }, setMetric: { store.settings.metric = $0 })
+                    setDisplay: { store.settings.display = $0 }, setMetric: { store.settings.metric = $0 },
+                    setSwitchOrder: { store.setSwitchOrder($0) })
     }
 
     /// The rows' colours, folds and changed names, keyed the way the menu's seats are.
