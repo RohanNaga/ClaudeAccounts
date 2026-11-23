@@ -281,6 +281,8 @@ Those flash small windows for a moment and need Accessibility for your
 terminal. `release.sh` builds and zips the app into `dist/` for a GitHub
 release and prints the checksum the Homebrew cask needs. The icon is drawn by
 `app/make-icon.swift`; delete `app/AppIcon.icns` to regenerate it.
+`scripts/render-menu.sh` draws the menu in fixed states to PNGs without
+starting the app; its `menu-readme.png` is `docs/menu.png`.
 
 Before 0.3 the app kept its state in a `data` folder beside itself. A launch
 that finds one moves it to Application Support and carries each login's

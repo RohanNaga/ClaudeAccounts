@@ -436,28 +436,36 @@ struct TitleBar: View {
             .keyboardShortcut("r")
             .help((header.updatedAt.map { "Updated \($0.formatted(date: .omitted, time: .shortened)). " } ?? "") + "Refresh (⌘R)")
             .accessibilityLabel("Refresh")
-            MoreMenu(name: "Claude Accounts") {
-                Button("Add Account…") { actions.signIn(nil) }
-                Divider()
-                Picker("Menu Bar Shows", selection: Binding(get: { header.display }, set: { actions.setDisplay($0) })) {
-                    ForEach(MenuBarDisplay.allCases) { Text($0.title).tag($0) }
-                }
-                Picker("Gauge Tracks", selection: Binding(get: { header.metric }, set: { actions.setMetric($0) })) {
-                    ForEach(UsageMetric.allCases) { Text($0.title).tag($0) }
-                }
-                Divider()
-                Toggle("Auto-Switch When Out", isOn: Binding(get: { header.autoSwitch }, set: { actions.setAutoSwitch($0) }))
-                    .help("When Claude stops a chat because the seat in use is out of usage, quit Claude, reopen it on the seat marked Next, and send \u{201C}resume\u{201D} to the chats that were working")
-                Picker("Switch Order", selection: Binding(get: { header.switchOrder }, set: { actions.setSwitchOrder($0) })) {
-                    ForEach(SwitchOrder.allCases) { Text($0.title).tag($0) }
-                }
-                Toggle("Open at Login", isOn: Binding(get: { header.openAtLogin }, set: { _ in actions.toggleOpenAtLogin() }))
-                Divider()
-                Button("Quit Claude Accounts") { NSApp.terminate(nil) }.keyboardShortcut("q")
-            }
+            MoreMenu(name: "Claude Accounts") { TitleMenuItems(header: header, actions: actions) }
         }
         .padding(.horizontal, 10)
         .frame(height: MenuLayout.titleBar)
+    }
+}
+
+/// The title bar's ··· items: the rare actions and the settings.
+struct TitleMenuItems: View {
+    let header: MenuHeader
+    let actions: MenuActions
+
+    var body: some View {
+        Button("Add Account…") { actions.signIn(nil) }
+        Divider()
+        Picker("Menu Bar Shows", selection: Binding(get: { header.display }, set: { actions.setDisplay($0) })) {
+            ForEach(MenuBarDisplay.allCases) { Text($0.title).tag($0) }
+        }
+        Picker("Gauge Tracks", selection: Binding(get: { header.metric }, set: { actions.setMetric($0) })) {
+            ForEach(UsageMetric.allCases) { Text($0.title).tag($0) }
+        }
+        Divider()
+        Toggle("Auto-Switch When Out", isOn: Binding(get: { header.autoSwitch }, set: { actions.setAutoSwitch($0) }))
+            .help("When Claude stops a chat because the seat in use is out of usage, quit Claude, reopen it on the seat marked Next, and send \u{201C}resume\u{201D} to the chats that were working")
+        Picker("Switch Order", selection: Binding(get: { header.switchOrder }, set: { actions.setSwitchOrder($0) })) {
+            ForEach(SwitchOrder.allCases) { Text($0.title).tag($0) }
+        }
+        Toggle("Open at Login", isOn: Binding(get: { header.openAtLogin }, set: { _ in actions.toggleOpenAtLogin() }))
+        Divider()
+        Button("Quit Claude Accounts") { NSApp.terminate(nil) }.keyboardShortcut("q")
     }
 }
 
