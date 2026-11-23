@@ -554,9 +554,8 @@ enum LoginSlot {
 
     static func dir(_ acct: AccountRecord) -> URL { Paths.stateDir.appendingPathComponent("slots/\(acct.id)") }
 
-    /// The row has a saved login Claude still accepts. `refused` is when Claude last refused each
-    /// organization's sign-in (LogFollower.refusedAt).
-    static func exists(_ acct: AccountRecord, refused: [String: Date]) -> Bool { identity(acct, refused: refused) != nil }
+    /// The row has a saved login Claude still accepts, by the refusals in Claude's `log`.
+    static func exists(_ acct: AccountRecord, log: LogFollower) -> Bool { identity(acct, log: log) != nil }
 
     /// `orgFolder` is the organization whose sessions Claude showed when this login was saved.
     struct Meta: Codable { var account: String?; var orgFolder: String?; var config: [String: String] }
@@ -567,11 +566,11 @@ enum LoginSlot {
     }
 
     /// Where the row's sessions go: set only when the saved login is the row's own account and
-    /// organization, and was saved after Claude last refused that organization's sign-in.
-    static func identity(_ acct: AccountRecord, refused: [String: Date]) -> Identity? {
+    /// organization, and Claude hasn't refused that sign-in since it was saved (SaveRule.counts).
+    static func identity(_ acct: AccountRecord, log: LogFollower) -> Identity? {
         guard let id = savedIdentity(acct),
               let savedAt = (try? dir(acct).appendingPathComponent("slot.json").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-              SaveRule.counts(savedAt: savedAt, refusedAt: refused[id.org]) else { return nil }
+              SaveRule.counts(savedAt: savedAt, refusedAt: log.refusal(of: id, at: Date())) else { return nil }
         return id
     }
 
@@ -857,7 +856,7 @@ enum SwitchEngine {
 
     private static func switchLocked(to target: AccountRecord, accounts: [AccountRecord], unattended: Bool,
                                      progress: @escaping Progress) async -> (outcome: SwitchOutcome, resume: PendingResume?) {
-        guard let want = LoginSlot.identity(target, refused: ClaudeApp.currentLog().refusedAt) else {
+        guard let want = LoginSlot.identity(target, log: ClaudeApp.currentLog()) else {
             return (SwitchOutcome(ok: false, message: SwitchError.noSlot(target.label).localizedDescription), nil)
         }
         if ClaudeApp.currentIdentity() == want {
@@ -1325,7 +1324,7 @@ enum UsageCache {
     }
 
     /// The auto-switch rule's view of each row, from cached readings.
-    static func candidates(_ accounts: [AccountRecord], _ entries: [String: Entry], refused: [String: Date]) -> [SwitchCandidate] {
+    static func candidates(_ accounts: [AccountRecord], _ entries: [String: Entry], log: LogFollower) -> [SwitchCandidate] {
         let outUntil = AutoSwitchLog.outUntil()
         return accounts.map { acct in
             let e = entries[acct.id]
@@ -1333,7 +1332,7 @@ enum UsageCache {
             return SwitchCandidate(acct, fiveHour: e?.fiveHour, weekly: e?.weekly,
                                    readAt: hasReading ? (e?.readAt ?? e?.polledAt) : nil,
                                    needsSignIn: e?.loginExpiresAt.map { $0.timeIntervalSinceNow < API.signInWarning } ?? false,
-                                   hasSavedLogin: LoginSlot.exists(acct, refused: refused), outUntil: outUntil[acct.id])
+                                   hasSavedLogin: LoginSlot.exists(acct, log: log), outUntil: outUntil[acct.id])
         }
     }
 }
@@ -1452,10 +1451,10 @@ final class Store: ObservableObject {
     func isInUse(_ acct: AccountRecord) -> Bool { accounts.row(for: inUse)?.id == acct.id }
 
     /// The row has a saved login Claude still accepts.
-    func hasSavedLogin(_ acct: AccountRecord) -> Bool { LoginSlot.exists(acct, refused: logWatcher.log.refusedAt) }
+    func hasSavedLogin(_ acct: AccountRecord) -> Bool { LoginSlot.exists(acct, log: logWatcher.log) }
 
-    /// Claude has refused this row's organization's sign-in as too old.
-    func isRefused(_ acct: AccountRecord) -> Bool { acct.orgUuid.map { logWatcher.log.refusedAt[$0] != nil } ?? false }
+    /// Claude refused this row's sign-in as too old and hasn't held it steadily since.
+    func isRefused(_ acct: AccountRecord) -> Bool { logWatcher.log.refusal(of: acct.identity, at: Date()) != nil }
 
     /// The hold whose login was saved, so each steady hold is saved once.
     private var savedHold: String?
@@ -1573,8 +1572,8 @@ final class Store: ObservableObject {
         let now = Date()
         let all = candidates(now: now)
         let current = accounts.row(for: inUse).flatMap { row in all.first { $0.id == row.id } }
-        // The log's stops belong to the account it names, which is `inUse`.
-        let stopped = !logWatcher.log.stoppedByLimit.isEmpty
+        // The log's stops once Claude settled on the account it names, which is `inUse`.
+        let stopped = !logWatcher.log.stoppedWhileSettled.isEmpty
         // Only look for Claude's process once Claude has stopped a chat; `ps` is the reliable check.
         let decision = AutoSwitchRule.decide(current: current, rows: all, enabled: true, limitStopped: stopped,
                                              claudeRunning: stopped && !ClaudeApp.pids().isEmpty,
@@ -2881,18 +2880,19 @@ enum Entry {
     /// last saved. Returns the row in use too, which a switch leaves out of usage.
     private static func printDecision(accounts: [AccountRecord]) -> (AutoSwitchRule.Decision, SwitchCandidate?) {
         let log = ClaudeApp.currentLog()
-        let all = UsageCache.candidates(accounts.inMenuOrder, UsageCache.load(), refused: log.refusedAt)
+        let all = UsageCache.candidates(accounts.inMenuOrder, UsageCache.load(), log: log)
         let current = accounts.row(for: log.identity).flatMap { row in all.first { $0.id == row.id } }
         let now = Date()
         func describe(_ c: SwitchCandidate) -> String {
             let row = accounts.first { $0.id == c.id }
             return c.summary(at: now, setUpStep: row.map {
-                SetUpRule.step(for: $0, claudeAccount: log.identity?.account, refused: $0.orgUuid.map { log.refusedAt[$0] != nil } ?? false)
+                SetUpRule.step(for: $0, claudeAccount: log.identity?.account, refused: log.refusal(of: $0.identity, at: now) != nil)
             } ?? "")
         }
         print("Auto-switch menu:   \(AppSettings.load().autoSwitch ? "on" : "off"); this run decides either way")
         print("In use:             \(current?.name ?? "an account this app doesn't know")")
-        print("Stopped for usage:  \(log.stoppedByLimit.count) chat\(log.stoppedByLimit.count == 1 ? "" : "s") in Claude's log")
+        let settledStops = log.stoppedWhileSettled.count
+        print("Stopped for usage:  \(settledStops) chat\(settledStops == 1 ? "" : "s") in Claude's log since it settled on this row")
         // The menu's order is the switch order: down from the row in use, wrapping round to the top.
         let next = current.flatMap { AutoSwitchRule.next(after: $0, in: all, now: now) }
         print("Switch order, as in the menu:")
@@ -2903,7 +2903,7 @@ enum Entry {
         print("Next switch goes to: \(next?.name ?? (current == nil ? "no row: Claude's account isn't one this app knows" : "no row: none other is set up with room"))")
         let last = AutoSwitchLog.lastAttempt()
         print("Last auto attempt:  \(last.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "never")")
-        let stopped = !log.stoppedByLimit.isEmpty
+        let stopped = settledStops > 0
         let decision = AutoSwitchRule.decide(current: current, rows: all, enabled: true, limitStopped: stopped,
                                              claudeRunning: stopped && !ClaudeApp.pids().isEmpty, lastAttempt: last, now: now)
         switch decision {
@@ -2926,9 +2926,9 @@ enum Entry {
         print("Auto-switch:      \(AppSettings.load().autoSwitch ? "on, when Claude stops a chat at the usage limit" : "off")")
         print("Accessibility:    \(QuitPrompt.trusted ? "granted to this process" : "not granted to this process")")
         print("Notifications:    \(Notify.permission())")
-        let refused = ClaudeApp.currentLog().refusedAt
+        let log = ClaudeApp.currentLog()
         for acct in accounts {
-            print("Saved login \(acct.label): \(LoginSlot.identity(acct, refused: refused).map { "organization \($0.org.prefix(8))" } ?? "none")")
+            print("Saved login \(acct.label): \(LoginSlot.identity(acct, log: log).map { "organization \($0.org.prefix(8))" } ?? "none")")
         }
         exit(0)
     }
@@ -2939,7 +2939,7 @@ enum Entry {
         var problems: [String] = []
         let current = ClaudeApp.currentIdentity()
         let currentAcct = accounts.row(for: current)
-        let want = LoginSlot.identity(target, refused: ClaudeApp.currentLog().refusedAt)
+        let want = LoginSlot.identity(target, log: ClaudeApp.currentLog())
         print("Target:             \(target.label)")
         print("Target saved login: \(want.map { "organization \($0.org.prefix(8))" } ?? "none")")
         if want == nil { problems.append(SwitchError.noSlot(target.label).localizedDescription) }

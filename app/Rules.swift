@@ -9,7 +9,7 @@ import Foundation
 // MARK: - Accounts and identities
 
 /// The account Claude is signed in to and the organization whose Code sessions it shows.
-struct Identity: Equatable, Codable, Sendable {
+struct Identity: Hashable, Codable, Sendable {
     let account: String
     let org: String
 }
@@ -43,6 +43,9 @@ struct AccountRecord: Codable, Identifiable, Equatable {
     /// The organization's name as the app shows it: the name someone gave it, else its own name,
     /// with "Individual" for the one Claude names after the account's email.
     var organization: String { shownName(orgLabel) ?? defaultOrganizationName(orgName) }
+
+    /// The account and organization this row stands for, once both are known.
+    var identity: Identity? { accountUuid.flatMap { account in orgUuid.map { Identity(account: account, org: $0) } } }
 }
 
 /// Claude names an account's own individual organization "<email>'s Organization"; the app calls
@@ -252,8 +255,8 @@ enum SaveRule {
     /// Three times the slowest fall-back seen (21 s).
     static let steadyHold: TimeInterval = 60
 
-    /// A saved login counts only if it was saved after Claude last refused its organization: an
-    /// older one is the sign-in Claude now calls too old.
+    /// A saved login counts unless Claude refused that sign-in after it was saved
+    /// (LogFollower.refusal): the older one is the sign-in Claude now calls too old.
     static func counts(savedAt: Date, refusedAt: Date?) -> Bool { refusedAt.map { savedAt > $0 } ?? true }
 }
 
@@ -538,14 +541,18 @@ struct LogFollower {
     /// idle and Claude doesn't resume it; it waits for a new message. Retrying the failed message
     /// instead rewinds the chat and starts its transcript over under a new id, without its subagents.
     private(set) var stoppedByLimit: Set<String> = []
+    /// When Claude stopped each chat in `stoppedByLimit`, from the line's time.
+    private var stoppedAt: [String: Date] = [:]
     /// Chats whose turn was still running when Claude quit.
     private(set) var cutByQuit: Set<String> = []
     /// When Claude named the identity it holds, from the line's time; named again after a refusal
     /// of its organization, the hold starts over. Nil while it holds none.
     private(set) var heldSince: Date?
-    /// When Claude last refused each organization's sign-in as too old, by organization id. Kept
-    /// across runs and sign-outs: it is about the organization's sign-in, not the run.
-    private(set) var refusedAt: [String: Date] = [:]
+    /// When Claude last refused each account's sign-in to an organization as too old. An
+    /// organization is shared by every account in it, and Claude refuses one account's sign-in, so
+    /// a refusal is kept by account and organization. Kept across runs and sign-outs until Claude
+    /// next holds that account and organization steadily (refusal(of:at:)).
+    private var refusedAt: [Identity: Date] = [:]
 
     /// Claude's own messages for a turn refused because the account is out of usage.
     static let outOfUsage = [
@@ -561,39 +568,67 @@ struct LogFollower {
             if line.contains("[LocalSessionManager] Initialization succeeded"),
                let account = Self.field(line, "accountId="), let org = Self.field(line, "orgId=") {
                 let named = Identity(account: account, org: org)
-                if named != identity { stoppedByLimit = []; cutByQuit = [] }
-                let refusedSinceHeld = heldSince.flatMap { since in refusedAt[org].map { $0 >= since } } ?? false
+                if named != identity { endHold(at: Self.time(line)); stoppedByLimit = []; stoppedAt = [:]; cutByQuit = [] }
+                let refusedSinceHeld = heldSince.flatMap { since in refusedAt[named].map { $0 >= since } } ?? false
                 if named != identity || heldSince == nil || refusedSinceHeld { heldSince = Self.time(line) }
                 identity = named
-            } else if line.contains("session_stale_relogin"), let at = Self.time(line) {
-                // Claude names the organization it refuses, as orgId= or inside its cache key.
-                if let org = Self.field(line, "orgId=") { refusedAt[org] = at }
-                if let org = identity?.org, line.contains(org) { refusedAt[org] = at }
+            } else if line.contains("session_stale_relogin"), let at = Self.time(line), let held = identity {
+                // Claude refuses the sign-in of the account it holds, naming the organization as
+                // orgId= or inside its cache key.
+                if let org = Self.field(line, "orgId=") ?? (line.contains(held.org) ? held.org : nil) {
+                    refusedAt[Identity(account: held.account, org: org)] = at
+                }
             } else if line.contains("Starting app {") || Self.signsOut(line) {
+                endHold(at: Self.time(line))
                 identity = nil
                 heldSince = nil
                 stoppedByLimit = []
+                stoppedAt = [:]
                 cutByQuit = []
             } else if line.contains("[CCD CycleHealth] ") {
                 if let id = Self.session(after: "[CCD CycleHealth] healthy cycle for ", in: line) {
                     stoppedByLimit.remove(id)
+                    stoppedAt[id] = nil
                     cutByQuit.remove(id)
                 } else if let id = Self.session(after: "[CCD CycleHealth] unhealthy cycle for ", in: line) {
                     if line.contains("reason=app_quit") { cutByQuit.insert(id) }
                 } else if let id = Self.session(after: "[CCD CycleHealth] ", in: line), line.contains(" api_error ("),
                           Self.outOfUsage.contains(where: { line.contains($0) }) {
                     stoppedByLimit.insert(id)
+                    stoppedAt[id] = Self.time(line)
                 }
             }
         }
+    }
+
+    /// Chats Claude stopped for usage once it had settled on the identity it holds, held for
+    /// SaveRule.steadyHold: only these say that identity is out. A stop sooner after Claude named it
+    /// ends a turn begun before, on the identity it held then, like a refusal before a steady hold.
+    var stoppedWhileSettled: Set<String> {
+        guard let since = heldSince else { return [] }
+        return Set(stoppedAt.filter { $0.value.timeIntervalSince(since) >= SaveRule.steadyHold }.keys)
     }
 
     /// The identity whose login may be saved at `now`: Claude has held it for SaveRule.steadyHold
     /// and has not refused its organization since it named it.
     func steady(at now: Date) -> Identity? {
         guard let identity, let since = heldSince, now.timeIntervalSince(since) >= SaveRule.steadyHold else { return nil }
-        if let refused = refusedAt[identity.org], refused >= since { return nil }
+        if let refused = refusedAt[identity], refused >= since { return nil }
         return identity
+    }
+
+    /// When Claude refused `identity`'s sign-in, if that refusal still counts at `now`: a refusal
+    /// counts until Claude next holds that account and organization steadily, which shows the
+    /// sign-in works again.
+    func refusal(of identity: Identity?, at now: Date) -> Date? {
+        guard let identity, steady(at: now) != identity else { return nil }
+        return refusedAt[identity]
+    }
+
+    /// The hold ends at `end` (another identity named, a new run, a sign-out); held steadily up to
+    /// then, its refusal no longer counts.
+    private mutating func endHold(at end: Date?) {
+        if let end, let held = steady(at: end) { refusedAt[held] = nil }
     }
 
     /// A line's time: Claude starts each line with its local "yyyy-MM-dd HH:mm:ss".

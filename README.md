@@ -185,7 +185,9 @@ install, or an update, keeps the order the menu already shows.
 
 It never switches:
 
-- before Claude has stopped a chat of the account in use for usage;
+- before Claude has stopped a chat of the account in use for usage, once it had
+  stayed on that account for a minute (a stop sooner than that ends a turn
+  begun on the account before);
 - to an account that is out itself (a meter at 100 percent), isn't set up, has
   no reading from the last 15 minutes, or shows **Sign in again**;
 - back to the account it left, until that account's usage resets, whatever its
@@ -299,7 +301,9 @@ the bottom of Claude's sidebar. The app saves that organization's Claude login
 once Claude has stayed on it for a minute, and from then on Switch and
 auto-switch can move to it. If Claude asks for a new sign-in to that
 organization, its row says so: choose it in Claude, sign in, and stay
-on it for a minute.
+on it for a minute. That request is about one account's sign-in, so it never
+touches another account's row in the same organization, and it is over once
+Claude has stayed on that account and organization for a minute.
 
 ## Command line
 
