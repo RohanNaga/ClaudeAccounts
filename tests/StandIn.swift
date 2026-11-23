@@ -116,8 +116,6 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var promptHasQuitButton = true
     /// Set Up: who the person signs in as once Claude asks (nil: nobody signs in).
     var signsInAs: StandSeat?
-    /// Claude's version, as its bundle and its log give it: the newest recorded one unless set.
-    var claudeVersion = standInClaudeVersion
     /// Every notification the app posted, as "<title>: <body>".
     private(set) var notifications: [String] = []
     /// Times the person opens Claude again after a switch quit it, between the quit and the launch:
@@ -238,7 +236,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// Claude starts as it would from its own sign-in files, and names (or refuses) the seat.
     func start() {
         let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; return nextPid }
-        log("\(ClaudeLog.appStart) version: \(claudeVersion) }")
+        log("\(ClaudeLog.appStart) }")
         guard let seat = signInOnDisk() else {
             if let who = signsInAs { clock.after(60) { [weak self] in self?.signIn(who, pid: p) } }
             return
@@ -326,7 +324,6 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         return .pressed("Send")
     }
     func idleSeconds() -> TimeInterval { 600 }
-    func version() -> String? { lock.withLock { installed ? claudeVersion : nil } }
     func notify(title: String, body: String) { lock.withLock { notifications.append("\(title): \(body)") } }
 }
 

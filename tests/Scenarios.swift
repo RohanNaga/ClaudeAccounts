@@ -550,6 +550,7 @@ let scenarios: [Scenario] = [
         h.click("Beta")
         await h.run(until: { h.noticeHas(pausedLine) && !h.switchInFlight }, limit: 1800)
         h.check(h.noticeHas(pausedLine), "a launch with no Named line pauses automatic switching, in one line: \(h.notice)")
+        await h.run(until: { h.claude.held != nil }, limit: 60)
         h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "confirm could not read the log, so it rolled back to Alpha with the chat: \(String(describing: h.claude.held))")
         h.check(h.hasSavedLogin(A) && h.hasSavedLogin(B), "every saved login intact")
         let quits = h.quits
@@ -603,11 +604,13 @@ let scenarios: [Scenario] = [
         h.claude.cookieSchema = "99"
         h.claude.writeSignIn(A)
         await h.pass(ClaudeTiming.meterEvery)
+        let savedB = h.savedAt(B)
         h.click("Beta")
         await h.run(until: { !h.switchInFlight }, limit: 900)
         h.check(h.noticeHas(pausedLine), "an unseen cookie format pauses automatic switching, in one line: \(h.notice)")
-        h.check(h.claude.held == A || h.claude.held == B, "Claude ends signed in to Alpha or Beta (8 A): holds \(String(describing: h.claude.held)), running \(!h.claude.pids().isEmpty), \(h.claude.actions)")
-        h.check(h.hasSavedLogin(A) && h.hasSavedLogin(B), "every saved login intact")
+        await h.run(until: { h.claude.held != nil }, limit: 60)
+        h.check(h.claude.held == A && h.claude.signInOnDisk() == A, "nothing is loaded in an unseen format, so Claude is back on Alpha: holds \(String(describing: h.claude.held)), running \(!h.claude.pids().isEmpty), \(h.claude.actions)")
+        h.check(h.hasSavedLogin(A) && h.savedAt(B) == savedB, "every saved login intact, Beta's untouched")
         let quits = h.quits
         h.claude.logLimitStop("local_one")
         await h.pass(300)
