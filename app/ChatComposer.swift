@@ -290,6 +290,8 @@ struct ChatResumer {
     /// False once another switch has started: Claude may be quitting or showing another account,
     /// so this resume types nothing more and stops.
     var current: () -> Bool = { true }
+    /// Hears each chat's id as soon as its result is settled.
+    var settled: (String) -> Void = { _ in }
 
     static let superseded = "another switch started"
 
@@ -317,6 +319,7 @@ struct ChatResumer {
                 guard let tried = await attempt(chat, pass: pass, sentBefore: sentTo.contains(chat.id)) else { continue }
                 if tried.sent { sentTo.insert(chat.id) }
                 results[chat.id] = tried.result
+                if tried.result.settled { settled(chat.id) }
                 trace("\(chat.title): \(Self.describe(tried.result))")
             }
             let left = chats.filter { results[$0.id]?.settled != true }.count

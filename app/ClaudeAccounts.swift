@@ -735,7 +735,9 @@ enum Switch {
 
     /// The lock this process holds while a switch runs.
     nonisolated(unsafe) private static var held: SwitchLock?
-    /// Chats a resume left when another switch overtook it; the next switch resumes them.
+    /// The chats the running resume has not settled yet, from its start. A switch that overtakes
+    /// it takes them over and resumes them after its own confirm (section 6, step 7), whenever in
+    /// the resume it starts.
     nonisolated(unsafe) private static var carried: Set<String> = []
 
     /// A test drops the switch it abandoned, as if the app had quit, so the next Store recovers.
@@ -843,10 +845,13 @@ enum Switch {
         var resumer = ChatResume.resumer(in: folder, reopenedAt: (j.launchedAt ?? World.now()).timeIntervalSince1970 * 1000,
                                          progress: progress)
         resumer.current = { SwitchLock.generation() == generation }
+        carried = Set(chats.map(\.id))
+        resumer.settled = { carried.remove($0) }
         let reports = await resumer.run(chats)
+        // A resume no switch overtook leaves nothing to carry: what it gave up on is named instead.
+        if resumer.current() { carried = [] }
         outcome.resumed = reports.filter(\.result.runningAgain).count
         outcome.superseded = reports.contains { $0.result == .notResumed(ChatResumer.superseded) }
-        carried.formUnion(reports.filter { $0.result == .notResumed(ChatResumer.superseded) }.map(\.chat.id))
         outcome.notResumed = reports.filter { !$0.result.runningAgain && $0.result != .notResumed(ChatResumer.superseded) }
             .map(\.chat.title)
         return outcome
