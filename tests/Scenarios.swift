@@ -204,7 +204,7 @@ let scenarios: [Scenario] = [
         h.claude.logLimitStop("local_one")
         await h.pass(120)
         h.check(h.claude.actions.isEmpty, "no switch when every seat is out: \(h.claude.actions)")
-        h.check(h.noticeHas("Every seat is out. Chats resume when") && h.noticeHas(ClockText.time(reset)), "the waiting line names the reset: \(h.notice)")
+        h.check(h.noticeHas("Every seat is out. Chats resume when") && h.noticeHas(DateFormatter.localizedString(from: reset, dateStyle: .none, timeStyle: .short)), "the waiting line names the reset: \(h.notice)")
     },
     Scenario(pair: "(Waiting, reset time passes)", model: "read the meter, then resume in place or switch") { h in
         await h.standard()
