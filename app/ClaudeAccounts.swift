@@ -1521,14 +1521,21 @@ final class Store: ObservableObject {
     /// Each settled usage stop becomes the seat's stop mark, with the reset of the reading taken
     /// at the stop (model, section 4). A meter read follows the stop and completes the mark.
     private func recordStops() {
-        var changed = false
-        for e in log.events.events where e.settled {
-            guard case .limitStop = e.event, let seat = e.held, e.at > (stops[seat]?.at ?? .distantPast) else { continue }
-            stops[seat] = StopMark(at: e.at, resetsAt: meters[seat]?.fullUntil(at: e.at) ?? meters[seat]?.fuller?.resetsAt)
-            forced.insert(seat)
-            changed = true
+        let new = Self.newStops(log.events, stops: stops, meters: meters)
+        guard !new.isEmpty else { return }
+        stops.merge(new) { _, b in b }
+        forced.formUnion(new.keys)
+        PairFile<StopMark>(name: "stops.json").save(stops)
+    }
+
+    /// The settled usage stops in `events` later than each seat's stop mark, as new marks.
+    nonisolated static func newStops(_ events: ClaudeEvents, stops: [Identity: StopMark], meters: [Identity: SeatMeters]) -> [Identity: StopMark] {
+        var new: [Identity: StopMark] = [:]
+        for e in events.events where e.settled {
+            guard case .limitStop = e.event, let seat = e.held, e.at > (new[seat]?.at ?? stops[seat]?.at ?? .distantPast) else { continue }
+            new[seat] = StopMark(at: e.at, resetsAt: meters[seat]?.fullUntil(at: e.at) ?? meters[seat]?.fuller?.resetsAt)
         }
-        if changed { PairFile<StopMark>(name: "stops.json").save(stops) }
+        return new
     }
 
     /// Save the login of a hold once it settles while Claude runs, so the seat Claude is on gets
@@ -2286,23 +2293,74 @@ enum Entry {
         ClaudeAccountsApp.main()
     }
 
-    /// `--status`: what a switch would act on, read-only.
+    /// `--status`: the state of every row and the automatic decision, read from the same facts
+    /// the menu reads, by the same functions (model, section 3). It writes nothing, and it names
+    /// nothing beyond the row labels.
     private static func printStatus() -> Never {
-        let id = ClaudeApp.currentIdentity()
-        let accounts = AccountStore.load()
-        func name(_ uuid: String?) -> String { accounts.first { $0.accountUuid == uuid }?.name ?? (uuid ?? "none") }
-        print("Claude processes: \(ClaudeApp.pids())")
-        print("Claude reports:   \(id.map { "\(accounts.row(for: $0)?.label ?? "an unknown account") (organization \($0.org.prefix(8)))" } ?? "signed out")")
-        print("Claude settings:  \(name(ClaudeApp.savedAccount()))")
-        print("Interrupted switch: \(SwitchJournal.load() == nil ? "none" : "yes")")
-        print("Auto-switch:      \(AppSettings.load().autoSwitch ? "on, when Claude stops a chat at the usage limit" : "off")")
-        print("Accessibility:    \(World.claude.trusted ? "granted to this process" : "not granted to this process")")
-        print("Notifications:    \(Notify.permission())")
-        let log = ClaudeApp.currentLog()
-        for acct in accounts {
-            print("Saved login \(acct.label): \(SavedLogins.usable(acct, refusedAt: { log.refusal(of: $0, at: World.now()) }).map { "organization \($0.org.prefix(8))" } ?? "none")")
-        }
+        print(StatusReport.text(StatusReport.facts(), now: World.now()), terminator: "")
         exit(0)
+    }
+}
+
+/// The text `--status` prints.
+enum StatusReport {
+    /// The facts as the menu would read them now, from disk and Claude's log, read-only.
+    static func facts() -> Facts {
+        var log = LogReader()
+        log.poll()
+        let meters = PairFile<SeatMeters>(name: "meters.json").load()
+        let stops = PairFile<StopMark>(name: "stops.json").load()
+        let installed = World.claude.installed
+        var f = Facts()
+        f.rows = AccountStore.load().inMenuOrder
+        f.claude = ClaudeFacts(installed: installed, running: !ClaudeApp.pids().isEmpty,
+                               recognised: !installed || ClaudeContract.recognises(World.claude.version()))
+        f.log = log.events
+        f.saved = Dictionary(f.rows.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
+        f.meters = meters
+        f.stops = stops.merging(Store.newStops(log.events, stops: stops, meters: meters)) { _, b in b }
+        f.failedTargets = PairFile<Date>(name: "failed-targets.json").load()
+        f.switching = SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "parked until Claude opens" : "in progress") }
+        f.trusted = World.claude.trusted
+        f.autoChosen = AppSettings.load().autoSwitch
+        f.waitingChats = f.hold == nil ? 0 : log.events.stoppedChats.byLimit.count
+        return f
+    }
+
+    static func text(_ f: Facts, now: Date) -> String {
+        let seats = Seats.build(f, now: now)
+        let label = { (s: Identity?) in s.flatMap { s in seats.first { $0.id == s }?.name } ?? "a pair not in the list" }
+        var out = ""
+        let claude: String
+        if !f.claude.installed { claude = "not installed" }
+        else if !f.claude.running { claude = "not running" }
+        else if let hold = f.hold { claude = "on \(label(hold.seat)), \(hold.settled(at: now) ? "settled" : "settling")" }
+        else { claude = "running, on no seat yet" }
+        out += "Claude: \(claude)\n"
+        let auto: String
+        switch AutoSwitch.status(f) {
+        case .on: auto = "on"
+        case .offAccessibility: auto = "off, Accessibility is not granted to this process"
+        case .offUnrecognised: auto = "off, this Claude version is not one the app has checked"
+        case .offByPerson: auto = "off, turned off in the menu"
+        }
+        out += "Automatic switching: \(auto)\n"
+        for (i, seat) in seats.enumerated() {
+            var line = "\(i + 1). \(seat.name): \(Diagnostics.stateName(seat.state))"
+            if case .out(let until?) = seat.state { line += " until \(ClockText.time(until))" }
+            if case .switching(let step) = seat.state { line += " (\(step))" }
+            if let read = seat.meters.readText(at: now) { line += ", meters \(read)" }
+            out += line + "\n"
+        }
+        let decision: String
+        switch AutoSwitch.decide(f, now: now) {
+        case .none: decision = "nothing to do"
+        case .switchTo(let t): decision = "switch to \(label(t))"
+        case .resumeInPlace: decision = "resume the stopped chats in place"
+        case .wait(let s, let at): decision = "wait" + (s.map { " for \(label($0))" } ?? "") + (at.map { " to reset at \(ClockText.time($0))" } ?? "")
+        }
+        out += "Decision: \(decision)\n"
+        return out
     }
 }
 

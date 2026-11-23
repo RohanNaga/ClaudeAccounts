@@ -311,7 +311,7 @@ The binary is at `Claude Accounts.app/Contents/MacOS/ClaudeAccounts`.
 
 | Command | What it does |
 |---|---|
-| `--status` | Prints what a switch would act on |
+| `--status` | Prints Claude's state, whether automatic switching is on, each row's state by its label, and the automatic decision. It reads the same facts as the menu and changes nothing |
 | `--switch <name>` | Runs a switch to the row named by id, label, email or the email's first part |
 | `--auto-switch` | Runs the Auto-Switch rule once: if Claude's log shows it stopped a chat of the account in use for usage, switches to the next row in the menu's order that is set up and has room, judged on the usage the menu last read. With `--dry-run` it prints the rows in that order and the one it would choose |
 | `--unattended` | With `--switch`, answers Claude's quit prompt with Quit anyway (implied by `--auto-switch`) |
