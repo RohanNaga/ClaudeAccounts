@@ -110,6 +110,10 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// Seconds from launch to the Named line, and from Named to a refusal (4 to 21 s seen).
     var nameAfter: TimeInterval = 3
     var refuseAfter: TimeInterval = 12
+    /// Claude names the seat it holds in a line the app has not seen: the Named shape is missing.
+    var namedLineChanged = false
+    /// Claude's quit prompt has no Quit anyway button: Accessibility finds no prompt, only a new window.
+    var promptHasQuitButton = true
     /// Set Up: who the person signs in as once Claude asks (nil: nobody signs in).
     var signsInAs: StandSeat?
     /// Claude's version, as its bundle and its log give it: the newest recorded one unless set.
@@ -147,8 +151,8 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
 
     // MARK: Claude's files
 
-    /// The cookie schema version recorded for the Claude versions the contracts cover.
-    static let cookieSchema = "24"
+    /// The cookie schema version Claude writes: the recorded one unless a scenario changes it.
+    var cookieSchema = ClaudeFiles.cookieSchemaVersion
 
     var cookies: URL { dataDir.appendingPathComponent(ClaudeFiles.cookies) }
     var config: URL { dataDir.appendingPathComponent(ClaudeFiles.config) }
@@ -160,7 +164,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         // Chromium's cookie database shape: a meta table carrying the schema version, and cookie
         // rows keyed by host. Placeholder values only; the stand-in's tag stands for the sign-in.
         let sql = "CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR); "
-            + "INSERT INTO meta VALUES('version','\(Self.cookieSchema)'); "
+            + "INSERT INTO meta VALUES('version','\(cookieSchema)');"
             + "CREATE TABLE cookies(host_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL); "
             + "INSERT INTO cookies VALUES('.example.org','other','x'); "
             + (seat == nil ? "" : "INSERT INTO cookies VALUES('.claude.ai','\(ClaudeFiles.signInCookie)','\(value)');")
@@ -218,7 +222,9 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         _ = try? h?.seekToEnd(); try? h?.write(contentsOf: Data(line.utf8)); try? h?.close()
     }
 
-    func logNamed(_ s: StandSeat) { log("\(ClaudeLog.identity) \(ClaudeLog.accountField)\(s.account) \(ClaudeLog.orgField)\(s.org)") }
+    func logNamed(_ s: StandSeat) {
+        if namedLineChanged { log("[identity] signed in, in a shape the app has not seen"); return }
+        log("\(ClaudeLog.identity) \(ClaudeLog.accountField)\(s.account) \(ClaudeLog.orgField)\(s.org)") }
     func logRefused(_ s: StandSeat) { log("[auth] \(ClaudeLog.refusal) cacheKey=\(s.account):\(s.org) \(ClaudeLog.orgField)\(s.org)") }
     func logTurnEnded(_ chat: String) { log("\(ClaudeLog.healthyCycle)\(chat) (12s, hadFirstResponse=true)") }
     func logLimitStop(_ chat: String) {
@@ -301,11 +307,13 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     func open(link: String) async { lock.withLock { actions.append("open \(link)") } }
 
     var trusted: Bool { trustedAX }
-    func quitPromptOpen(in owners: [pid_t]) -> Bool { lock.withLock { promptOpen } }
+    func quitPromptOpen(in owners: [pid_t]) -> Bool { lock.withLock { promptOpen && promptHasQuitButton } }
+    /// Quit anyway quits Claude; Cancel closes the prompt and leaves Claude running.
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool {
         guard trustedAX, lock.withLock({ promptOpen }) else { return false }
+        if title == ClaudeUI.quitAnyway && !promptHasQuitButton { return false }
         lock.withLock { actions.append("pressed \(title)") }
-        stop()
+        if title == ClaudeUI.cancel { lock.withLock { promptOpen = false } } else { stop() }
         return true
     }
     func exposeWebContent(of owners: [pid_t]) {}
