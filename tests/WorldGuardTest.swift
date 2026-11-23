@@ -34,6 +34,8 @@ struct PathWorld: ClaudeWorld {
     func chatScreen(session: String, in owners: [pid_t]) -> ChatScreen? { nil }
     func send(_ text: String, session: String, in owners: [pid_t], trace: (String) -> Void) -> ChatComposer.Sent { .refused("test") }
     func idleSeconds() -> TimeInterval { 0 }
+    func version() -> String? { nil }
+    func notify(title: String, body: String) {}
 }
 
 struct StillClock: AppClock {
