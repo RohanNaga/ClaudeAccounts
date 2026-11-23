@@ -39,6 +39,12 @@ enum MenuLayout {
         return cards
     }
 
+    /// The card the menu scrolls to when it opens: the account of the seat in use, so its card is
+    /// in view however long the list is. Nil when no seat is in use, which leaves the top in view.
+    static func openScrollTarget(_ seats: [Seat]) -> String? {
+        cards(seats).first { $0.contains { $0.state == .inUse } }?[0].id.account
+    }
+
     /// The meters a row lists when it shows both: the 5-hour one only for a plan that has it.
     static func meterLines(_ meters: SeatMeters) -> [(label: String, meter: MeterReading?)] {
         let fiveHour = meters.fiveHour != nil || meters.weekly == nil
@@ -372,7 +378,6 @@ struct MenuPanel: View {
 
     private var cards: some View {
         let busy = seats.contains { if case .switching = $0.state { return true } else { return false } }
-        let inUseCard = MenuLayout.cards(seats).first { $0.contains { $0.state == .inUse } }?[0].id.account
         return ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: MenuLayout.cardGap) {
@@ -385,7 +390,7 @@ struct MenuPanel: View {
             .scrollIndicators(.automatic)
             .frame(height: MenuLayout.cardsViewport(visibleScreenHeight: visibleScreenHeight, seats: seats,
                                                     hasNotice: notice != nil, expanded: expanded, folded: looks.folded))
-            .onAppear { if let inUseCard { proxy.scrollTo(inUseCard, anchor: .center) } }
+            .onAppear { if let target = MenuLayout.openScrollTarget(seats) { proxy.scrollTo(target, anchor: .center) } }
         }
     }
 }
