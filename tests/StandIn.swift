@@ -333,16 +333,16 @@ final class StandInUsage: UsageReader, @unchecked Sendable {
     private(set) var reads: [String] = []
     func set(_ seat: StandSeat, fiveHour: Double, weekly: Double = 10, resetsAt: Date?) {
         lock.withLock {
-            meters[seat.tag] = .ok(plan: "max", fiveHour: UsageWindow(utilization: fiveHour, resetsAt: resetsAt),
-                                  weekly: UsageWindow(utilization: weekly, resetsAt: resetsAt?.addingTimeInterval(86_400 * 3)), loginExpiresAt: nil)
+            meters[seat.tag] = .ok(fiveHour: UsageWindow(utilization: fiveHour, resetsAt: resetsAt),
+                                  weekly: UsageWindow(utilization: weekly, resetsAt: resetsAt?.addingTimeInterval(86_400 * 3)))
         }
     }
-    func fail(_ seat: StandSeat) { lock.withLock { meters[seat.tag] = .error("can't read") } }
+    func fail(_ seat: StandSeat) { lock.withLock { meters[seat.tag] = .unreadable } }
     func state(for acct: AccountRecord) async -> AccountState {
         lock.withLock {
             let tag = "\(acct.accountUuid ?? "?")/\(acct.orgUuid ?? "?")"
             reads.append(tag)
-            return meters[tag] ?? .error("not read yet")
+            return meters[tag] ?? .unreadable
         }
     }
 }
