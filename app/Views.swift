@@ -311,8 +311,6 @@ struct MenuActions {
     var setDisplay: (MenuBarDisplay) -> Void = { _ in }
     var setMetric: (UsageMetric) -> Void = { _ in }
     var setSwitchOrder: (SwitchOrder) -> Void = { _ in }
-
-    static let none = MenuActions()
 }
 
 /// The title bar's live values.
@@ -351,7 +349,7 @@ struct MenuPanel: View {
     let visibleScreenHeight: CGFloat
     var header = MenuHeader()
     var looks = MenuLooks()
-    var actions = MenuActions.none
+    var actions = MenuActions()
     var now: Date = World.now()
     /// The one row expanded to both meters. Never remembered: it is cleared whenever the menu opens.
     @State var expanded: Identity? = nil
@@ -392,7 +390,7 @@ struct MenuPanel: View {
     }
 }
 
-/// "Claude Accounts", refresh, and the menu of the rare actions and the one setting.
+/// "Claude Accounts", refresh, and the menu of the rare actions and the settings.
 struct TitleBar: View {
     let header: MenuHeader
     let actions: MenuActions

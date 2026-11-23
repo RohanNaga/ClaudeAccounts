@@ -19,7 +19,7 @@ each seat is one row in the menu. The app does three things:
    chat that was stopped one "resume" message.
 
 <p align="center">
-  <img src="docs/menu.png" width="346" alt="The ClaudeAccounts menu: eight seats across five accounts, the seat in use with both meters and their resets, two seats out with their reset times, one seat still to set up, and Switch on every other one-line row">
+  <img src="docs/menu.png" width="346" alt="The ClaudeAccounts menu: eight seats across five accounts, the seat in use with both meters and their resets, the seat the automatic switch goes to next marked Next, two seats out with their reset times, one seat still to set up, and Switch on every other one-line row">
 </p>
 
 > ClaudeAccounts is an independent project. It is not made, endorsed or
@@ -115,7 +115,11 @@ percent. The meters alone never start a switch.
 It goes down the menu from the seat in use, wrapping round to the top, and
 picks the first seat that is ready, has a reading from the last 15 minutes, and
 hasn't failed a switch in the last 10 minutes. **Move Up** and **Move Down** in
-a row's `···` menu set that order. Because nobody is there to answer Claude's
+a row's `···` menu set that order. **Switch Order** in the menu's `···` can
+instead try every **Individual** seat first (**Personal First**) or every
+organization seat first (**Organizations First**), each in menu order. The menu
+marks the seat it would go to with **Next**; when that seat's account is folded
+away, the mark is on the account's name. Because nobody is there to answer Claude's
 quit prompt, the automatic switch presses **Quit anyway** itself. If Claude
 still hasn't quit after 3 minutes, it cancels and changes nothing.
 
@@ -124,8 +128,7 @@ first. With more than one seat, one notification says so too.
 
 It pauses itself, with one line in the menu saying why:
 
-- **Auto-Switch When Out** in the menu's `···` is off. That toggle is the only
-  setting for it, and it is on from the start.
+- **Auto-Switch When Out** in the menu's `···` is off. It is on from the start.
 - Accessibility isn't allowed. macOS ties that permission to the app's
   signature, so a new version may need it again.
 - Something the app expects from Claude is missing at run time: Claude reopens
@@ -225,6 +228,7 @@ is never taller than the screen, and it opens on the seat in use.
   "Out" with its reset time when out, and **Switch**. Click the name to see both
   meters.
 - The seat in use shows both meters with their resets.
+- **Next** marks the seat the automatic switch would go to.
 - An account in several organizations, like a personal plan and a team, is one
   card with a row per organization. Its own personal organization shows as
   **Individual**. Click the account's name to fold its organizations away.
@@ -232,8 +236,8 @@ is never taller than the screen, and it opens on the seat in use.
   Name**, to go back), **Color**, **Move Up**, **Move Down**, **Sign in
   again…** and **Remove…**.
 - The title's `···` menu has **Add Account…**, **Menu Bar Shows**, **Gauge
-  Tracks** (5-hour or weekly limit), **Auto-Switch When Out**, **Open at Login**
-  and **Quit Claude Accounts**.
+  Tracks** (5-hour or weekly limit), **Auto-Switch When Out**, **Switch Order**,
+  **Open at Login** and **Quit Claude Accounts**.
 
 ## Command line
 
@@ -241,7 +245,7 @@ The binary is at `Claude Accounts.app/Contents/MacOS/ClaudeAccounts`.
 
 | Command | What it does |
 |---|---|
-| `--status` | Prints Claude's state, whether automatic switching is on, each row's state by its label, and the automatic decision. It reads the same facts as the menu and changes nothing |
+| `--status` | Prints Claude's state, whether Accessibility is granted, whether automatic switching is on, each row's state by its label, and the automatic decision. It reads the same facts as the menu and changes nothing |
 | `--test-resume <title or id>` | Sends "resume" to that one open chat by the steps a switch takes after it reopens Claude, once, and prints each step. Use a chat you don't mind getting it |
 
 `--test-resume` needs Accessibility. To use the app's own access rather than
