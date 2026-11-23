@@ -994,13 +994,13 @@ enum FirstRun {
 
 enum AppState {
     /// The one notice: the most important of every line that applies (model, section 11).
-    /// `failure` and `success` are the last switch's outcome; `finishing` is a journal whose
-    /// target waits for Claude to be opened again.
+    /// `failure` and `success` are the last switch's outcome; `finishing` is the line of a journal
+    /// that waits for Claude to open or to close.
     static func notice(_ f: Facts, now: Date, failure: String? = nil, success: String? = nil, finishing: String? = nil) -> Notice? {
         var all: [Notice] = []
         let name = { (s: Identity?) in f.rows.first { $0.seat == s && s != nil }.map { $0.label.isEmpty ? $0.name : $0.label } }
         if let s = f.switching {
-            all.append(finishing.map { Notice(kind: .switching, text: "Open Claude to finish switching to \($0).") }
+            all.append(finishing.map { Notice(kind: .switching, text: $0) }
                        ?? Notice(kind: .switching, text: s.note ?? "Switching to \(name(s.target) ?? "a seat")… \(s.step)"))
         }
         if let failure { all.append(Notice(kind: .failure, text: failure)) }

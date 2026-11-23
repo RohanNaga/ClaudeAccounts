@@ -640,7 +640,7 @@ struct SwitchOutcome: Equatable {
     var ok: Bool
     var text: String
     var detail: String? = nil
-    /// Claude was closed when the confirm wait ran out; the journal stays until it opens again.
+    /// The journal stays and waits on Claude: to open, to confirm the switch, or to close, to undo it.
     var parked = false
     /// The chats the switch set out to resume, and the ones it got running.
     var toResume = 0
@@ -703,6 +703,17 @@ struct SwitchJournal: Codable, Equatable {
     var launchedAt: Date? = nil
     /// Claude was closed when the confirm wait ran out: confirm whenever it next opens.
     var parked = false
+    /// An undo couldn't quit Claude: undo whenever Claude is next closed, the mirror of `parked`.
+    var undoWhenClosed = false
+
+    /// Recovery waits while Claude is not yet in the state this journal needs.
+    func waiting(running: Bool) -> Bool { parked ? !running : undoWhenClosed && running }
+
+    /// What the person does to let a waiting journal end, or nil when it needs nothing from them.
+    func waitLine(_ target: String) -> String? {
+        parked ? "Open Claude to finish switching to \(target)."
+            : undoWhenClosed ? "Quit Claude to undo the switch to \(target)." : nil
+    }
 
     static var url: URL { Paths.stateDir.appendingPathComponent("switch-journal.json") }
     static func load() -> SwitchJournal? {
@@ -764,7 +775,7 @@ enum Switch {
         guard lock() else { return SwitchOutcome(ok: false, text: "Another switch is running.") }
         if let open = SwitchJournal.load() {
             unlock()
-            return SwitchOutcome(ok: false, text: "Finishing the switch to \(r.name(open.to)) first.")
+            return SwitchOutcome(ok: false, text: open.waitLine(r.name(open.to)) ?? "Finishing the switch to \(r.name(open.to)) first.")
         }
         let running = !ClaudeApp.pids().isEmpty
         let events = ClaudeApp.events()
@@ -807,18 +818,18 @@ enum Switch {
 
     /// Finish or undo a switch the app was stopped in, from its journal (section 6, Recovery).
     /// Nil when there is none, or another process holds the lock. A parked journal waits for
-    /// Claude to be opened again and is left as it is while Claude is closed.
+    /// Claude to be opened again, and an undo that couldn't quit Claude waits for it to close.
     static func recover(names: [Identity: String], progress: @escaping Progress,
                         switched: @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome? {
         guard var j = SwitchJournal.load() else { return nil }
         let r = Request(kind: j.kind, to: j.to, names: names)
         guard lock() else { return nil }
-        if j.parked, ClaudeApp.pids().isEmpty {
+        if j.waiting(running: !ClaudeApp.pids().isEmpty), let line = j.waitLine(r.name(j.to)) {
             unlock()
-            return SwitchOutcome(ok: false, text: "Open Claude to finish switching to \(r.name(j.to)).", parked: true)
+            return SwitchOutcome(ok: false, text: line, parked: true)
         }
         let outcome: SwitchOutcome
-        if j.step < .load {
+        if j.step < .load || j.undoWhenClosed {
             let back = await rollback(&j, r, progress: progress)
             outcome = back.ok ? SwitchOutcome(ok: false, text: "Switch to \(r.name(j.to)) undone.") : back
         } else {
@@ -1018,13 +1029,16 @@ enum Switch {
     }
 
     /// Undo: quit Claude, move the chats back, put back the files backed up after the quit, and
-    /// reopen Claude. `ok` says the undo finished; a Claude that won't quit keeps the journal.
+    /// reopen Claude. `ok` says the undo finished. A Claude that won't quit keeps the journal,
+    /// marked to undo once Claude is closed, so nothing asks it to quit again meanwhile.
     private static func rollback(_ j: inout SwitchJournal, _ r: Request, progress: @escaping Progress) async -> SwitchOutcome {
         await World.claude.willStep("rollback")
         progress("Going back to \(r.name(j.from))…")
         if !ClaudeApp.pids().isEmpty {
             guard await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress).outcome == .quit else {
-                return SwitchOutcome(ok: false, text: "Quit Claude to undo the switch to \(r.name(j.to)).")
+                j.undoWhenClosed = true
+                try? j.save()
+                return SwitchOutcome(ok: false, text: j.waitLine(r.name(j.to)) ?? "", parked: true)
             }
         }
         let fm = FileManager.default
@@ -1358,7 +1372,9 @@ final class Store: ObservableObject {
         f.meters = meters
         f.stops = stops
         f.failedTargets = failedTargets
-        f.switching = switchingTo ?? SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "Open Claude to finish." : "Finishing…") }
+        f.switching = switchingTo ?? SwitchJournal.load().map {
+            SwitchFacts(target: $0.to, step: $0.parked ? "Open Claude to finish." : $0.undoWhenClosed ? "Quit Claude to undo." : "Finishing…")
+        }
         f.trusted = trusted
         f.autoChosen = settings.autoSwitch
         f.order = settings.switchOrder
@@ -1381,12 +1397,12 @@ final class Store: ObservableObject {
         let snap = Diagnostics.snapshot(f, seats: seats, decision: AutoSwitch.decide(f, now: now), now: now)
         for (kind, fields) in Diagnostics.changes(from: logged, to: snap) { Diagnostics.record(kind, fields) }
         logged = snap
-        let parked = SwitchJournal.load().flatMap { $0.parked && switchTask == nil ? names[$0.to] ?? "a seat" : nil }
+        let waitLine = switchTask == nil ? SwitchJournal.load().flatMap { $0.waitLine(names[$0.to] ?? "a seat") } : nil
         // A switch that met a missing shape failed because of it: while that miss stands, the
         // paused line says why, and the failure line shows once it clears.
         let metMiss = ShapeMisses.lastMet.map { $0 >= startedAt ?? .distantFuture } ?? false
         notice = AppState.notice(f, now: now, failure: metMiss && !f.claude.missing.isEmpty ? nil : failure,
-                                 success: success?.text, finishing: parked)
+                                 success: success?.text, finishing: waitLine)
     }
 
     var firstRun: Bool { accounts.isEmpty }
@@ -1419,8 +1435,9 @@ final class Store: ObservableObject {
         // A missing cookie schema is looked at again each tick, so the format seen whole clears it.
         if ShapeMisses.load()[.cookieSchema] != nil, switchTask == nil { try? await LoginSlot.checkCookieSchema(ClaudeApp.cookies) }
         // A journal no switch is running is finished (section 6, Recovery): the one the app was
-        // stopped in, one a confirm couldn't clear, and a parked one once Claude opens again.
-        if let journal = SwitchJournal.load(), !journal.parked || running { recover() }
+        // stopped in, one a confirm couldn't clear, a parked one once Claude opens again, and an
+        // undo that couldn't quit Claude once Claude is closed.
+        if let journal = SwitchJournal.load(), !journal.waiting(running: running) { recover() }
         await saveSettledHold()
         await readDueMeters()
         publish()
@@ -1593,7 +1610,7 @@ final class Store: ObservableObject {
         waitPosted = true
         let when = resumesAt.map { " at \(ClockText.time($0))" } ?? ""
         let name = seat.flatMap { names[$0] } ?? "a seat"
-        World.claude.notify(title: "Every seat is out", body: "Every seat is out. Chats resume when \(name) resets\(when).")
+        World.claude.notify(title: "Every seat is out", body: "Chats resume when \(name) resets\(when).")
     }
 
     /// Type "resume" into the chats a wait stopped, now that the seat in use has room again.
@@ -1796,7 +1813,7 @@ final class Store: ObservableObject {
         }
     }
 
-    /// Finish or undo a switch the app was stopped in, or one parked until Claude opened again.
+    /// Finish or undo a switch the app was stopped in, or one that waited for Claude to open or close.
     private func recover() {
         guard switchTask == nil, let journal = SwitchJournal.load() else { return }
         let names = self.names
@@ -1884,7 +1901,7 @@ final class Store: ObservableObject {
     private func autoFinished(_ outcome: SwitchOutcome, from: Identity?, to: Identity) {
         let name = { (s: Identity?) in s.flatMap { self.names[$0] } ?? "The seat in use" }
         if outcome.ok {
-            World.claude.notify(title: "Switched to \(name(to))", body: "Switched to \(name(to)): \(name(from)) is out. \(outcome.resumed) chat\(outcome.resumed == 1 ? "" : "s") resumed.")
+            World.claude.notify(title: "Switched to \(name(to))", body: "\(name(from)) is out. \(outcome.resumed) chat\(outcome.resumed == 1 ? "" : "s") resumed.")
             return
         }
         guard !outcome.parked else { return }
@@ -2261,7 +2278,7 @@ enum StatusReport {
         f.meters = meters
         f.stops = stops.merging(Store.newStops(log.events, stops: stops, meters: meters)) { _, b in b }
         f.failedTargets = PairFile<Date>(name: "failed-targets.json").load()
-        f.switching = SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "parked until Claude opens" : "in progress") }
+        f.switching = SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "parked until Claude opens" : $0.undoWhenClosed ? "undo waits for Claude to quit" : "in progress") }
         f.trusted = World.claude.trusted
         let settings = AppSettings.load()
         f.autoChosen = settings.autoSwitch
