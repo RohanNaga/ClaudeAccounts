@@ -46,6 +46,12 @@ final class VirtualClock: AppClock, @unchecked Sendable {
             lock.withLock { sleeperSeqs.insert(seq) }
         }
     }
+    /// The time of the earliest event still to run, so a run can jump straight to it.
+    var nextDue: Date? {
+        lock.withLock { due.filter { !abandoned.contains($0.seq) }.map(\.at).min() }
+    }
+    /// A count that changes whenever an event is scheduled or run, to tell when the app is still busy.
+    var activity: Int { lock.withLock { seq * 1_000_003 + due.count } }
     private var sleepers = 0
     private var abandoned = Set<Int>(), sleeperSeqs = Set<Int>()
     /// The app crashed: every task asleep now never wakes. Events the stand-in scheduled still run.
@@ -159,6 +165,10 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
         p.arguments = [cookies.path, sql]
         try? p.run(); p.waitUntilExit()
+        // The app judges "sat still" from the file's real modification time. Virtual time runs far
+        // ahead of real time, so the write is dated a minute back: by the time the app looks, the
+        // stand-in Claude has held the sign-in well past the 2 s the app waits for.
+        try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-60)], ofItemAtPath: cookies.path)
         var cfg: [String: Any] = [:]
         if let seat { cfg[ClaudeFiles.lastKnownAccount] = seat.account; cfg["oauth:tokenCache"] = "placeholder" }
         try? JSONSerialization.data(withJSONObject: cfg).write(to: config)
