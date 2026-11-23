@@ -1,8 +1,35 @@
 import Foundation
 import Darwin
 
-/// Live child processes of this test (the app runs sqlite3 as one).
-func childProcesses() -> Int32 { proc_listchildpids(getpid(), nil, 0) }
+/// Live child processes of this test (the app runs sqlite3 as one). Called with no buffer,
+/// proc_listchildpids returns a size estimate, not a count, so it is given one to fill.
+func childProcesses() -> Int32 {
+    var pids = [pid_t](repeating: 0, count: 64)
+    let n = proc_listchildpids(getpid(), &pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+    return max(0, n)
+}
+
+/// Threads of this test, other than the caller, that are running or blocked in the kernel: the
+/// app's tasks off the main actor doing file work. Idle pool threads wait and are not counted.
+func busyThreads() -> Int {
+    var list: thread_act_array_t?
+    var count: mach_msg_type_number_t = 0
+    guard task_threads(mach_task_self_, &list, &count) == KERN_SUCCESS, let list else { return 0 }
+    defer {
+        for i in 0..<Int(count) { mach_port_deallocate(mach_task_self_, list[i]) }
+        vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: list)), vm_size_t(Int(count) * MemoryLayout<thread_t>.size))
+    }
+    let me = mach_thread_self()
+    defer { mach_port_deallocate(mach_task_self_, me) }
+    var busy = 0
+    for i in 0..<Int(count) where list[i] != me {
+        var info = thread_basic_info()
+        var n = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
+        let r = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(n)) { thread_info(list[i], thread_flavor_t(THREAD_BASIC_INFO), $0, &n) } }
+        if r == KERN_SUCCESS, info.run_state == TH_STATE_RUNNING || info.run_state == TH_STATE_UNINTERRUPTIBLE { busy += 1 }
+    }
+    return busy
+}
 
 // End-to-end scenarios written from the model (claude-accounts-model, sections 6 to 9). Each is
 // named by its (state, event) pair and asserts the outcome and the line the person sees. A pair
@@ -50,25 +77,42 @@ struct Scenario {
         clock.advance(ClaudeTiming.settle + 5)
     }
 
-
-    /// Lets the app's tasks run until each is asleep on the clock or done, waiting out any real
-    /// process the app started (sqlite3) by polling for its exit.
+    /// Lets the app's tasks run until each is asleep on the clock or done: no real child process, no other thread at work,
+    /// (the app runs sqlite3) and no change to the clock's schedule and no switch awake, over three rounds of yields.
+    /// The app's tasks off the main actor run on other threads, so a short real pause lets them in.
     func settle() async {
-        for _ in 0..<200 {
+        var quiet = 0, last = clock.activity
+        for _ in 0..<2000 {
             for _ in 0..<20 { await Task.yield() }
-            if childProcesses() == 0 { for _ in 0..<20 { await Task.yield() }; if childProcesses() == 0 { return } }
-            usleep(1000)
+            let now = clock.activity
+            // A switch that is not asleep on the clock is mid-step (copying, moving, sqlite3).
+            let working = switchInFlight && clock.asleep == 0
+            if !working && childProcesses() == 0 && busyThreads() == 0 && now == last { quiet += 1; if quiet >= 3 { return } } else { quiet = 0 }
+            last = now
+            usleep(200)
         }
+        if Harness.trace { print("trace: settle gave up, children \(childProcesses()), busy \(busyThreads()), activity \(clock.activity) vs \(last), asleep \(clock.asleep)") }
     }
 
-    /// Moves time a second at a time, with one app tick every 15 s as the app's own timer does,
-    /// until `done` holds or `limit` seconds of virtual time pass. Nothing waits on the real clock.
+    /// HARNESS_TRACE=1 prints each jump of the clock and any settle that gave up.
+    static let trace = ProcessInfo.processInfo.environment["HARNESS_TRACE"] != nil
+
+    /// Runs virtual time until `done` holds or `limit` seconds pass. The clock jumps straight to the
+    /// next thing due, an event the app or the stand-in scheduled or the app's own tick, runs only
+    /// that, and lets the app settle before the next jump. Nothing waits on the real clock.
     func run(until done: () -> Bool, limit: TimeInterval = 1800) async {
-        var t: TimeInterval = 0
+        let start = clock.now(), end = start.addingTimeInterval(limit)
+        var nextTick = start
         await settle()
-        while !done() && t < limit {
-            if Int(t) % 15 == 0 { await tick(); await settle() }
-            clock.advance(1); t += 1
+        while !done() && clock.now() < end {
+            if clock.now() >= nextTick {
+                await tick(); await settle()
+                nextTick = nextTick.addingTimeInterval(tickEvery)
+                continue
+            }
+            if Harness.trace { print("trace: at +\(clock.now().timeIntervalSince(start)) s, next due \(clock.nextDue.map { $0.timeIntervalSince(clock.now()) } ?? -1) s, asleep \(clock.asleep), notice \(notice)") }
+            let to = min(clock.nextDue ?? end, nextTick, end)
+            clock.advance(max(0, to.timeIntervalSince(clock.now())))
             await settle()
         }
     }
