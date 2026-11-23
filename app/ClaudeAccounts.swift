@@ -1379,7 +1379,11 @@ final class Store: ObservableObject {
         for (kind, fields) in Diagnostics.changes(from: logged, to: snap) { Diagnostics.record(kind, fields) }
         logged = snap
         let parked = SwitchJournal.load().flatMap { $0.parked && switchTask == nil ? names[$0.to] ?? "a seat" : nil }
-        notice = AppState.notice(f, now: now, failure: failure, success: success?.text, finishing: parked)
+        // A switch that met a missing shape failed because of it: while that miss stands, the
+        // paused line says why, and the failure line shows once it clears.
+        let metMiss = ShapeMisses.lastMet.map { $0 >= startedAt ?? .distantFuture } ?? false
+        notice = AppState.notice(f, now: now, failure: metMiss && !f.claude.missing.isEmpty ? nil : failure,
+                                 success: success?.text, finishing: parked)
     }
 
     var firstRun: Bool { accounts.isEmpty }
@@ -1861,8 +1865,7 @@ final class Store: ObservableObject {
             failure = nil
         } else if outcome.ok {
             if !outcome.text.isEmpty { success = (outcome.text, World.now() + Self.successFor) }
-        } else if !outcome.text.isEmpty, !(ShapeMisses.lastMet.map { $0 >= startedAt ?? .distantFuture } ?? false) {
-            // A switch that met a missing shape failed because of it: the paused line says why.
+        } else if !outcome.text.isEmpty {
             failure = outcome.detail.map { "\(outcome.text) \($0)" } ?? outcome.text
         }
         publish()
