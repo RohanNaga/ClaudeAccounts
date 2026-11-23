@@ -665,6 +665,27 @@ struct ResumeEnd: Equatable {
     var superseded = false
 }
 
+/// One resume in progress, kept on disk from its start until it ends, so the chats an app that
+/// was stopped mid-resume was getting running go through the resume step again at its next launch.
+struct ResumeOnDisk: Codable {
+    var folder: String
+    var reopenedAt: Date
+    var chats: [String]
+    var id = UUID().uuidString
+
+    static var dir: URL { Paths.stateDir.appendingPathComponent("resuming") }
+    static func all() -> [ResumeOnDisk] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return files.compactMap { (try? Data(contentsOf: $0)).flatMap { try? JSONDecoder().decode(Self.self, from: $0) } }
+    }
+    private var url: URL { Self.dir.appendingPathComponent(id + ".json") }
+    func save() {
+        try? FileManager.default.createDirectory(at: Self.dir, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(self).write(to: url, options: .atomic)
+    }
+    func clear() { try? FileManager.default.removeItem(at: url) }
+}
+
 /// One switch at a time across the whole Mac.
 struct SwitchLock {
     let fd: Int32
@@ -773,6 +794,7 @@ enum Switch {
         guard World.isTest else { return }
         held?.release()
         held = nil
+        carried = []
     }
 
     private static func lock() -> Bool {
@@ -878,11 +900,14 @@ enum Switch {
     /// can't work, a Claude shape missing (8 B) or no Accessibility (7), nothing is opened, typed or
     /// pressed in Claude, and every chat is named instead (12). Otherwise each chat the resume gives
     /// up on is named. A switch that starts during it, a new `generation`, takes over the chats not
-    /// yet settled and resumes them after its own confirm.
+    /// yet settled and resumes them after its own confirm. Its chats stay on disk until it ends.
     static func resume(_ chats: [MovedChat], in folder: URL, reopenedAt: Date, progress: @escaping Progress,
                        generation: String = SwitchLock.generation()) async -> ResumeEnd {
         guard !chats.isEmpty else { return ResumeEnd() }
         guard ShapeMisses.load().isEmpty, World.claude.trusted else { return ResumeEnd(notResumed: chats.map(\.title)) }
+        let onDisk = ResumeOnDisk(folder: folder.path, reopenedAt: reopenedAt, chats: chats.map(\.id))
+        onDisk.save()
+        defer { onDisk.clear() }
         var resumer = ChatResume.resumer(in: folder, reopenedAt: reopenedAt.timeIntervalSince1970 * 1000, progress: progress)
         resumer.current = { SwitchLock.generation() == generation }
         let ids = Set(chats.map(\.id))
@@ -1362,6 +1387,21 @@ final class Store: ObservableObject {
     init() {
         SavedLogins.adopt(accounts)
         publish()
+        resumeLeftOver()
+    }
+
+    /// A resume the app was stopped in runs again through the one resume step, from Claude's
+    /// reopening: a chat that ran since is left alone, and one it can't get running is named.
+    private func resumeLeftOver() {
+        for left in ResumeOnDisk.all() {
+            left.clear()
+            let folder = URL(fileURLWithPath: left.folder)
+            let chats = left.chats.compactMap { ChatResume.chat(folder.appendingPathComponent($0 + ".json")) }
+            Task {
+                resumeEnded(await Switch.resume(chats, in: folder, reopenedAt: left.reopenedAt, progress: { _ in }))
+                publish()
+            }
+        }
     }
 
     /// Start the app's own ticking. Tests never call this: they call `tick()` themselves.
