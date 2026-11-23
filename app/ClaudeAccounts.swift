@@ -407,12 +407,18 @@ enum ClaudeApp {
         sessions.appendingPathComponent(id.account).appendingPathComponent(id.org)
     }
 
-    /// Records of the sessions shown in the sidebar: not archived, not a scheduled-task run.
-    static func openSessionRecords(in orgFolder: URL) -> [URL] {
-        let files = (try? FileManager.default.contentsOfDirectory(at: orgFolder, includingPropertiesForKeys: nil)) ?? []
-        return files.filter { url in
-            guard url.lastPathComponent.hasPrefix("local_"), url.pathExtension == "json",
-                  let obj = record(url) else { return false }
+    /// Records of the sessions shown in the sidebar: not archived, not a scheduled-task run. A
+    /// folder that doesn't exist holds none. A folder or record that can't be read throws, so a
+    /// switch never leaves behind a chat it could not see (model, section 8 B). A record that
+    /// reads but isn't a session is not one Claude shows either.
+    static func openSessionRecords(in orgFolder: URL) throws -> [URL] {
+        let files: [URL]
+        do { files = try FileManager.default.contentsOfDirectory(at: orgFolder, includingPropertiesForKeys: nil) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
+        return try files.filter { url in
+            guard url.lastPathComponent.hasPrefix("local_"), url.pathExtension == "json" else { return false }
+            let data = try Data(contentsOf: url)
+            guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
             return (obj[ClaudeFiles.isArchived] as? Bool) != true && obj[ClaudeFiles.scheduledTaskId] == nil
         }
     }
@@ -827,7 +833,7 @@ enum Switch {
         let generation = SwitchLock.generation()
         let folder = ClaudeApp.folder(j.to)
         let chats = outcome.ok && !outcome.parked
-            ? ResumeRule.toResume(ClaudeApp.openSessionRecords(in: folder).compactMap(ChatResume.chat),
+            ? ResumeRule.toResume(((try? ClaudeApp.openSessionRecords(in: folder)) ?? []).compactMap(ChatResume.chat),
                                   stoppedByLimit: Set(j.resume), cutByQuit: [])
             : []
         outcome.toResume = chats.count
@@ -1067,7 +1073,7 @@ enum Switch {
             j.moves.append(.init(from: a.path, to: b.path))
             try j.save()
         }
-        for record in ClaudeApp.openSessionRecords(in: ClaudeApp.folder(from)) {
+        for record in try ClaudeApp.openSessionRecords(in: ClaudeApp.folder(from)) {
             let dest = dst.appendingPathComponent(record.lastPathComponent)
             if fm.fileExists(atPath: dest.path) {
                 try fm.createDirectory(at: quarantine, withIntermediateDirectories: true)
@@ -2333,7 +2339,7 @@ enum TestResume {
         guard !ClaudeApp.pids().isEmpty else { say("Claude isn't open."); exit(1) }
         guard let identity = ClaudeApp.events().hold?.seat else { say("Claude's log doesn't name the account it has open."); exit(1) }
         let folder = ClaudeApp.folder(identity)
-        let matches = ClaudeApp.openSessionRecords(in: folder).compactMap(ChatResume.chat)
+        let matches = ((try? ClaudeApp.openSessionRecords(in: folder)) ?? []).compactMap(ChatResume.chat)
             .filter { $0.id == key || $0.title.lowercased() == key.lowercased() }
         guard matches.count == 1, let chat = matches.first else {
             say(matches.isEmpty ? "No open chat of the account Claude has open has that title or session id."
