@@ -31,6 +31,7 @@ final class VirtualClock: AppClock, @unchecked Sendable {
                 return e
             }
             guard let e = next else { break }
+            if lock.withLock({ abandoned.contains(e.seq) }) { continue }
             e.run()
         }
         lock.withLock { t = max(t, end) }
@@ -42,9 +43,13 @@ final class VirtualClock: AppClock, @unchecked Sendable {
         lock.withLock { sleepers += 1 }
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             after(seconds) { [weak self] in self?.lock.withLock { self?.sleepers -= 1 }; c.resume() }
+            lock.withLock { sleeperSeqs.insert(seq) }
         }
     }
     private var sleepers = 0
+    private var abandoned = Set<Int>(), sleeperSeqs = Set<Int>()
+    /// The app crashed: every task asleep now never wakes. Events the stand-in scheduled still run.
+    func abandonSleepers() { lock.withLock { abandoned.formUnion(sleeperSeqs); sleepers = 0 } }
     /// How many of the app's tasks are asleep on this clock.
     var asleep: Int { lock.withLock { sleepers } }
 }
@@ -101,6 +106,11 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var refuseAfter: TimeInterval = 12
     /// Set Up: who the person signs in as once Claude asks (nil: nobody signs in).
     var signsInAs: StandSeat?
+    /// The version Claude logs at start (the contracts were recorded on 1.0.0).
+    var version = "1.0.0"
+    /// Times the person opens Claude again after a switch quit it, once the sign-in files change.
+    var reopensAfterQuit = 0
+    private var quitStamp: Date?
     /// Opens a window of its own right after launch, which a scenario uses for "the person opened Claude".
     var personOpensClaudeDuringSwitch = 0
     /// Chats on screen, by session id, and what their composer shows.
@@ -209,7 +219,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// Claude starts as it would from its own sign-in files, and names (or refuses) the seat.
     func start() {
         let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; return nextPid }
-        log("\(ClaudeLog.appStart) version: 1.0.0 }")
+        log("\(ClaudeLog.appStart) version: \(version) }")
         guard let seat = signInOnDisk() else {
             if let who = signsInAs { clock.after(60) { [weak self] in self?.signIn(who, pid: p) } }
             return
@@ -239,9 +249,20 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     }
 
     /// Claude stops: a crash, or the person quitting it.
-    func stop() { lock.withLock { pid = nil; held = nil; promptOpen = false } }
+    func stop() {
+        let m = (try? FileManager.default.attributesOfItem(atPath: cookies.path))?[.modificationDate] as? Date
+        lock.withLock { pid = nil; held = nil; promptOpen = false; quitStamp = m ?? Date.distantPast }
+    }
 
-    func pids() -> [pid_t] { installed ? lock.withLock { pid.map { [$0] } ?? [] } : [] }
+    func pids() -> [pid_t] {
+        guard installed else { return [] }
+        if lock.withLock({ pid == nil && reopensAfterQuit > 0 && quitStamp != nil }),
+           let m = (try? FileManager.default.attributesOfItem(atPath: cookies.path))?[.modificationDate] as? Date, m != quitStamp {
+            lock.withLock { reopensAfterQuit -= 1; quitStamp = nil; actions.append("person opened") }
+            start()
+        }
+        return lock.withLock { pid.map { [$0] } ?? [] }
+    }
     func windowIDs(_ owners: [pid_t]) -> Set<Int> {
         lock.withLock { pid == nil ? [] : (promptOpen ? [1, 2] : [1]) }
     }
@@ -286,22 +307,23 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     func idleSeconds() -> TimeInterval { 600 }
 }
 
-/// Meters the scenario sets per account, read through the app's own usage seam.
+/// Meters the scenario sets per seat pair (13a.1), read through the app's own usage seam.
 final class StandInUsage: UsageReader, @unchecked Sendable {
     private let lock = NSLock()
     private var meters: [String: AccountState] = [:]
     private(set) var reads: [String] = []
-    func set(_ account: String, fiveHour: Double, weekly: Double = 10, resetsAt: Date?) {
+    func set(_ seat: StandSeat, fiveHour: Double, weekly: Double = 10, resetsAt: Date?) {
         lock.withLock {
-            meters[account] = .ok(plan: "max", fiveHour: UsageWindow(utilization: fiveHour, resetsAt: resetsAt),
+            meters[seat.tag] = .ok(plan: "max", fiveHour: UsageWindow(utilization: fiveHour, resetsAt: resetsAt),
                                   weekly: UsageWindow(utilization: weekly, resetsAt: resetsAt?.addingTimeInterval(86_400 * 3)), loginExpiresAt: nil)
         }
     }
-    func fail(_ account: String) { lock.withLock { meters[account] = .error("can't read") } }
+    func fail(_ seat: StandSeat) { lock.withLock { meters[seat.tag] = .error("can't read") } }
     func state(for acct: AccountRecord) async -> AccountState {
         lock.withLock {
-            reads.append(acct.accountUuid ?? "?")
-            return meters[acct.accountUuid ?? ""] ?? .error("not read yet")
+            let tag = "\(acct.accountUuid ?? "?")/\(acct.orgUuid ?? "?")"
+            reads.append(tag)
+            return meters[tag] ?? .error("not read yet")
         }
     }
 }

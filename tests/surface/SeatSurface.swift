@@ -35,6 +35,16 @@ enum ShownAction: Equatable { case switchTo, setUp }
     /// The notice's short line and its full sentence.
     var notice: [String] { [store.notice?.text, store.notice?.detail].compactMap { $0 } }
     var rowNames: [String] { store.seats.map(\.name) }
+    private func seat(_ row: String) -> Seat? { store.seats.first { $0.name == row } }
+    /// The meter's age as the row says it: "not read yet", "read N min ago", or nil while fresh.
+    func meterText(_ row: String) -> String? { seat(row)?.meters.readText(at: clock.now()) }
+    func rename(_ row: String, to name: String) { if let s = seat(row) { store.rename(s, to: name, organization: false) } else { check(false, "no row named \(row)") } }
+    func move(_ row: String, by step: Int) { if let s = seat(row) { store.move(s, by: step, organization: false) } else { check(false, "no row named \(row)") } }
+    func remove(_ row: String) { if let s = seat(row) { store.remove(s) } else { check(false, "no row named \(row)") } }
+    var firstRun: Bool { store.firstRun }
+    func hasSavedLogin(_ seat: StandSeat) -> Bool { SavedLogins.savedAt(seat.identity) != nil }
+    /// The app is quit or crashes: its parked tasks never wake, and a new app starts on the same files.
+    func crashApp() { clock.abandonSleepers(); Switch.abandonForTest(); store = Store() }
     func click(_ row: String) {
         guard let s = store.seats.first(where: { $0.name == row }) else { check(false, "no row named \(row)"); return }
         if s.action == .setUp { store.setUp(s) } else { store.switchTo(s) }
