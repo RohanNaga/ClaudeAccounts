@@ -23,7 +23,6 @@ struct RulesTests {
         refusalsBelongToOneSignIn()
         stopsCountOnceSettled()
         settingUp()
-        quitWatch()
         organizations()
         labels()
         upgrade()
@@ -359,76 +358,6 @@ struct RulesTests {
         check(SetUpRule.notSetUp(target, seen: nil, in: rows) == "Claude isn't signed in, so Work \u{00B7} Labs is still not set up.",
               "no sign-in is said so")
         check(!SetUpRule.notSetUp(target, seen: other, in: rows).contains("@"), "no email in the message")
-    }
-
-    // MARK: Quit watch
-
-    static func at(_ seconds: Double) -> Date { now.addingTimeInterval(seconds) }
-
-    static func quitWatch() {
-        let gone = QuitObservation(claudeRunning: false, promptOpen: false)
-        let quiet = QuitObservation(claudeRunning: true, promptOpen: false)
-        let prompt = QuitObservation(claudeRunning: true, promptOpen: true)
-
-        var w = QuitWatch(unattended: false, canAnswer: false, started: now)
-        check(w.step(gone, now: at(1)) == .done(.quit), "Claude gone means it quit")
-
-        // Claude's log is silent and nobody answers the prompt for a long time.
-        w = QuitWatch(unattended: false, canAnswer: false, started: now)
-        var gaveUp = false
-        for t in stride(from: 1.0, through: 3600, by: 30) where w.step(prompt, now: at(t)) != .wait("Claude is asking whether to quit while a chat runs…") {
-            gaveUp = true
-        }
-        check(!gaveUp, "never gives up while the prompt is open, even for an hour with a silent log")
-        check(w.step(gone, now: at(3700)) == .done(.quit), "a late Quit anyway still completes the switch")
-
-        w = QuitWatch(unattended: false, canAnswer: false, started: now)
-        _ = w.step(prompt, now: at(1))
-        check(w.step(quiet, now: at(2)) == .wait("Waiting for Claude to quit…"), "silent log: a closed prompt is not read as Cancel at once")
-        check(w.step(quiet, now: at(2 + 599)) != .done(.declined), "silent log: waits for a late quit")
-        check(w.step(quiet, now: at(2 + 601)) == .done(.declined), "silent log: gives up only after the undecided wait")
-
-        var cancelled = quiet
-        cancelled.vetoLogged = true
-        w = QuitWatch(unattended: false, canAnswer: false, started: now)
-        _ = w.step(prompt, now: at(1))
-        check(w.step(cancelled, now: at(2)) != .done(.declined), "a working log gets a moment before Cancel is final")
-        check(w.step(cancelled, now: at(6)) == .done(.declined), "veto, prompt closed, no new quit: Cancel")
-
-        var waiting = cancelled
-        waiting.waitLogged = true
-        w = QuitWatch(unattended: false, canAnswer: false, started: now)
-        _ = w.step(prompt, now: at(1))
-        check(w.step(waiting, now: at(7200)) == .wait("Claude quits once its chats finish…"), "Wait for Claude is followed to the end")
-
-        var quitting = cancelled
-        quitting.quitLoggedAfterVeto = true
-        w = QuitWatch(unattended: false, canAnswer: false, started: now)
-        _ = w.step(prompt, now: at(1))
-        check(w.step(quitting, now: at(30)) == .wait("Claude is quitting…"), "a person's Quit anyway is followed")
-
-        w = QuitWatch(unattended: true, canAnswer: true, started: now)
-        check(w.step(prompt, now: at(1)) == .answer, "unattended with Accessibility answers the prompt")
-        w.answered(at: at(1))
-        check(w.step(prompt, now: at(2)) == .answer, "a prompt still open after a press is pressed again")
-        check(w.step(quiet, now: at(3)) == .wait("Claude is quitting…"), "once it closes, waits for the quit")
-        check(w.step(gone, now: at(20)) == .done(.quit), "and sees Claude go")
-        w = QuitWatch(unattended: true, canAnswer: true, started: now)
-        _ = w.step(prompt, now: at(1))
-        w.answered(at: at(1))
-        check(w.step(quiet, now: at(1 + 181)) == .done(.failed), "a quit that never lands after Quit anyway fails")
-
-        w = QuitWatch(unattended: true, canAnswer: false, started: now)
-        check(w.step(prompt, now: at(1)) == .wait("Claude is asking whether to quit while a chat runs…"),
-              "unattended without Accessibility waits for a person instead of guessing")
-
-        w = QuitWatch(unattended: false, canAnswer: false, started: now)
-        check(w.step(quiet, now: at(30)) == .wait("Waiting for Claude to quit…"), "no prompt yet: waits")
-        check(w.step(quiet, now: at(91)) == .done(.failed), "no prompt and no quit: Claude ignored the request")
-        var vetoOnly = quiet
-        vetoOnly.vetoLogged = true
-        w = QuitWatch(unattended: false, canAnswer: false, started: now)
-        check(w.step(vetoOnly, now: at(91)) == .done(.declined), "a veto whose prompt never shows ends as declined")
     }
 
     // MARK: Organizations

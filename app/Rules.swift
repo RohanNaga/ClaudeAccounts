@@ -665,29 +665,26 @@ struct LogFollower {
 
 // MARK: - Following a quit request
 
-/// What the switch sees each time it looks while Claude decides whether to quit.
+/// What the switch sees each time it looks while Claude decides whether to quit: the process and
+/// its windows only. Claude's log is not read here; it was once silent through a whole prompt.
 struct QuitObservation: Equatable {
     var claudeRunning: Bool
     /// One of Claude's alerts or sheets is on screen, found through Accessibility or as a new window.
     var promptOpen: Bool
-    /// Claude logged that its quit prompt stopped the quit.
-    var vetoLogged = false
-    /// Claude logged that it will quit once its chats finish (Wait for Claude).
-    var waitLogged = false
-    /// Claude logged a new quit after the prompt (Quit anyway).
-    var quitLoggedAfterVeto = false
 }
 
-/// Follows one quit request to its end. It never gives up while Claude's quit prompt is open or
-/// while Claude may still quit because of this request, so a late answer can never quit Claude
-/// after the switch has walked away. Claude's log can go silent for hours, so the prompt is
-/// also watched on screen and a silent log is never read as a Cancel at once.
+/// Follows one quit request to its end (model, section 6, step 2). A manual switch waits for the
+/// person to answer Claude's prompt. An automatic one presses Quit anyway, and after
+/// `Limits.autoQuitWait` cancels the prompt and stops. A prompt that closed while Claude still runs
+/// is the person's Cancel.
 struct QuitWatch {
     enum Outcome: Equatable { case quit, declined, failed }
     enum Step: Equatable {
         case wait(String)
         /// Press Quit anyway on the open prompt.
         case answer
+        /// Press Cancel on the open prompt: an automatic switch gives up.
+        case cancel
         case done(Outcome)
     }
 
@@ -697,14 +694,11 @@ struct QuitWatch {
     var canAnswer: Bool
     let started: Date
 
-    /// With no prompt and nothing in the log, Claude has ignored the request after this long.
+    /// With no prompt, Claude has ignored the request after this long.
     static let noPromptTimeout: TimeInterval = 90
-    /// After Quit anyway, Claude's own cleanup and watchdog finish within this long.
-    static let quittingTimeout: TimeInterval = 180
-    /// With a working log, a closed prompt and no new quit means Cancel after this long.
-    static let cancelSettle: TimeInterval = 3
-    /// With a silent log, Cancel and Wait for Claude look the same; wait this long for a quit.
-    static let undecidedTimeout: TimeInterval = 10 * 60
+    /// A prompt that closed with Claude still running this long was cancelled. Quit anyway ends
+    /// the process within a few seconds, so this leaves it room.
+    static let cancelSettle: TimeInterval = 10
 
     private(set) var promptSeen = false
     private(set) var promptClosedAt: Date?
@@ -721,6 +715,9 @@ struct QuitWatch {
 
     mutating func step(_ o: QuitObservation, now: Date) -> Step {
         if !o.claudeRunning { return .done(.quit) }
+        if unattended, now.timeIntervalSince(started) >= Limits.autoQuitWait {
+            return o.promptOpen ? .cancel : .done(.failed)
+        }
         if o.promptOpen {
             promptSeen = true
             promptClosedAt = nil
@@ -728,25 +725,13 @@ struct QuitWatch {
             if unattended && canAnswer { return .answer }
             return .wait("Claude is asking whether to quit while a chat runs…")
         }
-        if let answeredAt {
-            return now.timeIntervalSince(answeredAt) > Self.quittingTimeout ? .done(.failed) : .wait("Claude is quitting…")
-        }
+        if answeredAt != nil { return .wait("Claude is quitting…") }
         if promptSeen {
             let closed = promptClosedAt ?? now
             promptClosedAt = closed
-            let since = now.timeIntervalSince(closed)
-            if o.waitLogged { return .wait("Claude quits once its chats finish…") }
-            if o.quitLoggedAfterVeto {
-                return since > Self.quittingTimeout ? .done(.failed) : .wait("Claude is quitting…")
-            }
-            if o.vetoLogged { return since >= Self.cancelSettle ? .done(.declined) : .wait("Claude is quitting…") }
-            return since >= Self.undecidedTimeout ? .done(.declined) : .wait("Waiting for Claude to quit…")
+            return now.timeIntervalSince(closed) >= Self.cancelSettle ? .done(.declined) : .wait("Claude is quitting…")
         }
-        let elapsed = now.timeIntervalSince(started)
-        if o.vetoLogged {
-            return elapsed >= Self.noPromptTimeout ? .done(.declined) : .wait("Claude is asking whether to quit while a chat runs…")
-        }
-        return elapsed >= Self.noPromptTimeout ? .done(.failed) : .wait("Waiting for Claude to quit…")
+        return now.timeIntervalSince(started) >= Self.noPromptTimeout ? .done(.failed) : .wait("Waiting for Claude to quit…")
     }
 }
 
@@ -1061,6 +1046,18 @@ struct ClaudeEvents {
     }
 
     /// The last settled TurnEnded on `seat`: a reading after it at 100 means the seat wrapped up.
+    /// Log lines carry whole seconds: an event stamped S happened within [S, S+1), so a reading
+    /// is after it only from S+1 on.
+    static func readAfter(_ logged: Date, readAt: Date) -> Bool { readAt >= logged.addingTimeInterval(1) }
+
+    /// Chats whose turn ended, settled, on `seat` and not before `since`: the turns a wrap-up ended.
+    func turnsEnded(on seat: Identity, since: Date) -> Set<String> {
+        Set(events.compactMap { e in
+            guard case .turnEnded(let chat) = e.event, e.held == seat, e.settled, !Self.readAfter(e.at, readAt: since) else { return nil }
+            return chat
+        })
+    }
+
     func lastTurnEnd(on seat: Identity) -> Date? {
         events.last { e in if case .turnEnded = e.event { return e.held == seat && e.settled }; return false }?.at
     }
@@ -1123,6 +1120,8 @@ struct ClaudeFacts: Equatable {
 struct SwitchFacts: Equatable {
     var target: Identity
     var step: String
+    /// A line that replaces the step for a moment, such as a second request refused.
+    var note: String? = nil
 }
 
 /// Everything the model reads, read fresh. Nothing in here is inferred.
@@ -1202,7 +1201,7 @@ enum AutoSwitch {
     static func isDone(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
         if let mark = f.stops[seat], mark.until > now { return true }
         guard let ended = f.log.lastTurnEnd(on: seat), let m = f.meters[seat], let readAt = m.readAt,
-              readAt > ended, m.isFresh(at: now), m.showsFull else { return false }
+              ClaudeEvents.readAfter(ended, readAt: readAt), m.isFresh(at: now), m.showsFull else { return false }
         return true
     }
 
@@ -1309,7 +1308,7 @@ enum AppState {
         let name = { (s: Identity?) in f.rows.first { $0.identity == s && s != nil }.map { $0.label.isEmpty ? $0.name : $0.label } }
         if let s = f.switching {
             all.append(finishing.map { Notice(kind: .switching, text: "Open Claude to finish switching to \($0).") }
-                       ?? Notice(kind: .switching, text: "Switching to \(name(s.target) ?? "a seat")… \(s.step)"))
+                       ?? Notice(kind: .switching, text: s.note ?? "Switching to \(name(s.target) ?? "a seat")… \(s.step)"))
         }
         if let failure { all.append(Notice(kind: .failure, text: failure)) }
         if case .wait(let seat, let at) = AutoSwitch.decide(f, now: now), f.waitingChats > 0 {

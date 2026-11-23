@@ -11,7 +11,6 @@ import AppKit
 import CryptoKit
 import ServiceManagement
 import SwiftUI
-import UserNotifications
 
 // MARK: - Paths and constants
 
@@ -324,50 +323,53 @@ enum ClaudeApp {
 
     static func windowIDs(_ owners: [pid_t]) -> Set<Int> { World.claude.windowIDs(owners) }
 
+    /// How one quit request ended, whether Quit anyway was pressed, and whether an open prompt
+    /// had no button the app knows: a shape this Claude doesn't match (model, section 8).
+    struct QuitResult {
+        var outcome: QuitWatch.Outcome
+        var answered = false
+        var promptWithoutButton = false
+    }
+
     /// Quit the way ⌘Q does, then wait until the process is gone, so Claude has flushed its
     /// cookies and settings. With a chat mid-reply Claude first asks, in a native alert: Quit
-    /// anyway, Wait for Claude (it quits once its chats finish) or Cancel. `QuitWatch` decides
-    /// from what is on screen and in Claude's log; it never walks away while the prompt is open.
+    /// anyway, Wait for Claude or Cancel. `QuitWatch` decides from the process and its windows.
     ///
     /// `unattended` answers the prompt with Quit anyway through Accessibility, the answer a person
     /// switching by hand gives; Claude then marks each cut-off chat to resume at its next launch.
-    /// Without Accessibility access an unattended quit waits for a person like any other.
-    static func quit(unattended: Bool = false,
-                     progress: @Sendable (String) -> Void = { _ in }) async -> (outcome: QuitWatch.Outcome, answered: Bool) {
+    static func quit(unattended: Bool = false, progress: @Sendable (String) -> Void = { _ in }) async -> QuitResult {
         let running = pids()
-        guard !running.isEmpty else { return (.quit, false) }
-        let mark = logMark()
+        guard !running.isEmpty else { return QuitResult(outcome: .quit) }
         let windowsBefore = windowIDs(running)
         for pid in running { await World.claude.requestQuit(pid) }
         var watch = QuitWatch(unattended: unattended, canAnswer: World.claude.trusted, started: World.now())
         var firstTry: Date?
         var shown: String?
+        var noButton = false
         while true {
             await World.sleep(0.5)
             let alive = !pids().isEmpty
-            let text = alive ? logText(since: mark) : ""
-            let veto = text.range(of: ClaudeLog.quitVetoed)
-            let afterVeto = veto.map { text[$0.upperBound...] } ?? ""
             let seen = QuitObservation(
                 claudeRunning: alive,
                 // Accessibility finds the prompt by its Quit anyway button; a window Claude opened
                 // after the request also counts, which covers a prompt without that button.
-                promptOpen: alive && (World.claude.quitPromptOpen(in: running) || !windowIDs(running).subtracting(windowsBefore).isEmpty),
-                vetoLogged: veto != nil,
-                waitLogged: afterVeto.contains(ClaudeLog.quitDeferred),
-                quitLoggedAfterVeto: afterVeto.contains(ClaudeLog.quitHandler))
+                promptOpen: alive && (World.claude.quitPromptOpen(in: running) || !windowIDs(running).subtracting(windowsBefore).isEmpty))
             switch watch.step(seen, now: World.now()) {
-            case .done(let outcome): return (outcome, watch.answeredAt != nil)
+            case .done(let outcome):
+                return QuitResult(outcome: outcome, answered: watch.answeredAt != nil, promptWithoutButton: noButton)
             case .wait(let what):
                 if what != shown { shown = what; progress(what) }
+            case .cancel:
+                _ = World.claude.pressQuitPrompt(ClaudeUI.cancel, in: running)
+                return QuitResult(outcome: .failed, answered: watch.answeredAt != nil, promptWithoutButton: noButton)
             case .answer:
                 if World.claude.pressQuitPrompt(ClaudeUI.quitAnyway, in: running) {
                     watch.answered(at: World.now())
                     progress("Answered Claude's prompt with \(ClaudeUI.quitAnyway)…")
                 } else if World.now().timeIntervalSince(firstTry ?? World.now()) > QuitPrompt.findTimeout {
-                    // A new window with no Quit anyway button is not a prompt this app answers:
-                    // leave the answer to a person and keep waiting for it.
+                    // A new window with no Quit anyway button is not a prompt this app answers.
                     watch.canAnswer = false
+                    noButton = true
                 }
                 firstTry = firstTry ?? World.now()
             }
@@ -498,9 +500,7 @@ final class LogWatcher {
 /// One account's saved Claude app login: its claude.ai cookie rows (still encrypted with
 /// Claude's own key, never decrypted here) and the Code tab's token cache from config.json.
 enum LoginSlot {
-    static let hosts = "('.claude.ai','claude.ai')"
     static let configKeys = ClaudeFiles.loginConfigKeys
-    static let cookieSchemaVersion = "24"
 
     static func dir(_ acct: AccountRecord) -> URL { Paths.stateDir.appendingPathComponent("slots/\(acct.id)") }
 
@@ -589,9 +589,9 @@ enum SavedLogins {
         guard await LoginSlot.sqlite(source, "pragma quick_check;").out.trimmingCharacters(in: .whitespacesAndNewlines) == "ok" else {
             throw SwitchError.sqlite("Claude's cookie database failed its integrity check")
         }
-        guard await LoginSlot.cookieVersion(source) == LoginSlot.cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
+        guard await LoginSlot.cookieVersion(source) == ClaudeFiles.cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
         let cookies = new.appendingPathComponent("cookies.db")
-        let res = await LoginSlot.sqlite(cookies, "ATTACH \(LoginSlot.quoted(source)) AS c; CREATE TABLE cookies AS SELECT * FROM c.cookies WHERE host_key IN \(LoginSlot.hosts);")
+        let res = await LoginSlot.sqlite(cookies, "ATTACH \(LoginSlot.quoted(source)) AS c; CREATE TABLE cookies AS SELECT * FROM c.cookies WHERE host_key IN \(ClaudeFiles.cookieHosts);")
         guard res.status == 0 else { throw SwitchError.sqlite(res.err) }
         for f in [source, sourceJournal] { try? fm.removeItem(at: f) }
         guard await signInCount(cookies) == 1 else { throw SwitchError.notSignedIn }
@@ -636,8 +636,8 @@ enum SavedLogins {
             values = copy.meta.config
             insert = "ATTACH \(LoginSlot.quoted(copy.folder.appendingPathComponent("cookies.db"))) AS s; "
         }
-        guard await LoginSlot.cookieVersion(ClaudeApp.cookies) == LoginSlot.cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
-        let sql = insert + "BEGIN; DELETE FROM main.cookies WHERE host_key IN \(LoginSlot.hosts); "
+        guard await LoginSlot.cookieVersion(ClaudeApp.cookies) == ClaudeFiles.cookieSchemaVersion else { throw SwitchError.cookieSchemaChanged }
+        let sql = insert + "BEGIN; DELETE FROM main.cookies WHERE host_key IN \(ClaudeFiles.cookieHosts); "
             + (seat == nil ? "" : "INSERT INTO main.cookies SELECT * FROM s.cookies; ") + "COMMIT;"
         let res = await LoginSlot.sqlite(ClaudeApp.cookies, sql)
         guard res.status == 0 else { throw SwitchError.sqlite(res.err) }
@@ -703,6 +703,9 @@ struct SwitchOutcome: Equatable {
     var notResumed: [String] = []
     /// Another switch started during the resume and carries its chats on.
     var superseded = false
+    /// Claude didn't match a recorded shape: no Named line after a launch, or a quit prompt without
+    /// its button. Switching on its own pauses until Claude's version changes (model, section 8).
+    var unrecognised = false
 }
 
 /// One switch at a time across the whole Mac.
@@ -782,6 +785,8 @@ enum Switch {
         let to: Identity
         /// Each seat's row label; a pair with no row reads "another account".
         let names: [Identity: String]
+        /// Chats an automatic switch resumes besides those the log shows stopped: the wrapped-up ones.
+        var resume: Set<String> = []
         func name(_ id: Identity?) -> String { id.flatMap { names[$0] } ?? "another account" }
     }
 
@@ -833,7 +838,8 @@ enum Switch {
             return SwitchOutcome(ok: false, text: "Couldn't write the switch's journal, so nothing changed.")
         }
         progress("Quitting Claude…")
-        switch await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress).outcome {
+        let quit = await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress)
+        switch quit.outcome {
         case .quit: break
         case .declined:
             SwitchJournal.clear()
@@ -843,11 +849,11 @@ enum Switch {
             SwitchJournal.clear()
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
             unlock()
-            return SwitchOutcome(ok: false, text: "Claude didn't quit, so nothing changed.")
+            return SwitchOutcome(ok: false, text: "Claude didn't quit, so nothing changed.", unrecognised: quit.promptWithoutButton)
         }
         // The run that just ended names the chats that were working: stopped for usage or cut by the quit.
         let ended = ClaudeApp.events().stoppedChats
-        j.resume = Array(ended.byLimit.union(ended.byQuit).union(carried)).sorted()
+        j.resume = Array(ended.byLimit.union(ended.byQuit).union(carried).union(r.resume)).sorted()
         carried = []
         let outcome = await forward(&j, r, progress: progress)
         return await finish(outcome, j, r, progress: progress, switched: switched)
@@ -936,6 +942,8 @@ enum Switch {
                 try step(&j, .launch)
             }
             if j.step == .launch {
+                // A person who opened Claude since the load gets it quit once more (section 7).
+                guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
                 j.launchedAt = World.now()
                 try step(&j, .confirm)
                 await ClaudeApp.launch()
@@ -946,12 +954,15 @@ enum Switch {
             if back.ok { back = SwitchOutcome(ok: false, text: "Couldn't switch to \(r.name(j.to)).", detail: error.localizedDescription) }
             return back
         }
-        // Recovering a confirm: a Claude that is closed is opened again, and the wait starts over.
+        // Recovering a confirm: the wait starts over from Claude's run, its own or one a person
+        // opened while the switch was parked. A Claude that is closed is opened again.
         if recovering, j.parked || ClaudeApp.pids().isEmpty {
             j.parked = false
             if ClaudeApp.pids().isEmpty {
                 j.launchedAt = World.now()
                 await ClaudeApp.launch()
+            } else {
+                j.launchedAt = ClaudeApp.events().events.last { $0.event == .newRun }?.at ?? World.now()
             }
             try? j.save()
         }
@@ -1029,7 +1040,12 @@ enum Switch {
                         try? j.save()
                         return SwitchOutcome(ok: false, text: "Open Claude to finish switching to \(r.name(j.to)).", parked: true)
                     }
-                    return await rolledBack(&j, r, "\(r.name(j.to)) didn't open in time.", progress: progress)
+                    var late = await rolledBack(&j, r, "\(r.name(j.to)) didn't open in time.", progress: progress)
+                    // Claude ran the whole wait and named nobody: its log no longer has the shape the app reads.
+                    late.unrecognised = !events.events.contains { e in
+                        if case .named = e.event { return e.at >= launch.addingTimeInterval(-1) } else { return false }
+                    }
+                    return late
                 }
             }
             await World.sleep(1)
@@ -1167,56 +1183,6 @@ enum ChatResume {
             retrying: retrying)
     }
 
-}
-
-/// A macOS notification, for a switch nobody watched, posted by the app itself so it shows the
-/// app's name and icon. It shows on this Mac only, once macOS allows the app to post them.
-enum Notify {
-    /// Keeps a notification on screen while the menu is open, when macOS counts the app as in front.
-    private final class Presenter: NSObject, UNUserNotificationCenterDelegate {
-        func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
-                                    withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
-            done([.banner, .list])
-        }
-    }
-    private static let presenter = Presenter()
-
-    /// Only a process inside the app bundle has the app's identity to post with.
-    private static var center: UNUserNotificationCenter? {
-        Bundle.main.bundleIdentifier == nil ? nil : UNUserNotificationCenter.current()
-    }
-
-    /// The menu app calls this at launch. The first time, macOS asks whether Claude Accounts may
-    /// post notifications; the command line posts with the answer given there.
-    static func requestPermission() {
-        center?.delegate = presenter
-        center?.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-    }
-
-    /// Whether macOS lets the app post notifications, for --status.
-    static func permission() -> String {
-        guard let center else { return "unknown: not run from the app bundle" }
-        let done = DispatchSemaphore(value: 0)
-        nonisolated(unsafe) var status = UNAuthorizationStatus.notDetermined
-        center.getNotificationSettings { status = $0.authorizationStatus; done.signal() }
-        guard done.wait(timeout: .now() + 5) == .success else { return "unknown" }
-        switch status {
-        case .authorized, .provisional, .ephemeral: return "allowed"
-        case .denied: return "not allowed (System Settings > Notifications > Claude Accounts)"
-        default: return "not asked yet: the menu app asks at launch"
-        }
-    }
-
-    /// Post at once, and return once macOS has the request, because the command line exits next.
-    static func post(_ title: String, _ body: String) {
-        guard let center else { return }
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        let done = DispatchSemaphore(value: 0)
-        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { _ in done.signal() }
-        _ = done.wait(timeout: .now() + 5)
-    }
 }
 
 // MARK: - Usage cache and auto-switch state
@@ -1393,6 +1359,10 @@ final class Store: ObservableObject {
     private var log = LogReader()
     private var running = false
     private var trusted = World.claude.trusted
+    /// Claude's version as last read, and whether a shape the app reads went missing at run time
+    /// on that version (model, section 8). A new version clears the miss.
+    private var claudeVersion: String?
+    private var shapeMissing = false
     private var meters = PairFile<SeatMeters>(name: "meters.json").load()
     private var stops = PairFile<StopMark>(name: "stops.json").load()
     private var failedTargets = PairFile<Date>(name: "failed-targets.json").load()
@@ -1404,6 +1374,8 @@ final class Store: ObservableObject {
     private var forced: Set<Identity> = []
     /// The hold whose login was saved, so each settled hold is saved once.
     private var savedHold: Hold?
+    /// When each seat was last read with room: turns that ended after it ended as the seat ran out.
+    private var roomReadAt: [Identity: Date] = [:]
     /// Chats already resumed in place, so a wait resumes each stopped chat once.
     private var resumed: Set<String> = []
     private var switchingTo: SwitchFacts?
@@ -1411,7 +1383,13 @@ final class Store: ObservableObject {
     private var success: (text: String, until: Date)?
     private var ticking = false
     private var timer: Timer?
+    /// The switch holding the lock, from its start until it confirms or ends. Its resume runs
+    /// after, on `resumeTask`, so a second switch can overtake it (model, section 6, step 7).
     private(set) var switchTask: Task<Void, Never>?
+    private var resumeTask: Task<Void, Never>?
+    /// Counts switches, so an older one's end never clears a newer one's task.
+    private var runs = 0
+    private var noteUntil: Date?
 
     init() {
         SavedLogins.adopt(accounts)
@@ -1432,7 +1410,9 @@ final class Store: ObservableObject {
     func facts(now: Date = World.now()) -> Facts {
         var f = Facts()
         f.rows = accounts.inMenuOrder
-        f.claude = ClaudeFacts(installed: World.claude.installed, running: running, recognised: true)
+        let installed = World.claude.installed
+        f.claude = ClaudeFacts(installed: installed, running: running,
+                               recognised: !installed || (ClaudeContract.recognises(claudeVersion) && !shapeMissing))
         f.log = log.events
         f.saved = Dictionary(accounts.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
         f.meters = meters
@@ -1455,6 +1435,7 @@ final class Store: ObservableObject {
     private func publish(now: Date = World.now()) {
         let f = facts(now: now)
         if let s = success, s.until <= now { success = nil }
+        if let until = noteUntil, until <= now { noteUntil = nil; switchingTo?.note = nil }
         seats = Seats.build(f, now: now)
         let parked = SwitchJournal.load().flatMap { $0.parked && switchTask == nil ? names[$0.to] ?? "a seat" : nil }
         notice = AppState.notice(f, now: now, failure: failure, success: success?.text, finishing: parked)
@@ -1492,6 +1473,8 @@ final class Store: ObservableObject {
         accounts = AccountStore.load().labelled()
         running = !ClaudeApp.pids().isEmpty
         trusted = World.claude.trusted
+        let version = World.claude.version()
+        if version != claudeVersion { claudeVersion = version; shapeMissing = false }
         log.poll()
         recordStops()
     }
@@ -1544,7 +1527,8 @@ final class Store: ObservableObject {
             let readAt = meters[seat]?.readAt ?? .distantPast
             let resets = [meters[seat]?.fiveHour?.resetsAt, meters[seat]?.weekly?.resetsAt].compactMap { $0 }
             if resets.contains(where: { readAt < $0 + Limits.meterAfterReset && $0 + Limits.meterAfterReset <= now }) { return true }
-            if let ended = log.events.lastTurnEnd(on: seat), ended >= readAt, since >= Limits.meterOnTurnEnd { return true }
+            if let ended = log.events.lastTurnEnd(on: seat), !ClaudeEvents.readAfter(ended, readAt: readAt),
+               since >= Limits.meterOnTurnEnd { return true }
             return false
         }
     }
@@ -1574,6 +1558,7 @@ final class Store: ObservableObject {
         switch state {
         case .ok(_, let fh, let wk, _):
             let before = meters[seat]?.readAt ?? .distantPast
+            if let last = meters[seat], !last.showsFull, let at = last.readAt { roomReadAt[seat] = at }
             let reading = SeatMeters(fiveHour: fh.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
                                      weekly: wk.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
                                      readAt: readAt)
@@ -1619,8 +1604,10 @@ final class Store: ObservableObject {
             resumeInPlace(waitingChats(f), on: seat, now: now)
         case .switchTo(let target):
             // The switch runs on its own task; a failed target sends the decision round again.
-            guard switchTask == nil else { return }
-            run(to: target, kind: .auto)
+            guard switchTask == nil, let seat = f.hold?.seat else { return }
+            // With no reading with room on record, only the turn that set off the last read counts.
+            let since = roomReadAt[seat] ?? log.events.lastTurnEnd(on: seat) ?? now
+            run(to: target, kind: .auto, resume: log.events.turnsEnded(on: seat, since: since))
         }
     }
 
@@ -1717,17 +1704,18 @@ final class Store: ObservableObject {
         return accounts.moved(row, by: step, organization: organization) != nil
     }
 
-    /// Sign the seat's Claude Code login out, delete it and its saved login, and drop the row.
-    /// Its chats stay in Claude's folder for that pair.
+    /// Drop the row and delete its saved login at once, then sign its Claude Code login out and
+    /// delete it. Its chats stay in Claude's folder for that pair.
     func remove(_ seat: Seat) {
         guard let row = record(for: seat) else { return }
+        SavedLogins.remove(seat.id)
+        meters[seat.id] = nil
+        PairFile<SeatMeters>(name: "meters.json").save(meters)
+        save(AccountStore.load().filter { $0.id != row.id })
         Task {
             _ = await ClaudeCLI.run(configDir: row.configURL, ["auth", "logout"])
             if await Keychain.credential(service: row.keychainService) != nil { await Keychain.delete(service: row.keychainService) }
             try? FileManager.default.removeItem(at: row.configURL)
-            SavedLogins.remove(seat.id)
-            self.meters[seat.id] = nil
-            self.save(AccountStore.load().filter { $0.id != row.id })
         }
     }
 
@@ -1762,23 +1750,32 @@ final class Store: ObservableObject {
     /// Switch Claude to a seat with no saved login, at its sign-in page.
     func setUp(_ seat: Seat) { run(to: seat.id, kind: .setUp) }
 
-    /// Wait for the switch in progress, if any, to end.
-    func finishSwitch() async { await switchTask?.value }
+    /// Wait for the switch in progress, and the resume after it, to end.
+    func finishSwitch() async {
+        await switchTask?.value
+        await resumeTask?.value
+    }
 
     /// Each seat's row label, for the switch's lines.
     private var names: [Identity: String] { Dictionary(seats.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a }) }
 
     /// Run one switch; a second request while one runs is refused with a notice.
     @discardableResult
-    private func run(to target: Identity, kind: SwitchJournal.Kind) -> Task<Void, Never> {
+    private func run(to target: Identity, kind: SwitchJournal.Kind, resume: Set<String> = []) -> Task<Void, Never> {
         if let busy = switchTask {
             let to = switchingTo?.target ?? SwitchJournal.load()?.to
-            failure = "Already switching to \(to.flatMap { names[$0] } ?? "a seat")."
+            let line = "Already switching to \(to.flatMap { names[$0] } ?? "a seat")."
+            if switchingTo != nil {
+                switchingTo?.note = line
+                noteUntil = World.now() + Self.successFor
+            } else {
+                failure = line
+            }
             publish()
             return busy
         }
         let from = log.events.hold?.seat
-        let request = Switch.Request(kind: kind, to: target, names: names)
+        let request = Switch.Request(kind: kind, to: target, names: names, resume: resume)
         return start(target) { progress, switched in await Switch.run(request, progress: progress, switched: switched) } then: { outcome in
             if kind == .auto { self.autoFinished(outcome, from: from, to: target) }
         }
@@ -1795,40 +1792,57 @@ final class Store: ObservableObject {
     }
 
     /// Run `body` as the switch in progress: its steps show on the target's row, and its outcome
-    /// becomes the notice as soon as the switch ends, before the chats resume.
+    /// becomes the notice as soon as the switch ends, before the chats resume. From then on a new
+    /// switch may start; this one's resume goes on until that switch overtakes it.
     @discardableResult
     private func start(_ target: Identity,
                        _ body: @escaping (@escaping Switch.Progress, @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome,
                        then: @escaping (SwitchOutcome) -> Void) -> Task<Void, Never> {
         failure = nil
         success = nil
+        runs += 1
+        let run = runs
         switchingTo = SwitchFacts(target: target, step: "Starting…")
         publish()
         let progress: Switch.Progress = { step in
             Task { @MainActor in
-                guard self.switchingTo?.target == target else { return }
+                guard self.runs == run, self.switchingTo?.target == target else { return }
                 self.switchingTo?.step = step
                 self.publish()
             }
         }
+        let ended = Flag()
         let switched: (SwitchOutcome) async -> Void = { outcome in
-            await MainActor.run { self.switched(outcome) }
+            await MainActor.run {
+                ended.set = true
+                self.switched(outcome, run: run)
+            }
         }
         let task = Task {
             let outcome = await body(progress, switched)
-            self.switchTask = nil
+            // A switch that ended before confirm (cancelled, refused, failed) reports here.
+            if !ended.set { self.switched(outcome, run: run) }
             if outcome.toResume > 0 { self.resumeEnded(outcome) }
             then(outcome)
+            if self.runs == run { self.resumeTask = nil }
             self.publish()
         }
         switchTask = task
         return task
     }
 
+    /// Set once a switch has reported how it ended.
+    private final class Flag: @unchecked Sendable { var set = false }
+
     /// The switch itself ended: its line goes in the notice.
-    private func switched(_ outcome: SwitchOutcome) {
+    private func switched(_ outcome: SwitchOutcome, run: Int) {
+        guard runs == run else { return }
+        resumeTask = switchTask
+        switchTask = nil
         switchingTo = nil
+        noteUntil = nil
         observe()
+        if outcome.unrecognised { shapeMissing = true }
         if outcome.parked {
             failure = nil
         } else if outcome.ok {
@@ -1851,13 +1865,13 @@ final class Store: ObservableObject {
     private func autoFinished(_ outcome: SwitchOutcome, from: Identity?, to: Identity) {
         let name = { (s: Identity?) in s.flatMap { self.names[$0] } ?? "The seat in use" }
         if outcome.ok {
-            Notify.post("Switched to \(name(to))", "Switched to \(name(to)): \(name(from)) is out. \(outcome.resumed) chat\(outcome.resumed == 1 ? "" : "s") resumed.")
+            World.claude.notify(title: "Switched to \(name(to))", body: "Switched to \(name(to)): \(name(from)) is out. \(outcome.resumed) chat\(outcome.resumed == 1 ? "" : "s") resumed.")
             return
         }
         guard !outcome.parked else { return }
         failedTargets[to] = World.now()
         PairFile<Date>(name: "failed-targets.json").save(failedTargets)
-        Notify.post("Didn't switch to \(name(to))", failure ?? outcome.text)
+        World.claude.notify(title: "Didn't switch to \(name(to))", body: failure ?? outcome.text)
         Task { await self.tick() }
     }
 }
