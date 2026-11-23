@@ -61,6 +61,8 @@ SCENARIO_FILES=("$ROOT/tests/StandIn.swift" "$ROOT/tests/Scenarios.swift" "$ROOT
 if [ -f "$ROOT/tests/BugScenarios.swift" ]; then SCENARIO_FILES+=("$ROOT/tests/BugScenarios.swift")
 else SCENARIO_FILES+=("$ROOT/tests/surface/NoBugScenarios.swift"); fi
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/scenarios" "${APP_SOURCES[@]}" "${SCENARIO_FILES[@]}"
+# The resume pair drives ChatComposer's own Accessibility code against the chat fixture.
+export CHAT_FIXTURE="$OUT/prompt-fixture"
 RESULTS="$OUT/scenario-results"
 rm -rf "$RESULTS"; mkdir -p "$RESULTS"
 "$OUT/scenarios" --list | awk '{ printf "%03d %s%c", NR, $0, 0 }' \
