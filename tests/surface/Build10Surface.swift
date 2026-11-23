@@ -35,6 +35,13 @@ enum ShownAction: Equatable { case switchTo, setUp }
     }
     var notice: [String] { [store.switching, store.message].compactMap { $0 } }
     var rowNames: [String] { store.accounts.map(\.label) }
+    func meterText(_ row: String) -> String? { nil }
+    func rename(_ row: String, to name: String) { check(false, "build 10 has no rename by seat") }
+    func move(_ row: String, by step: Int) { check(false, "build 10 has no move by seat") }
+    func remove(_ row: String) { if let r = record(row) { store.remove(r) } }
+    var firstRun: Bool { store.accounts.isEmpty }
+    func hasSavedLogin(_ seat: StandSeat) -> Bool { store.accounts.contains { $0.accountUuid == seat.account && $0.orgUuid == seat.org && store.hasSavedLogin($0) } }
+    func crashApp() { clock.abandonSleepers(); store = Store() }
     func click(_ row: String) {
         guard let r = record(row) else { check(false, "no row named \(row)"); return }
         if action(row) == .setUp { store.setUp(r) } else { store.switchTo(r) }
