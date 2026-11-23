@@ -9,7 +9,7 @@ import Foundation
 /// button counts, never the chat window's web content or another alert Claude has open, so no
 /// other button can be pressed by mistake.
 enum QuitPrompt {
-    static let quitAnyway = "Quit anyway"
+    static let quitAnyway = ClaudeUI.quitAnyway
     /// How long a new window of Claude's may go without showing a Quit anyway button before the
     /// switch stops trying to answer it and leaves the answer to a person.
     static let findTimeout: TimeInterval = 20

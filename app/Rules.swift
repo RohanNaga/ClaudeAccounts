@@ -555,44 +555,40 @@ struct LogFollower {
     private var refusedAt: [Identity: Date] = [:]
 
     /// Claude's own messages for a turn refused because the account is out of usage.
-    static let outOfUsage = [
-        "You've hit your", "You've reached your", "You're out of usage credits", "You're out of extra usage",
-        "Your org is out of usage", "Your seat type doesn't include", "Your usage allocation has been disabled",
-        "Your group's usage limit is set to $0", "requires usage credits",
-    ]
+    static let outOfUsage = ClaudeLog.limitTexts
 
     init(identity: Identity? = nil) { self.identity = identity }
 
     mutating func read(_ text: String) {
         for line in text.split(separator: "\n") {
-            if line.contains("[LocalSessionManager] Initialization succeeded"),
-               let account = Self.field(line, "accountId="), let org = Self.field(line, "orgId=") {
+            if line.contains(ClaudeLog.identity),
+               let account = Self.field(line, ClaudeLog.accountField), let org = Self.field(line, ClaudeLog.orgField) {
                 let named = Identity(account: account, org: org)
                 if named != identity { endHold(at: Self.time(line)); stoppedByLimit = []; stoppedAt = [:]; cutByQuit = [] }
                 let refusedSinceHeld = heldSince.flatMap { since in refusedAt[named].map { $0 >= since } } ?? false
                 if named != identity || heldSince == nil || refusedSinceHeld { heldSince = Self.time(line) }
                 identity = named
-            } else if line.contains("session_stale_relogin"), let at = Self.time(line), let held = identity {
+            } else if line.contains(ClaudeLog.refusal), let at = Self.time(line), let held = identity {
                 // Claude refuses the sign-in of the account it holds, naming the organization as
                 // orgId= or inside its cache key.
-                if let org = Self.field(line, "orgId=") ?? (line.contains(held.org) ? held.org : nil) {
+                if let org = Self.field(line, ClaudeLog.orgField) ?? (line.contains(held.org) ? held.org : nil) {
                     refusedAt[Identity(account: held.account, org: org)] = at
                 }
-            } else if line.contains("Starting app {") || Self.signsOut(line) {
+            } else if line.contains(ClaudeLog.appStart) || Self.signsOut(line) {
                 endHold(at: Self.time(line))
                 identity = nil
                 heldSince = nil
                 stoppedByLimit = []
                 stoppedAt = [:]
                 cutByQuit = []
-            } else if line.contains("[CCD CycleHealth] ") {
-                if let id = Self.session(after: "[CCD CycleHealth] healthy cycle for ", in: line) {
+            } else if line.contains(ClaudeLog.cycle) {
+                if let id = Self.session(after: ClaudeLog.healthyCycle, in: line) {
                     stoppedByLimit.remove(id)
                     stoppedAt[id] = nil
                     cutByQuit.remove(id)
-                } else if let id = Self.session(after: "[CCD CycleHealth] unhealthy cycle for ", in: line) {
-                    if line.contains("reason=app_quit") { cutByQuit.insert(id) }
-                } else if let id = Self.session(after: "[CCD CycleHealth] ", in: line), line.contains(" api_error ("),
+                } else if let id = Self.session(after: ClaudeLog.unhealthyCycle, in: line) {
+                    if line.contains(ClaudeLog.quitReason) { cutByQuit.insert(id) }
+                } else if let id = Self.session(after: ClaudeLog.cycle, in: line), line.contains(ClaudeLog.apiError),
                           Self.outOfUsage.contains(where: { line.contains($0) }) {
                     stoppedByLimit.insert(id)
                     stoppedAt[id] = Self.time(line)
@@ -639,7 +635,7 @@ struct LogFollower {
     private static let timeFormat: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        f.dateFormat = ClaudeLog.timeFormat
         return f
     }()
 
@@ -651,7 +647,7 @@ struct LogFollower {
     }
 
     static func signsOut<S: StringProtocol>(_ line: S) -> Bool {
-        line.contains("Navigated to /logout") || line.contains("loggedOut: false \u{2192} true")
+        ClaudeLog.signOut.contains { line.contains($0) }
     }
 
     private static func field<S: StringProtocol>(_ line: S, _ key: String) -> String? {
@@ -663,7 +659,7 @@ struct LogFollower {
     private static func session<S: StringProtocol>(after marker: String, in line: S) -> String? {
         guard let r = line.range(of: marker) else { return nil }
         let id = line[r.upperBound...].prefix { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
-        return id.hasPrefix("local_") ? String(id) : nil
+        return id.hasPrefix(ClaudeLog.sessionPrefix) ? String(id) : nil
     }
 }
 

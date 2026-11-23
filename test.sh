@@ -11,12 +11,19 @@ OUT="$ROOT/.build-cache"
 mkdir -p "$OUT"
 export CLANG_MODULE_CACHE_PATH="$OUT"
 
+# What the app knows about Claude (app/Claude.swift) and the code that reads Claude's windows.
+CORE=("$ROOT/app/Claude.swift" "$ROOT/app/Rules.swift" "$ROOT/app/QuitPrompt.swift" "$ROOT/app/ChatComposer.swift")
+
+# First the guard every stand-in test relies on: a test world never reaches the real Claude.
+swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/world-guard" "${CORE[@]}" "$ROOT/tests/WorldGuardTest.swift"
+"$OUT/world-guard"
+
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/rules-tests" \
-  "$ROOT/app/Rules.swift" "$ROOT/tests/RulesTests.swift"
+  "${CORE[@]}" "$ROOT/tests/RulesTests.swift"
 "$OUT/rules-tests"
 
 # The menu's status line wraps to every line it needs: a cut-off instruction can't be followed.
-status=$(grep -A4 'if let msg = store.message {' "$ROOT/app/ClaudeAccounts.swift")
+status=$(grep -A4 'if let msg = store.message {' "$ROOT/app/Views.swift")
 if ! grep -q 'Text(msg).*fixedSize(horizontal: false, vertical: true)' <<<"$status" || grep -qE 'lineLimit|truncationMode' <<<"$status"; then
   echo "FAIL: the menu's status line must wrap (fixedSize vertical, no lineLimit or truncation)"; exit 1
 fi
@@ -24,9 +31,9 @@ echo "Status line wraps: ok"
 
 # A manual switch is the person's call: a row's action comes from RowAction (tested above), which
 # never reads usage, and the switch itself never checks whether the target is out.
-section() { awk -v start="$1" '$0 ~ start {f=1; print; next} f && /^(enum|struct|final class|class|extension) / {exit} f' "$ROOT/app/ClaudeAccounts.swift"; }
-if ! grep -q 'RowAction.pick' <<<"$(section '^struct AccountRow')" \
-   || grep -qE 'isOut|atLimit|MeterRule|AutoSwitchRule' <<<"$(section '^enum SwitchEngine')"; then
+section() { awk -v start="$1" '$0 ~ start {f=1; print; next} f && /^(enum|struct|final class|class|extension) / {exit} f' "$ROOT/app/$2"; }
+if ! grep -q 'RowAction.pick' <<<"$(section '^struct AccountRow' Views.swift)" \
+   || grep -qE 'isOut|atLimit|MeterRule|AutoSwitchRule' <<<"$(section '^enum SwitchEngine' ClaudeAccounts.swift)"; then
   echo "FAIL: a row's action must come from RowAction, and a manual switch must not check the target's usage"; exit 1
 fi
 echo "Manual switch to any row: ok"
@@ -40,9 +47,9 @@ echo "Set up brings the chats: ok"
 
 swiftc -module-cache-path "$OUT" -o "$OUT/prompt-fixture" "$ROOT/tests/PromptFixture.swift"
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/prompt-test" \
-  "$ROOT/app/QuitPrompt.swift" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/PromptTest.swift"
+  "${CORE[@]}" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/PromptTest.swift"
 "$OUT/prompt-test" "$OUT/prompt-fixture"
 
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/resume-test" \
-  "$ROOT/app/Rules.swift" "$ROOT/app/ChatComposer.swift" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/ResumeTest.swift"
+  "${CORE[@]}" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/ResumeTest.swift"
 "$OUT/resume-test" "$OUT/prompt-fixture"
