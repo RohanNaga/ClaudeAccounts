@@ -142,6 +142,5 @@ final class ChatWindow: ClaudeWorld, @unchecked Sendable {
     func quitPromptOpen(in owners: [pid_t]) -> Bool { standIn.quitPromptOpen(in: owners) }
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool { standIn.pressQuitPrompt(title, in: owners) }
     func idleSeconds() -> TimeInterval { standIn.idleSeconds() }
-    func version() -> String? { standIn.version() }
     func notify(title: String, body: String) { standIn.notify(title: title, body: body) }
 }

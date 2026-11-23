@@ -61,6 +61,3 @@ enum ShownAction: Equatable { case switchTo, setUp }
         if action(row) == .setUp { store.setUp(r) } else { store.switchTo(r) }
     }
 }
-
-/// Build 10 has no recorded versions; the stand-in reports a placeholder.
-let standInClaudeVersion = "1.0.0"
