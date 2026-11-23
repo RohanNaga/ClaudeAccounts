@@ -741,7 +741,9 @@ enum Switch {
         let to: Identity
         /// Each seat's row label; a pair with no row reads "another account".
         let names: [Identity: String]
-        /// Chats an automatic switch resumes besides those the log shows stopped: the wrapped-up ones.
+        /// Chats an automatic switch resumes, from the log as the Store read it before the quit: those
+        /// stopped for usage on the seat in use and the wrapped-up ones. A failed read at the quit, or
+        /// a retry after an undone switch, keeps them.
         var resume: Set<String> = []
         func name(_ id: Identity?) -> String { id.flatMap { names[$0] } ?? "another account" }
     }
@@ -852,9 +854,11 @@ enum Switch {
                                   stoppedByLimit: Set(j.resume), cutByQuit: [])
             : []
         outcome.toResume = chats.count
+        // While a Claude shape is missing, resume is off (section 8 B): the chats are named instead.
+        if !ShapeMisses.load().isEmpty { outcome.notResumed = chats.map(\.title) }
         unlock()
         await switched(outcome)
-        guard !chats.isEmpty else { return outcome }
+        guard !chats.isEmpty, outcome.notResumed.isEmpty else { return outcome }
         var resumer = ChatResume.resumer(in: folder, reopenedAt: (j.launchedAt ?? World.now()).timeIntervalSince1970 * 1000,
                                          progress: progress)
         resumer.current = { SwitchLock.generation() == generation }
@@ -1032,6 +1036,13 @@ enum Switch {
     /// marked to undo once Claude is closed, so nothing asks it to quit again meanwhile.
     private static func rollback(_ j: inout SwitchJournal, _ r: Request, progress: @escaping Progress) async -> SwitchOutcome {
         await World.claude.willStep("rollback")
+        // Before load with no chat moved, Claude's files are as it left them: there is nothing to
+        // put back, so Claude is not asked to quit again, only opened if it is closed.
+        if j.step < .load, j.moves.isEmpty {
+            SwitchJournal.clear()
+            if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
+            return SwitchOutcome(ok: true, text: "Back on \(r.name(j.from)).")
+        }
         progress("Going back to \(r.name(j.from))…")
         if !ClaudeApp.pids().isEmpty {
             guard await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress).outcome == .quit else {
@@ -1599,7 +1610,8 @@ final class Store: ObservableObject {
             let since = roomReadAt[seat] ?? log.events.lastTurnEnd(on: seat) ?? now
             // Which of Claude's two signals set it off (model, section 4), for the diagnostics file.
             let trigger = (stops[seat].map { $0.until > now } ?? false) ? "limitStop" : "wrapUp"
-            run(to: target, kind: .auto, resume: log.events.turnsEnded(on: seat, since: since), trigger: trigger)
+            let resume = log.events.stoppedForUsage(on: seat).union(log.events.turnsEnded(on: seat, since: since))
+            run(to: target, kind: .auto, resume: resume, trigger: trigger)
         }
     }
 

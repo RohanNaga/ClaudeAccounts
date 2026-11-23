@@ -704,6 +704,21 @@ struct ClaudeEvents {
         })
     }
 
+    /// Chats whose last word in the log is a usage stop logged while Claude held `seat`. Unlike
+    /// `stoppedChats`, a restart of Claude, or a switch undone back to `seat`, does not clear them.
+    func stoppedForUsage(on seat: Identity) -> Set<String> {
+        var last: [String: StampedEvent] = [:]
+        for e in events {
+            switch e.event {
+            case .limitStop(let c), .turnEnded(let c), .cutByQuit(let c): last[c] = e
+            default: break
+            }
+        }
+        return Set(last.compactMap { chat, e in
+            if case .limitStop = e.event, e.held == seat { return chat } else { return nil }
+        })
+    }
+
     func lastTurnEnd(on seat: Identity) -> Date? {
         events.last { e in if case .turnEnded = e.event { return e.held == seat && e.settled }; return false }?.at
     }
@@ -874,6 +889,13 @@ enum AutoSwitch {
         return true
     }
 
+    /// A fresh reading with room, taken once the seat's last stop had run out (section 4: the reset
+    /// is read a minute later, then the chats resume). A stop mark running out is not room by itself.
+    static func hasRoom(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
+        guard let m = f.meters[seat], let readAt = m.readAt, m.isFresh(at: now), !m.showsFull else { return false }
+        return readAt >= f.stops[seat]?.until ?? .distantPast
+    }
+
     /// The order the automatic switch tries the other seats in: down the menu from `from`,
     /// wrapping round, with the personal seats or the organization seats first when the person
     /// chose so. This is the only place that order is decided.
@@ -909,7 +931,9 @@ enum AutoSwitch {
     static func decide(_ f: Facts, now: Date) -> Decision {
         guard status(f) == .on, f.switching == nil, let hold = f.hold, hold.settled(at: now),
               f.rows.contains(where: { $0.identity == hold.seat }) else { return .none }
-        guard isDone(hold.seat, f, now: now) else { return f.waitingChats > 0 ? .resumeInPlace : .none }
+        guard isDone(hold.seat, f, now: now) else {
+            return f.waitingChats > 0 && hasRoom(hold.seat, f, now: now) ? .resumeInPlace : .none
+        }
         if let t = target(from: hold.seat, f, now: now) { return .switchTo(t) }
         let resets = f.rows.compactMap(\.identity).compactMap { s in OutRule.until(s, f, now: now).map { (s, $0) } }
         let first = resets.min { $0.1 < $1.1 }
