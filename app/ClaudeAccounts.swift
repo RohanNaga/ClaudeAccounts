@@ -608,6 +608,7 @@ enum SavedLogins {
     static func remove(_ seat: Identity) { try? FileManager.default.removeItem(at: dir(seat)) }
 
     /// Bring each row's login from the old per-row slot into its pair's folder, once.
+    /// The slot stays: a rollback to the previous build logs in from it, and load reads an old row's organization there.
     static func adopt(_ rows: [AccountRecord]) {
         let fm = FileManager.default
         for row in rows {
@@ -622,7 +623,6 @@ enum SavedLogins {
                 try? fm.removeItem(at: current)
                 continue
             }
-            try? fm.removeItem(at: slot)
         }
     }
 }
