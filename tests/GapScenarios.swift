@@ -541,7 +541,8 @@ let gapScenarios: [Scenario] = [
     // 25. The upgrade. The previous build kept each row's Claude login in slots/<row id>; on its first
     // start the new build files each one under its pair and leaves the slots, so a rollback to the
     // previous build still logs in, and that build reads back the rows and settings the new one saves.
-    Scenario(pair: "(Upgrade from the previous build's saved state)", model: "each seat with a saved login is Ready or In use with it filed under its pair; the old slots stay; the rows keep their order, names and labels; a manual Switch confirms with its chats; the previous build reads back what the new build saves") { h in
+    // A kept slot is a saved login too, so removing its seat deletes it with the one under saved/.
+    Scenario(pair: "(Upgrade from the previous build's saved state)", model: "each seat with a saved login is Ready or In use with it filed under its pair; the old slots stay; the rows keep their order, names and labels; a manual Switch confirms with its chats; the previous build reads back what the new build saves; 7: a seat removed while not in use loses its saved login, its old slot and its row") { h in
         let work = StandSeat(1, org: 0), lab = StandSeat(1, org: 3), side = StandSeat(2, org: 0), studio = StandSeat(3, org: 5)
         let old = PreviousBuild(claude: h.claude)
         // Account 1 has two organizations; its first row and account 2's row were saved before rows
@@ -595,6 +596,18 @@ let gapScenarios: [Scenario] = [
         h.check(back.rows == expected, "the previous build reads every row back from the new build's accounts.json, the old rows now naming their organizations: \(String(describing: back.rows))")
         h.check(back.settings == settings, "and every setting from its settings.json: \(String(describing: back.settings))")
         h.check(old.slotFiles() == slots, "the slots are unchanged after the switch and both saves: \(old.slotFiles().keys.sorted())")
+
+        // The person removes Work · Research, an upgraded seat Claude does not hold.
+        let others = { (files: [String: Data]) in files.filter { !$0.key.hasPrefix(rows[1].id + "/") } }
+        let saved = [work, side].map { h.savedAt($0) }
+        h.remove("Work · Research")
+        await h.settle()
+        h.check(!FileManager.default.fileExists(atPath: SavedLogins.dir(lab.identity).path), "the removed seat's saved/<account>_<org> folder is gone")
+        h.check(!old.hasSlot(rows[1].id), "and its old slot, with Claude's cookie rows and token keys: \(old.slotFiles().keys.sorted())")
+        h.check(h.rowNames == ["Work", "Side", "Studio"] && old.read().rows == expected.filter { $0.id != rows[1].id },
+                "its row is gone from the menu and accounts.json, the others unchanged: \(h.rowNames), \(String(describing: old.read().rows?.map(\.id)))")
+        h.check(others(old.slotFiles()) == others(slots) && [work, side].map { h.savedAt($0) } == saved,
+                "the other rows' slots and saved logins are untouched")
     },
 ]
 
@@ -672,6 +685,9 @@ private struct PreviousBuild {
             .write(to: dir.appendingPathComponent("slot.json"), options: .atomic)
         for f in ["cookies.db", "slot.json"] { try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dir.appendingPathComponent(f).path) }
     }
+
+    /// The row's slot folder is on disk, empty or not.
+    func hasSlot(_ id: String) -> Bool { FileManager.default.fileExists(atPath: slot(id).path) }
 
     /// The stand-in's write mark in a row's slot: which sign-in it holds.
     func slotMark(_ id: String) -> String? { claude.writeMark(in: slot(id).appendingPathComponent("cookies.db")) }
