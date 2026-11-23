@@ -875,7 +875,7 @@ enum Switch {
         let recovering = j.step == .confirm
         do {
             if j.step < .save {
-                guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
+                guard await closed(&j, r, progress: progress) else { return await rolledBack(&j, r, "Claude was opened during the switch.", progress: progress) }
                 await World.claude.willStep("backUp")
                 j.backup = try backUp()
                 try await step(&j, .save)
@@ -889,7 +889,7 @@ enum Switch {
                 try await step(&j, .move)
             }
             if j.step == .move {
-                guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
+                guard await closed(&j, r, progress: progress) else { return await rolledBack(&j, r, "Claude was opened during the switch.", progress: progress) }
                 await World.claude.willStep("move")
                 // A seat whose organization is not known yet has no chat folder until Claude names it.
                 if let from = j.from, from != j.to, !j.to.orgUnknown { try await moveChats(from: from, to: j.to, journal: &j) }
@@ -902,7 +902,7 @@ enum Switch {
         }
         do {
             if j.step == .load {
-                guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
+                guard await closed(&j, r, progress: progress) else { return await rolledBack(&j, r, "Claude was opened during the switch.", progress: progress) }
                 await World.claude.willStep("load")
                 progress(j.kind == .setUp ? "Opening Claude's sign-in…" : "Loading \(r.name(j.to))…")
                 try await SavedLogins.load(j.kind == .setUp ? nil : j.to)
@@ -910,7 +910,7 @@ enum Switch {
             }
             if j.step == .launch {
                 // A person who opened Claude since the load gets it quit once more (section 7).
-                guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
+                guard await closed(&j, r, progress: progress) else { return await rolledBack(&j, r, "Claude was opened during the switch.", progress: progress) }
                 j.launchedAt = World.now()
                 try await step(&j, .confirm)
                 await World.claude.willStep("launch")
@@ -991,9 +991,6 @@ enum Switch {
             let named = events.hold.map { j.to.matches($0.seat) && $0.since >= launch.addingTimeInterval(-1) } ?? false
             switch verdict(events, to: j.to, kind: j.kind, since: launch, running: running, now: now) {
             case .confirmed:
-                if let backup = j.backup {
-                    try? FileManager.default.moveItem(at: SwitchJournal.url, to: URL(fileURLWithPath: backup).appendingPathComponent("switch.json"))
-                }
                 SwitchJournal.clear()
                 pruneBackups()
                 return SwitchOutcome(ok: true, text: j.kind == .setUp ? "Set up \(r.name(j.to))." : "Switched to \(r.name(j.to)).")
