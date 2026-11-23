@@ -469,6 +469,26 @@ let autoFaultScenarios: [Scenario] = [
         checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
         checkActs(h)
     },
+    Scenario(pair: "(Automatic switch at resume, kill the app, the person resumes the chat before the app is back)",
+             model: "6.7: a chat already resumed is skipped; Recovery: the next launch's resume counts from Claude's reopening, so a chat that ran since is left alone") { h in
+        let lines = await autoStart(h, onScreen: false)
+        await startAuto(h)
+        await h.run(until: { lines.note(h); return h.claude.actions.contains { $0.hasPrefix("open ") } }, limit: 900)
+        h.killApp()
+        h.check(h.resumeOnDisk, "setup: the killed resume leaves its chat on disk for the next launch")
+        // While the app is down, the person sends the chat a message: it runs, then goes idle.
+        h.claude.addChat("local_one", in: B, lastActivity: h.now)
+        h.claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
+        await h.pass(60)
+        h.make(); await h.tick(); await h.settle()
+        await h.run(until: { lines.note(h); return !h.resumeOnDisk }, limit: ClaudeTiming.resumeFor + 5 * 60)
+        lines.note(h)
+        checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
+        h.check(h.claude.sent.isEmpty, "the next launch types nothing into a chat the person resumed since Claude reopened (6.7); typed \(h.claude.sent)")
+        h.check(!lines.has("Couldn't resume"), "and does not name it: \(lines.seen)")
+        checkActs(h)
+        await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
+    },
     Scenario(pair: "(Automatic switch at resume, kill Claude)",
              model: "7: Claude quits with no switch running; 5 resumeFor: retried every 60 s for 30 min; 8 B: nothing typed into a closed Claude") { h in
         let lines = await autoStart(h, onScreen: false)
