@@ -644,7 +644,7 @@ struct SignInView: View {
         .frame(width: 400)
         // Opening this window is the request, so the login starts at once.
         .onAppear {
-            target = store.signInTarget
+            target = store.signInRecord
             if flow.phase == .idle { flow.start(reauth: target) }
         }
         .onDisappear {
