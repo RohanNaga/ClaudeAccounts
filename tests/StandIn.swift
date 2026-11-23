@@ -42,13 +42,28 @@ final class VirtualClock: AppClock, @unchecked Sendable {
     }
 }
 
+/// A placeholder id in the shape Claude logs ids, a 36-character UUID, so the app's own parsing
+/// reads it. `kind` (a hex digit) and `n` keep it readable: a for accounts, b for organizations,
+/// e for an account's personal organization.
+func placeholderId(_ kind: Character, _ n: Int) -> String {
+    String(repeating: kind, count: 8) + "-0000-4000-8000-" + String(format: "%012x", n)
+}
+
 /// One seat: an account in an organization. Ids are placeholders, never real ones.
 struct StandSeat: Hashable, CustomStringConvertible {
     let account: String
     let org: String
+    init(account: String, org: String) { self.account = account; self.org = org }
+    /// Account `n` in organization `org` (0: the account's personal organization).
+    init(_ n: Int, org: Int) {
+        self.init(account: placeholderId("a", n), org: org == 0 ? placeholderId("e", n) : placeholderId("b", org))
+    }
     var identity: Identity { Identity(account: account, org: org) }
     var tag: String { "\(account)/\(org)" }
-    var description: String { tag }
+    var description: String {
+        func n(_ id: String) -> String { String(Int(id.suffix(12), radix: 16) ?? 0) }
+        return "account \(n(account)) in \(org.hasPrefix("e") ? "its personal organization" : "organization \(n(org))")"
+    }
 }
 
 /// How Claude answers a request to quit.
@@ -106,6 +121,9 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
 
     // MARK: Claude's files
 
+    /// The cookie schema version recorded for the Claude versions the contracts cover.
+    static let cookieSchema = "24"
+
     var cookies: URL { dataDir.appendingPathComponent(ClaudeFiles.cookies) }
     var config: URL { dataDir.appendingPathComponent(ClaudeFiles.config) }
 
@@ -113,7 +131,13 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     func writeSignIn(_ seat: StandSeat?) {
         try? FileManager.default.removeItem(at: cookies)
         let value = seat?.tag ?? ""
-        let sql = "CREATE TABLE cookies(name TEXT, value TEXT); " + (seat == nil ? "" : "INSERT INTO cookies VALUES('\(ClaudeFiles.signInCookie)','\(value)');")
+        // Chromium's cookie database shape: a meta table carrying the schema version, and cookie
+        // rows keyed by host. Placeholder values only; the stand-in's tag stands for the sign-in.
+        let sql = "CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR); "
+            + "INSERT INTO meta VALUES('version','\(Self.cookieSchema)'); "
+            + "CREATE TABLE cookies(host_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL); "
+            + "INSERT INTO cookies VALUES('.example.org','other','x'); "
+            + (seat == nil ? "" : "INSERT INTO cookies VALUES('.claude.ai','\(ClaudeFiles.signInCookie)','\(value)');")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
         p.arguments = [cookies.path, sql]
@@ -194,7 +218,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         clock.after(refuseAfter) { [weak self] in
             guard let self, self.pid == p else { return }
             self.logRefused(seat)
-            let fallback = StandSeat(account: seat.account, org: self.personal[seat.account] ?? "personal-\(seat.account)")
+            let fallback = StandSeat(account: seat.account, org: self.personal[seat.account] ?? placeholderId("e", Int(seat.account.suffix(12), radix: 16) ?? 0))
             self.lock.withLock { self.held = fallback }
             self.logNamed(fallback)
         }
