@@ -668,7 +668,20 @@ let scenarios: [Scenario] = [
         h.click("Beta")
         await h.run(until: { h.claude.held == B && !h.switchInFlight }, limit: 600)
         h.check(h.claude.held == B, "manual Switch still works: \(String(describing: h.claude.held)), \(h.notice)")
-        h.check(h.noticeHas(pausedLine), "a prompt still without its button keeps the pause: \(h.notice)")
+        // Spec 11: a failure the person must act on outranks the pause for the one notice slot.
+        h.check(h.notice == ["Couldn't resume 1 chat: send it a message."], "the chat the switch could not resume holds the notice: \(h.notice)")
+        await h.pass(ClaudeTiming.settle + 5)
+        h.usage.set(B, fiveHour: 100, resetsAt: h.clock.now().addingTimeInterval(3600))
+        let quitsOnBeta = h.quits
+        h.claude.logLimitStop("local_one")
+        await h.pass(600)
+        h.check(h.quits == quitsOnBeta && h.claude.held == B, "no automatic switch while the failure line holds the slot: \(h.claude.actions)")
+        h.store.closeNotice()
+        await h.tick()
+        h.check(h.notice.first == "\(pausedLine) Claude's quit prompt has no Quit anyway button.", "a prompt still without its button shows the pause once that line is closed: \(h.notice)")
+        h.claude.logLimitStop("local_one")
+        await h.pass(600)
+        h.check(h.quits == quitsOnBeta && h.claude.held == B, "still no automatic switch under the paused line: \(h.claude.actions)")
         h.claude.promptHasQuitButton = true
         h.click("Alpha")
         await h.run(until: { h.claude.held == A && !h.switchInFlight }, limit: 600)
