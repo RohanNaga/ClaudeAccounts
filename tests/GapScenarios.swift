@@ -355,8 +355,8 @@ let gapScenarios: [Scenario] = [
         h.check(h.claude.held == B && h.claude.chats(in: B).contains("local_one"), "the person's quit carries the switch on to Beta: \(String(describing: h.claude.held)), \(h.notice)")
     },
 
-    // 17. Decision: colours and the menu-bar display and metric settings stay working.
-    Scenario(pair: "(Menu, colour and menu-bar settings changed)", model: "decision: colours and the menu-bar display and metric stay working until Rohan rules (10)") { h in
+    // 17. Section 10: colours and the menu-bar display and metric settings work.
+    Scenario(pair: "(Menu, colour and menu-bar settings changed)", model: "10: colours and the menu-bar display and metric settings work") { h in
         await h.standard()
         h.check(h.store.menuBarTitle == "Alpha 20%", "setup: the title shows the seat in use and its 5-hour meter: \(h.store.menuBarTitle)")
         h.store.settings.metric = .weekly
@@ -502,6 +502,41 @@ let gapScenarios: [Scenario] = [
         h.check(h.noticeHas("Allow Accessibility"), "the Accessibility line shows once that line is closed: \(h.notice)")
         await h.pass(10 * 60)
         h.check(!h.noticeHas("Couldn't resume"), "the chat is named once: \(h.notice)")
+    },
+    // 24. Sections 6.7 and 7: a switch the person starts during an in-place resume stops that resume
+    // and carries its chats. A wrap-up's chat waits only on the app's own list, so the switch can't
+    // find it in Claude's run: only the carried set takes it to Beta.
+    Scenario(pair: "(Resuming in place after a wrap-up, the chat not on screen, click Switch on T)", model: "7: a second switch request during a resume cancels the resume and carries its chats over; 6.7: they get one \"resume\" after the new seat's confirm") { h in
+        await h.standard(onScreen: false)
+        let start = h.now
+        let resetA = start.addingTimeInterval(737)
+        for s in [B, C] { h.usage.set(s, fiveHour: 100, resetsAt: start.addingTimeInterval(4 * 3600)) }
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        h.claude.logTurnEnded("local_one")
+        h.usage.set(A, fiveHour: 100, resetsAt: resetA)
+        await h.pass(120)
+        h.check(h.noticeHas("Every seat is out") && h.claude.actions.isEmpty, "setup: the wrap-up waits, every seat out: \(h.notice), \(h.claude.actions)")
+        let usage = h.usage
+        h.clock.after(resetA.timeIntervalSince(h.now) - 5) { usage.set(A, fiveHour: 0, resetsAt: resetA.addingTimeInterval(5 * 3600)) }
+        await h.run(until: { h.claude.actions.contains { $0.hasPrefix("open ") } }, limit: 30 * 60)
+        h.check(h.claude.held == A && h.quits == 0, "setup: Alpha reset and the in-place resume opened the chat: \(h.claude.actions)")
+        // The chat never shows its message box on Alpha; a few minutes into the retries the person
+        // switches, and on Beta the chat shows it.
+        await h.pass(2 * 60 + ClaudeTiming.resumeEvery / 2)
+        h.click("Beta")
+        h.claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
+        var sentAt: Date? = nil, namedB: Date? = nil
+        await h.run(until: {
+            if namedB == nil, h.claude.held == B { namedB = h.now }
+            if sentAt == nil, !h.claude.sent.isEmpty { sentAt = h.now }
+            return false
+        }, limit: 10 * 60)
+        h.check(h.claude.held == B && h.claude.chats(in: B).contains("local_one"), "the switch went to Beta with the chat: \(String(describing: h.claude.held)), \(h.claude.actions)")
+        h.check(namedB.map { n in sentAt.map { $0 >= n.addingTimeInterval(Spec.settle - 5) } ?? false } ?? false,
+                "nothing typed before Beta's confirm: typed \(secs(namedB, sentAt)) after Claude named Beta, \(h.claude.actions)")
+        h.check(h.claude.sent == ["local_one resume"], "the chat gets exactly one resume: typed \(h.claude.sent)")
+        await h.pass(35 * 60)
+        h.check(!h.noticeHas("Couldn't resume") && h.claude.sent == ["local_one resume"], "the stopped in-place resume names nothing later: \(h.notice), typed \(h.claude.sent)")
     },
 ]
 
