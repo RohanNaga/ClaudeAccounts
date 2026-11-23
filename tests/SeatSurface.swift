@@ -57,6 +57,11 @@ enum ShownState: Equatable { case switching, inUse, needsSignIn, out, ready }
         guard let i = cards.firstIndex(where: { $0.contains { $0.name == row } }) else { return nil }
         return cards[..<i].reduce(0) { $0 + MenuLayout.cardHeight($1, expanded: nil) + MenuLayout.cardGap }
     }
+    /// The rows on the card the menu scrolls to as it opens (nil: it stays at the top).
+    var openScrollCard: [String]? {
+        guard let id = MenuLayout.openScrollTarget(store.seats) else { return nil }
+        return MenuLayout.cards(store.seats).first { $0[0].id.account == id }?.map(\.name)
+    }
     /// The stand-in's write mark inside a seat's saved login: which of Claude's cookie writes it copied.
     func savedMark(_ seat: StandSeat) -> String? {
         claude.writeMark(in: SavedLogins.dir(seat.identity).appendingPathComponent("current/cookies.db"))

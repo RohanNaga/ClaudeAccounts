@@ -782,6 +782,7 @@ let scenarios: [Scenario] = [
         h.check(h.state("Row 25") == .inUse, "Row 25 is in use: \(String(describing: h.state("Row 25")))")
         let top = h.cardTop("Row 25")
         h.check(top.map { $0 > m.height - m.pinned } == true, "Row 25's card starts below the unscrolled cards: at \(String(describing: top)) of a \(m.height - m.pinned) pt viewport")
+        h.check(h.openScrollCard?.contains("Row 25") == true, "the menu opens scrolled to Row 25's card: it scrolls to \(String(describing: h.openScrollCard))")
     },
     // Section 6 steps, section 8 invariants and section 9 cases.
     Scenario(pair: "(Switch step 2, quit prompt cancelled)", model: "\"Switch cancelled\", nothing changed") { h in
