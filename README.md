@@ -112,7 +112,7 @@ header's `···` menu turns the automatic part off.
 
 | Where | What | When |
 |---|---|---|
-| `~/Library/Application Support/ClaudeAccounts` | Everything the app keeps: accounts, per-account Claude Code logins (each pinned to its organization by a `forceLoginOrgUUID` line in its own `settings.json`), saved Claude logins, backups, settings, the usage cache | Always |
+| `~/Library/Application Support/ClaudeAccounts` | Everything the app keeps: accounts, per-account Claude Code logins (each pinned to its organization by a `forceLoginOrgUUID` line in its own `settings.json`), saved Claude logins, backups, settings, the usage cache, and `diagnostics.jsonl`: one line per change of Claude's state, a row's state, the automatic decision or a switch, with its time, state names and row numbers only, never a name, email, id or token. It never leaves the Mac | Always |
 | Login keychain | One `Claude Code-credentials-<hash>` item per account, written by Claude Code | Adding or signing in to an account |
 | `api.anthropic.com/api/oauth/usage` | Each account's usage, about once a minute | Always; this is the only network traffic |
 | `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Written only on **Switch** or **Set Up**, with Claude quit; the account in use's cookie rows and keys are also read (copied into its saved login) once Claude has stayed on it for a minute; the folder names in `claude-code-sessions` are also read to find an account's other organizations |
@@ -311,7 +311,7 @@ The binary is at `Claude Accounts.app/Contents/MacOS/ClaudeAccounts`.
 
 | Command | What it does |
 |---|---|
-| `--status` | Prints what a switch would act on |
+| `--status` | Prints Claude's state, whether automatic switching is on, each row's state by its label, and the automatic decision. It reads the same facts as the menu and changes nothing |
 | `--switch <name>` | Runs a switch to the row named by id, label, email or the email's first part |
 | `--auto-switch` | Runs the Auto-Switch rule once: if Claude's log shows it stopped a chat of the account in use for usage, switches to the next row in the menu's order that is set up and has room, judged on the usage the menu last read. With `--dry-run` it prints the rows in that order and the one it would choose |
 | `--unattended` | With `--switch`, answers Claude's quit prompt with Quit anyway (implied by `--auto-switch`) |

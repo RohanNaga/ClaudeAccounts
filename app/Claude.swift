@@ -8,12 +8,13 @@
 
 import AppKit
 import ApplicationServices
+import UserNotifications
 
 // MARK: - The world
 
 /// The Claude desktop app as the app sees it: where its files are, its processes and windows,
 /// how it quits and launches, and what its Accessibility tree offers. Every method is a single
-/// primitive; the rules that combine them (QuitWatch, LogFollower, ResumeRule) stay in the app.
+/// primitive; the rules that combine them (QuitWatch, ResumeRule) stay in the app.
 protocol ClaudeWorld: Sendable {
     /// The home folder Claude's files and the Claude Code CLI live under.
     var home: URL { get }
@@ -24,6 +25,8 @@ protocol ClaudeWorld: Sendable {
     var dataDir: URL { get }
     /// Claude's log folder, holding main.log and its rotations main1.log to main4.log.
     var logDir: URL { get }
+    /// Claude is on this Mac.
+    var installed: Bool { get }
     /// Claude's main executable, which identifies its processes.
     func executable() -> String
     /// Claude's main process ids.
@@ -50,6 +53,17 @@ protocol ClaudeWorld: Sendable {
     func send(_ text: String, session: String, in owners: [pid_t], trace: (String) -> Void) -> ChatComposer.Sent
     /// Seconds since anyone used this Mac's keyboard, mouse or trackpad.
     func idleSeconds() -> TimeInterval
+    /// Post a notification on this Mac: an automatic outcome the person may not be watching.
+    func notify(title: String, body: String)
+    /// A switch step is about to run, on the switch's own task, after the journal names it.
+    /// Nothing happens on a real Mac; a test faults the step here.
+    func willStep(_ step: String) async
+}
+
+extension ClaudeWorld {
+    /// A stand-in Claude is installed unless its test says otherwise.
+    var installed: Bool { true }
+    func willStep(_ step: String) async {}
 }
 
 /// The time the app reads and waits on. Tests advance a virtual one instead of sleeping.
@@ -148,6 +162,8 @@ struct RealClaudeWorld: ClaudeWorld {
     var dataDir: URL { home.appendingPathComponent("Library/Application Support/Claude") }
     var logDir: URL { home.appendingPathComponent("Library/Logs/Claude") }
 
+    var installed: Bool { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) != nil }
+
     func executable() -> String {
         let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId)?.path ?? "/Applications/Claude.app"
         return bundle + "/Contents/MacOS/Claude"
@@ -195,6 +211,59 @@ struct RealClaudeWorld: ClaudeWorld {
     func idleSeconds() -> TimeInterval {
         CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
     }
+    func notify(title: String, body: String) { Notify.post(title, body) }
+}
+
+// MARK: - Notifications
+
+/// A macOS notification, for a switch nobody watched, posted by the app itself so it shows the
+/// app's name and icon. It shows on this Mac only, once macOS allows the app to post them.
+enum Notify {
+    /// Keeps a notification on screen while the menu is open, when macOS counts the app as in front.
+    private final class Presenter: NSObject, UNUserNotificationCenterDelegate {
+        func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                    withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+            done([.banner, .list])
+        }
+    }
+    private static let presenter = Presenter()
+
+    /// Only a process inside the app bundle has the app's identity to post with.
+    private static var center: UNUserNotificationCenter? {
+        Bundle.main.bundleIdentifier == nil ? nil : UNUserNotificationCenter.current()
+    }
+
+    /// The menu app calls this at launch. The first time, macOS asks whether Claude Accounts may
+    /// post notifications; the command line posts with the answer given there.
+    static func requestPermission() {
+        center?.delegate = presenter
+        center?.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// Whether macOS lets the app post notifications, for --status.
+    static func permission() -> String {
+        guard let center else { return "unknown: not run from the app bundle" }
+        let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var status = UNAuthorizationStatus.notDetermined
+        center.getNotificationSettings { status = $0.authorizationStatus; done.signal() }
+        guard done.wait(timeout: .now() + 5) == .success else { return "unknown" }
+        switch status {
+        case .authorized, .provisional, .ephemeral: return "allowed"
+        case .denied: return "not allowed (System Settings > Notifications > Claude Accounts)"
+        default: return "not asked yet: the menu app asks at launch"
+        }
+    }
+
+    /// Post at once, and return once macOS has the request, because the command line exits next.
+    static func post(_ title: String, _ body: String) {
+        guard let center else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let done = DispatchSemaphore(value: 0)
+        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { _ in done.signal() }
+        _ = done.wait(timeout: .now() + 5)
+    }
 }
 
 // MARK: - Claude's files
@@ -211,6 +280,9 @@ enum ClaudeFiles {
     static let rotations = 1...4
     /// The cookie that holds Claude's sign-in.
     static let signInCookie = "sessionKey"
+    /// The cookie hosts that hold the sign-in, as an SQL list, and the cookie database's schema version.
+    static let cookieHosts = "('.claude.ai','claude.ai')"
+    static let cookieSchemaVersion = "24"
     /// config.json: the account Claude last ran as, and its cached tokens.
     static let lastKnownAccount = "lastKnownAccountUuid"
     static let loginConfigKeys = ["oauth:tokenCache", "oauth:tokenCacheV2", lastKnownAccount]
@@ -230,8 +302,7 @@ enum ClaudeFiles {
 
 // MARK: - Claude's log
 
-/// The shapes of the lines in Claude's main.log the app reads. The rules that use them are
-/// LogFollower and QuitWatch in Rules.swift and the quit loop in ClaudeApp.
+/// The shapes of the lines in Claude's main.log the app reads. ClaudeEvents in Rules.swift reads them.
 enum ClaudeLog {
     /// Every line starts with Claude's local time in this format.
     static let timeFormat = "yyyy-MM-dd HH:mm:ss"
@@ -258,10 +329,6 @@ enum ClaudeLog {
         "Your org is out of usage", "Your seat type doesn't include", "Your usage allocation has been disabled",
         "Your group's usage limit is set to $0", "requires usage credits",
     ]
-    /// The quit prompt's outcome: Claude vetoed the quit, deferred it until chats finish, or quit.
-    static let quitVetoed = "vetoed by before-quit interceptor"
-    static let quitDeferred = "[updater-guard] restart deferred"
-    static let quitHandler = "beforeQuit: handler fired"
 }
 
 // MARK: - Claude's Accessibility elements
@@ -270,6 +337,8 @@ enum ClaudeLog {
 enum ClaudeUI {
     /// The quit prompt's button that quits with chats still running.
     static let quitAnyway = "Quit anyway"
+    /// The quit prompt's button that keeps Claude open; an automatic switch that gives up presses it.
+    static let cancel = "Cancel"
     /// The role of the element that holds one chat; its URL ends in the session id.
     static let chatRole = "AXWebArea"
     /// The message box's accessibility name.
