@@ -19,6 +19,8 @@ private enum Spec {
     static let meterOnTurnEnd: TimeInterval = 60
     static let coolDown: TimeInterval = 10 * 60
     static let autoQuitWait: TimeInterval = 3 * 60
+    /// A relaunched hold settles for 60 s before the decision may act on it.
+    static let settle: TimeInterval = 60
 }
 
 /// A pair no row names: the account Claude opens on when it ignores the loaded sign-in.
@@ -128,7 +130,7 @@ let gapScenarios: [Scenario] = [
         await h.run(until: { h.claude.held == C && h.state("Gamma") == .inUse && !h.switchInFlight }, limit: 900)
         let next = h.claude.at("quit").dropFirst(2).first
         h.check(h.claude.held == C, "the next target, Gamma, is tried, not Beta again: holds \(String(describing: h.claude.held)), \(h.claude.actions)")
-        h.check(next.map { $0.timeIntervalSince(failed) <= Limits.settle + 15 } ?? false,
+        h.check(next.map { $0.timeIntervalSince(failed) <= Spec.settle + 15 } ?? false,
                 "the decision ran again at once (once the relaunched hold settled): next quit \(secs(failed, next)) after the undo")
         h.check(h.resumed("local_one"), "the chat the limit stopped is resumed on Gamma: sent \(h.claude.sent), Gamma's folder \(h.claude.chats(in: C))")
         // Gamma runs out inside the cool-down: Alpha is out and Beta failed, so nothing to switch to.
@@ -144,6 +146,7 @@ let gapScenarios: [Scenario] = [
         await h.run(until: { h.claude.held == B && !h.switchInFlight }, limit: 600)
         h.check(h.claude.held == B, "the switch after the cool-down goes to Beta: holds \(String(describing: h.claude.held)), \(h.notice)")
         h.check(Limits.coolDown == Spec.coolDown, "coolDown is 10 min: \(Limits.coolDown)")
+        h.check(Limits.settle == Spec.settle, "a relaunched hold settles for 60 s: \(Limits.settle)")
     },
 
     // 6. Section 5: quitWait 3 min on an automatic switch.
@@ -166,6 +169,10 @@ let gapScenarios: [Scenario] = [
         await h.pass(10 * 60)
         h.check(h.claude.at("quit").count == quits && h.claude.at("launch").isEmpty, "and stops: no further quit request, no launch: \(h.claude.actions.suffix(6))")
         h.check(h.claude.held == A && h.claude.signInOnDisk() == A && h.claude.chats(in: A).contains("local_one"), "nothing changed: Claude on Alpha with its chat")
+        // Stopped until a new signal: the next limit stop starts a switch again.
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.at("quit").count > quits }, limit: 300)
+        h.check(h.claude.at("quit").count > quits, "a new limit stop asks Claude to quit again: \(h.claude.actions.suffix(4))")
     },
 
     // 7. Sections 3 and 7: a stale meter is not an automatic target.
