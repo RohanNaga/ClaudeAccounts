@@ -425,15 +425,6 @@ enum ClaudeApp {
         return text.range(of: ClaudeLog.appStart, options: .backwards).map { String(text[$0.lowerBound...]) } ?? text
     }
 
-    /// Claude's last two log files read in order: who it is now (or was when it last quit), since
-    /// when, and the organizations whose sign-in it refused.
-    static func currentLog() -> LogFollower {
-        var follower = LogFollower()
-        follower.read(readLines(logDir.appendingPathComponent(ClaudeFiles.rotatedLog(1)), from: 0).text)
-        follower.read(readLines(log, from: 0).text)
-        return follower
-    }
-
     /// Claude's last two log files read in order as the model's events (F3).
     static func events() -> ClaudeEvents {
         var events = ClaudeEvents()
@@ -441,9 +432,6 @@ enum ClaudeApp {
         events.read(readLines(log, from: 0).text)
         return events
     }
-
-    /// Who Claude is signed in as now, or was when it last quit, from its own log.
-    static func currentIdentity() -> Identity? { currentLog().identity }
 
     // MARK: Sessions
 
@@ -476,29 +464,6 @@ enum ClaudeApp {
     }
 
     static func lastActivity(_ url: URL) -> Double { (record(url)?[ClaudeFiles.lastActivityAt] as? Double) ?? 0 }
-}
-
-/// Follows Claude's log, reading only what is new: the account Claude reports, for the menu, and
-/// the chats of that account Claude stopped for usage, for auto-switch.
-final class LogWatcher {
-    private var mark: ClaudeApp.LogMark?
-    private(set) var log = LogFollower()
-
-    func poll() -> Identity? {
-        let now = ClaudeApp.logMark()
-        if let mark, mark.inode == now.inode, mark.offset <= now.offset {
-            let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: mark.offset)
-            log.read(text)
-            self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
-        } else {
-            log = LogFollower()
-            log.read(ClaudeApp.readLines(ClaudeApp.logDir.appendingPathComponent(ClaudeFiles.rotatedLog(1)), from: 0).text)
-            let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: 0)
-            log.read(text)
-            self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
-        }
-        return log.identity
-    }
 }
 
 /// One account's saved Claude app login: its claude.ai cookie rows (still encrypted with
@@ -606,7 +571,7 @@ enum SavedLogins {
         try JSONEncoder().encode(meta).write(to: new.appendingPathComponent("login.json"), options: .atomic)
         guard check(new, seat) == meta else { throw SwitchError.inconsistent }
         if whileRunning {
-            guard ClaudeApp.currentIdentity() == seat, ClaudeApp.savedAccount() == seat.account else { throw SwitchError.inconsistent }
+            guard ClaudeApp.events().hold?.seat == seat, ClaudeApp.savedAccount() == seat.account else { throw SwitchError.inconsistent }
         }
         // The proven copy moves aside, never away, until the new one reads back.
         if check(current, seat) != nil {
@@ -1192,99 +1157,6 @@ enum ChatResume {
 
 }
 
-// MARK: - Usage cache and auto-switch state
-
-/// The last good reading per account, kept so a relaunch shows numbers without asking again
-/// and so `--auto-switch` on the command line decides from what the menu last read.
-enum UsageCache {
-    struct Entry: Codable {
-        var polledAt: Date
-        var retryAt: Date?
-        var plan: String?
-        var fiveHour: UsageWindow?
-        var weekly: UsageWindow?
-        var loginExpiresAt: Date?
-        /// When the reading shown was taken; a later rate-limited ask doesn't move it.
-        var readAt: Date?
-    }
-
-    static var url: URL { Paths.stateDir.appendingPathComponent("usage-cache.json") }
-
-    static func load() -> [String: Entry] {
-        guard let data = try? Data(contentsOf: url) else { return [:] }
-        return (try? JSONDecoder().decode([String: Entry].self, from: data)) ?? [:]
-    }
-
-    static func save(_ entries: [String: Entry]) {
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: url, options: .atomic)
-    }
-
-    /// The auto-switch rule's view of each row, from cached readings.
-    static func candidates(_ accounts: [AccountRecord], _ entries: [String: Entry], log: LogFollower) -> [SwitchCandidate] {
-        let outUntil = AutoSwitchLog.outUntil()
-        return accounts.map { acct in
-            let e = entries[acct.id]
-            let hasReading = e?.fiveHour != nil || e?.weekly != nil || e?.plan != nil
-            return SwitchCandidate(acct, fiveHour: e?.fiveHour, weekly: e?.weekly,
-                                   readAt: hasReading ? (e?.readAt ?? e?.polledAt) : nil,
-                                   needsSignIn: e?.loginExpiresAt.map { $0.timeIntervalSinceNow < API.signInWarning } ?? false,
-                                   hasSavedLogin: SavedLogins.usable(acct, refusedAt: { log.refusal(of: $0, at: World.now()) }) != nil, outUntil: outUntil[acct.id])
-        }
-    }
-}
-
-extension SwitchCandidate {
-    /// A row with its unrounded meters and their resets.
-    init(_ acct: AccountRecord, fiveHour: UsageWindow?, weekly: UsageWindow?, readAt: Date?, needsSignIn: Bool,
-         hasSavedLogin: Bool, outUntil: Date?) {
-        self.init(id: acct.id, name: acct.label, fiveHour: fiveHour?.utilization, weekly: weekly?.utilization,
-                  readAt: readAt, needsSignIn: needsSignIn, hasSavedLogin: hasSavedLogin,
-                  fiveHourResetsAt: fiveHour?.resetsAt, weeklyResetsAt: weekly?.resetsAt, outUntil: outUntil)
-    }
-}
-
-/// When auto-switch last tried and which rows it left out of usage, shared by the menu and the
-/// command line so the cool-down and that memory hold across both and across relaunches.
-enum AutoSwitchLog {
-    private struct File: Codable {
-        var lastAttempt: Date
-        var outcome: String?
-        /// Rows a switch left because Claude stopped a chat at their limit, each until its reset.
-        var outUntil: [String: Date]?
-    }
-    private static var url: URL { Paths.stateDir.appendingPathComponent("auto-switch.json") }
-
-    private static func load() -> File? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(File.self, from: data)
-    }
-
-    private static func save(_ file: File) {
-        guard let data = try? JSONEncoder().encode(file) else { return }
-        try? data.write(to: url, options: .atomic)
-    }
-
-    static func lastAttempt() -> Date? { load()?.lastAttempt }
-
-    /// Rows still counted as out, by id.
-    static func outUntil(now: Date = World.now()) -> [String: Date] { (load()?.outUntil ?? [:]).filter { $0.value > now } }
-
-    /// An automatic switch starts at `date`, leaving `row` out of usage until `until`.
-    static func started(_ date: Date, leaving row: String, outUntil until: Date) {
-        var out = outUntil(now: date)
-        out[row] = until
-        save(File(lastAttempt: date, outcome: nil, outUntil: out))
-    }
-
-    /// The automatic switch that started last ended with `outcome`.
-    static func finished(_ outcome: String) {
-        guard var file = load() else { return }
-        file.outcome = outcome
-        save(file)
-    }
-}
-
 // MARK: - Store
 
 /// A small JSON file of values keyed by seat pair, in the app's state folder.
@@ -1482,8 +1354,20 @@ final class Store: ObservableObject {
 
     var firstRun: Bool { accounts.isEmpty }
 
-    /// The fuller meter of the seat in use: the menu bar's gauge.
-    var titleMeter: MeterReading? { seats.first { $0.state == .inUse }?.meters.fuller }
+    /// The menu bar's gauge: the seat in use's meter for the chosen limit, or its weekly meter
+    /// when it has no 5-hour one. The display and limit settings stay working until Rohan rules on
+    /// them (model, section 10).
+    var titleMeter: MeterReading? {
+        guard let m = seats.first(where: { $0.state == .inUse })?.meters else { return nil }
+        return settings.metric == .fiveHour ? m.fiveHour ?? m.weekly : m.weekly
+    }
+
+    /// The text beside the gauge, by the display setting.
+    var menuBarTitle: String {
+        guard let meter = titleMeter, settings.display != .gauge, let seat = seats.first(where: { $0.state == .inUse }) else { return "" }
+        let percent = "\(Int(meter.percent.rounded()))%"
+        return settings.display == .gaugePercent ? percent : "\(seat.name) \(percent)"
+    }
 
     // MARK: Tick
 
@@ -1765,6 +1649,23 @@ final class Store: ObservableObject {
     func rename(_ seat: Seat, to name: String, organization: Bool) {
         guard let row = record(for: seat) else { return }
         save(AccountStore.load().renamed(row, to: name, organization: organization))
+    }
+
+    /// Give a seat's account a new colour, on every one of its rows; each row keeps its place.
+    /// Kept working until Rohan rules on per-account colours (model, section 10).
+    func recolor(_ seat: Seat, _ color: String) {
+        guard let row = record(for: seat) else { return }
+        var all = AccountStore.load()
+        for i in all.indices where all[i].id == row.id || (row.accountUuid != nil && all[i].accountUuid == row.accountUuid) {
+            all[i].color = color
+        }
+        save(all)
+    }
+
+    /// Show or fold away the organizations of an account in the menu; settings.json keeps it.
+    /// Kept working until Rohan rules on folding (model, section 10).
+    func setShowsOrganizations(of account: String, _ shown: Bool) {
+        settings.setShowsOrganizations(of: account, shown)
     }
 
     /// Move a seat one place up (-1) or down (1): an organization among its account's, any other
@@ -2090,7 +1991,7 @@ final class LoginFlow: ObservableObject {
     private var rollback: (keychain: (account: String, secret: String)?, profile: Data?)?
 
     /// Start a login. With `target`, sign that account in again in its own folder, so its
-    /// row keeps its place, name and color. Without it, add a new account; it gets its label once
+    /// row keeps its place and name. Without it, add a new account; it gets its label once
     /// sign-in finishes, so the folder gets a random id now. `organization`
     /// (a target's own, or another organization of a known account) is pre-selected on the
     /// sign-in page through Claude Code's `forceLoginOrgUUID` setting in that login's folder.
@@ -2284,12 +2185,16 @@ final class LoginFlow: ObservableObject {
     }
 }
 
-/// The command line has one flag, `--status`, which prints what the app reads and changes
-/// nothing. Switching has one way in, the menu, so one place decides it.
+/// The command line switches nothing: switching has one way in, the menu, so one place decides
+/// it. `--status` prints what the app reads and changes nothing. `--test-resume <session id or
+/// title>` sends "resume" to that one open chat of the seat Claude holds, by the steps a switch
+/// takes after it reopens Claude, once, and prints each step; it takes the switch lock.
 enum Entry {
     static func main() {
         Migration.moveLegacyState()
-        if CommandLine.arguments.contains("--status") { printStatus() }
+        let args = CommandLine.arguments
+        if args.contains("--status") { printStatus() }
+        if let i = args.firstIndex(of: "--test-resume"), i + 1 < args.count { TestResume.run(args[i + 1]) }
         ClaudeAccountsApp.main()
     }
 
@@ -2378,7 +2283,7 @@ struct ClaudeAccountsApp: App {
         MenuBarExtra {
             MenuContent(store: store)
         } label: {
-            Image(nsImage: menuBarImage(title: store.titleMeter.map { "\(Int($0.percent.rounded()))%" } ?? "",
+            Image(nsImage: menuBarImage(title: store.menuBarTitle,
                                         fraction: store.titleMeter.map { $0.percent / 100 } ?? 1.0 / 3,
                                         warning: store.notice?.kind == .failure))
         }
@@ -2388,5 +2293,48 @@ struct ClaudeAccountsApp: App {
             SignInView(store: store)
         }
         .windowResizability(.contentSize)
+    }
+}
+
+/// `--test-resume`: the resume step a switch runs, once, at one chat the person names, printing
+/// each step, so the path that runs with nobody at the Mac can be watched on a chat of their choice.
+enum TestResume {
+    static func run(_ key: String) -> Never {
+        func say(_ line: String) { print(line); fflush(stdout) }
+        guard !ClaudeApp.pids().isEmpty else { say("Claude isn't open."); exit(1) }
+        guard let identity = ClaudeApp.events().hold?.seat else { say("Claude's log doesn't name the account it has open."); exit(1) }
+        let folder = ClaudeApp.folder(identity)
+        let matches = ClaudeApp.openSessionRecords(in: folder).compactMap(ChatResume.chat)
+            .filter { $0.id == key || $0.title.lowercased() == key.lowercased() }
+        guard matches.count == 1, let chat = matches.first else {
+            say(matches.isEmpty ? "No open chat of the account Claude has open has that title or session id."
+                                : "\(matches.count) open chats have that title; name one by its session id:")
+            for match in matches { say("  \(match.id)") }
+            exit(1)
+        }
+        guard SwitchLock.acquire() != nil else { say("A switch is running; try again once it's done."); exit(1) }
+        guard AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary) else {
+            say("This process has no Accessibility access. Run it through the app, which has its own:")
+            say("  open -n -W -o \"$(tty)\" --stderr \"$(tty)\" -a \"\(Bundle.main.bundlePath)\" --args --test-resume \"\(key)\"")
+            exit(1)
+        }
+        say("Chat: \(chat.title) (\(chat.id))")
+        let resumer = ChatResume.resumer(in: folder, reopenedAt: Date().timeIntervalSince1970 * 1000, retrying: false,
+                                         progress: { _ in }, echo: { say("  " + $0) })
+        final class Box: @unchecked Sendable { var reports: [ChatResumer.Report] = [] }
+        let box = Box(), done = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.reports = await resumer.run([chat])
+            done.signal()
+        }
+        done.wait()
+        let result = box.reports.first?.result ?? .notResumed("not tried")
+        switch result {
+        case .sent: say("Result: sent \u{201C}\(ResumeRule.message)\u{201D}, and the chat is running.")
+        case .running: say("Result: the chat was already running, so nothing was sent.")
+        case .draft: say("Result: its message box holds unsent text, so nothing was sent.")
+        case .notResumed(let why): say("Result: not running: \(why).")
+        }
+        exit(result.runningAgain ? 0 : 1)
     }
 }
