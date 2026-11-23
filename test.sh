@@ -29,21 +29,15 @@ if ! grep -q 'Text(msg).*fixedSize(horizontal: false, vertical: true)' <<<"$stat
 fi
 echo "Status line wraps: ok"
 
-# A manual switch is the person's call: a row's action comes from RowAction (tested above), which
-# never reads usage, and the switch itself never checks whether the target is out.
+# Manual Switch, Set Up and the automatic switch run one procedure, which never reads meters:
+# a manual switch is the person's call (model, section 6).
 section() { awk -v start="$1" '$0 ~ start {f=1; print; next} f && /^(enum|struct|final class|class|extension) / {exit} f' "$ROOT/app/$2"; }
-if ! grep -q 'RowAction.pick' <<<"$(section '^struct AccountRow' Views.swift)" \
-   || grep -qE 'isOut|atLimit|MeterRule|AutoSwitchRule' <<<"$(section '^enum SwitchEngine' ClaudeAccounts.swift)"; then
-  echo "FAIL: a row's action must come from RowAction, and a manual switch must not check the target's usage"; exit 1
+if ! grep -q 'Switch.run(request' <<<"$(section '^final class Store' ClaudeAccounts.swift)" \
+   || ! grep -q 'case manual, auto, setUp' <<<"$(section '^struct SwitchJournal' ClaudeAccounts.swift)" \
+   || grep -qE 'meters|Usage\.|OutRule|isFresh' <<<"$(section '^enum Switch ' ClaudeAccounts.swift)"; then
+  echo "FAIL: every switch must run Switch.run, with Set Up as one of its kinds, and Switch must not read usage"; exit 1
 fi
-echo "Manual switch to any row: ok"
-
-# A confirmed set-up brings the previous row's chats over through the switch's own move and reopen.
-if ! grep -q 'moveSessions(from: previous.id' <<<"$(awk '/private static func setUpLocked/,/struct Prepared/' "$ROOT/app/ClaudeAccounts.swift")" \
-   || ! grep -q 'await reopen(as: want' <<<"$(awk '/private static func setUpLocked/,/struct Prepared/' "$ROOT/app/ClaudeAccounts.swift")"; then
-  echo "FAIL: a confirmed set-up must move the previous row's chats with moveSessions and reopen like a switch"; exit 1
-fi
-echo "Set up brings the chats: ok"
+echo "One switch for every way in: ok"
 
 swiftc -module-cache-path "$OUT" -o "$OUT/prompt-fixture" "$ROOT/tests/PromptFixture.swift"
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/prompt-test" \
