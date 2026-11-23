@@ -14,14 +14,13 @@ import Foundation
 /// on keyboard focus.
 enum ChatComposer {
     /// What Claude calls its message box, compared without case.
-    static let promptName = "prompt"
+    static let promptName = ClaudeUI.promptName
     /// What a send control is called, compared without case.
-    static let sendNames: Set<String> = ["send", "send message", "send prompt", "submit"]
+    static let sendNames = ClaudeUI.sendNames
     /// What the control that stops a running turn is called, compared without case.
-    static let stopNames: Set<String> = ["stop", "stop response", "stop generating", "interrupt"]
+    static let stopNames = ClaudeUI.stopNames
     /// Never pressed as the send control, by the start of their names.
-    static let neverPress = ["retry", "rewind", "stop", "interrupt", "fork", "cancel", "delete", "remove",
-                             "edit", "copy", "undo", "clear", "reject", "deny", "dismiss", "discard"]
+    static let neverPress = ClaudeUI.neverPress
     /// How long Claude may take to show Send once the text is in the box, and to take the message once it is pressed.
     static let sendWait: TimeInterval = 3
 
@@ -97,14 +96,14 @@ enum ChatComposer {
         trace("put \u{201C}\(text)\u{201D} in it and read it back")
         // Claude shows Send once its page has the text: look for it until it appears.
         var control: (element: AXUIElement, name: String)?
-        let deadline = Date().addingTimeInterval(sendWait)
+        let deadline = World.now().addingTimeInterval(sendWait)
         repeat {
             if let again = webAreas(showing: session, in: pids).first.flatMap(composer(in:)) {
                 control = sendControl(again, appearedSince: before)
             }
             if control != nil { break }
             usleep(100_000)
-        } while Date() < deadline
+        } while World.now() < deadline
         guard let control else {
             empty(found.prompt)
             return .refused("its send button never appeared")
@@ -113,12 +112,12 @@ enum ChatComposer {
         // the press is judged by what the chat shows next: the text gone from the box, or Stop.
         AXUIElementPerformAction(control.element, kAXPressAction as CFString)
         trace("pressed \(control.name)")
-        let pressedAt = Date()
+        let pressedAt = World.now()
         repeat {
             let now = webAreas(showing: session, in: pids).first.flatMap(composer(in:))
             if now?.stop != nil || now?.empty == true { return .pressed(control.name) }
             usleep(100_000)
-        } while Date().timeIntervalSince(pressedAt) < sendWait
+        } while World.now().timeIntervalSince(pressedAt) < sendWait
         empty(found.prompt)
         return .refused("its send button didn't take the message")
     }
@@ -134,7 +133,7 @@ enum ChatComposer {
                 var found: [AXUIElement] = []
                 var budget = 20000
                 collect(window, depth: 0, budget: &budget) { element in
-                    guard attribute(element, kAXRoleAttribute) as? String == "AXWebArea",
+                    guard attribute(element, kAXRoleAttribute) as? String == ClaudeUI.chatRole,
                           let url = attribute(element, kAXURLAttribute) as? URL, url.lastPathComponent == session else { return false }
                     found.append(element)
                     return true
@@ -152,7 +151,7 @@ enum ChatComposer {
         var budget = 20000
         collect(area, depth: 0, budget: &budget) { element in
             let role = attribute(element, kAXRoleAttribute) as? String
-            if role == "AXWebArea", !CFEqual(element, area) { return true }
+            if role == ClaudeUI.chatRole, !CFEqual(element, area) { return true }
             if role == kAXTextAreaRole || role == kAXTextFieldRole, settable(element, kAXValueAttribute) { boxes.append(element) }
             return false
         }
@@ -262,8 +261,8 @@ enum ChatComposer {
 
 /// The clock the resume step's waits run on, so the fixture test advances it instead of waiting.
 struct ResumeClock {
-    var now: () -> Date = Date.init
-    var sleep: (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+    var now: () -> Date = { World.now() }
+    var sleep: (TimeInterval) async -> Void = { await World.sleep($0) }
 }
 
 /// Gets every chat a quit cut off or a usage limit stopped running again after a switch: lets
@@ -282,11 +281,9 @@ struct ChatResumer {
     var progress: (String) -> Void = { _ in }
     /// Each step it takes, for the app's resume log and `--test-resume`.
     var trace: (String) -> Void = { _ in }
-    var trusted: () -> Bool = { AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary) }
+    var trusted: () -> Bool = { World.claude.trusted }
     /// Seconds since anyone used this Mac's keyboard, mouse or trackpad.
-    var idleSeconds: () -> TimeInterval = {
-        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
-    }
+    var idleSeconds: () -> TimeInterval = { World.claude.idleSeconds() }
     var clock = ResumeClock()
     /// Try again on ResumeRule's schedule; off for a single pass.
     var retrying = true
@@ -348,8 +345,8 @@ struct ChatResumer {
         if sentBefore { return (.notResumed(Self.noReply), false) }
         guard trusted() else { return (.notResumed("Claude Accounts has no Accessibility access"), false) }
         guard !pids().isEmpty else { return (.notResumed("Claude isn't open"), false) }
-        ChatComposer.exposeWebContent(of: pids())
-        if pass > 1, ChatComposer.screen(session: chat.id, in: pids()) == nil,
+        World.claude.exposeWebContent(of: pids())
+        if pass > 1, World.claude.chatScreen(session: chat.id, in: pids()) == nil,
            !ResumeRule.mayRetry(secondsSinceInput: idleSeconds()) {
             trace("\(chat.title): someone is using the Mac, so it isn't opened on this pass")
             return nil
@@ -366,7 +363,7 @@ struct ChatResumer {
         var said = ""
         while true {
             guard current() else { return (.notResumed(Self.superseded), false) }
-            let screen = ChatComposer.screen(session: chat.id, in: pids())
+            let screen = World.claude.chatScreen(session: chat.id, in: pids())
             let state = Self.describe(screen)
             if state != said { trace(state); said = state }
             if let screen, screen.composer, !screen.loading, readyAt == nil { readyAt = clock.now() }
@@ -378,14 +375,14 @@ struct ChatResumer {
             case .done(let result):
                 return (result, false)
             case .send:
-                switch ChatComposer.send(ResumeRule.message, session: chat.id, in: pids(), trace: trace) {
+                switch World.claude.send(ResumeRule.message, session: chat.id, in: pids(), trace: trace) {
                 case .busy: return (.running, false)
                 case .draft: return (.draft, false)
                 case .refused(let why): return (.notResumed(why), false)
                 case .pressed:
                     var how = ""
                     let started = await poll(ResumeRule.startWait, every: 0.25) {
-                        if ChatComposer.screen(session: chat.id, in: pids())?.busy == true { how = "Stop appeared"; return true }
+                        if World.claude.chatScreen(session: chat.id, in: pids())?.busy == true { how = "Stop appeared"; return true }
                         if running(chat) { how = "Claude recorded new activity in the chat"; return true }
                         return false
                     }

@@ -16,13 +16,13 @@ import UserNotifications
 // MARK: - Paths and constants
 
 enum Paths {
-    static let home = FileManager.default.homeDirectoryForCurrentUser
+    static var home: URL { World.claude.home }
     /// Where the app keeps its state, so the app bundle can be installed anywhere.
-    static let stateDir = home.appendingPathComponent("Library/Application Support/ClaudeAccounts")
+    static var stateDir: URL { World.claude.stateDir }
     /// Before 0.3 the state sat in a `data` folder beside the app bundle.
     static let legacyStateDir = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("data")
-    static let accountsFile = stateDir.appendingPathComponent("accounts.json")
-    static let loginsDir = stateDir.appendingPathComponent("logins")
+    static var accountsFile: URL { stateDir.appendingPathComponent("accounts.json") }
+    static var loginsDir: URL { stateDir.appendingPathComponent("logins") }
 }
 
 enum API {
@@ -37,57 +37,6 @@ enum API {
 }
 
 // MARK: - Process helpers
-
-struct ProcResult {
-    let status: Int32
-    let out: String
-    let err: String
-}
-
-/// Run a process to completion on a background thread. The work blocks, so it runs on a
-/// dispatch queue rather than tying up one of Swift concurrency's few cooperative threads.
-func runProcess(_ path: String, _ args: [String], env: [String: String]? = nil,
-                cwd: URL? = nil, timeout: TimeInterval = 30) async -> ProcResult {
-    await withCheckedContinuation { cont in
-        DispatchQueue.global().async {
-            cont.resume(returning: runProcessBlocking(path, args, env: env, cwd: cwd, timeout: timeout))
-        }
-    }
-}
-
-/// Drains both pipes concurrently so a large output (the keychain dump) can't fill a
-/// pipe and deadlock, and terminates the process if it outlives the timeout.
-private func runProcessBlocking(_ path: String, _ args: [String], env: [String: String]?,
-                                cwd: URL?, timeout: TimeInterval) -> ProcResult {
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: path)
-    proc.arguments = args
-    if let env { proc.environment = env }
-    if let cwd { proc.currentDirectoryURL = cwd }
-    let outPipe = Pipe(), errPipe = Pipe()
-    proc.standardOutput = outPipe
-    proc.standardError = errPipe
-    proc.standardInput = FileHandle.nullDevice
-    do { try proc.run() } catch {
-        return ProcResult(status: -1, out: "", err: error.localizedDescription)
-    }
-    let killer = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
-    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
-    var errData = Data()
-    let group = DispatchGroup()
-    group.enter()
-    DispatchQueue.global().async {
-        errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        group.leave()
-    }
-    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-    group.wait()
-    proc.waitUntilExit()
-    killer.cancel()
-    return ProcResult(status: proc.terminationStatus,
-                      out: String(decoding: outData, as: UTF8.self),
-                      err: String(decoding: errData, as: UTF8.self))
-}
 
 enum ClaudeCLI {
     /// The CLI isn't on a menu bar app's PATH, so look in the usual install locations.
@@ -287,11 +236,30 @@ enum AccountState: Equatable {
     }
 }
 
+/// Reads one account's usage. Production asks the usage service with the account's own login;
+/// a test scripts the meter instead.
+protocol UsageReader: Sendable {
+    func state(for acct: AccountRecord) async -> AccountState
+}
+
+struct ServiceUsageReader: UsageReader {
+    func state(for acct: AccountRecord) async -> AccountState { await Usage.state(for: acct) }
+}
+
 enum Usage {
+    nonisolated(unsafe) private(set) static var reader: any UsageReader = ServiceUsageReader()
+
+    /// Script the meter for a test. Only after `World.install`, so a test never mixes scripted
+    /// usage with the real Claude.
+    static func install(_ reader: any UsageReader) {
+        precondition(World.isTest, "install a test world before scripting usage")
+        self.reader = reader
+    }
+
     /// Return a login with time left on its access token, renewing through the CLI if needed.
     static func freshCredential(_ acct: AccountRecord) async -> Credential? {
         if let cred = await Keychain.credential(service: acct.keychainService),
-           cred.expiresAt / 1000 - Date().timeIntervalSince1970 > API.refreshMargin {
+           cred.expiresAt / 1000 - World.now().timeIntervalSince1970 > API.refreshMargin {
             return cred
         }
         // `auth status` only reads the stored login; `/usage` calls the API, which makes the CLI
@@ -305,7 +273,7 @@ enum Usage {
     static func state(for acct: AccountRecord) async -> AccountState {
         // Past the fixed deadline no renewal can succeed, so skip straight to asking.
         if let stored = await Keychain.credential(service: acct.keychainService),
-           let deadline = stored.refreshTokenExpiresAt, deadline / 1000 < Date().timeIntervalSince1970 {
+           let deadline = stored.refreshTokenExpiresAt, deadline / 1000 < World.now().timeIntervalSince1970 {
             return .needsLogin("Login expired.")
         }
         guard let cred = await freshCredential(acct) else {
@@ -320,7 +288,7 @@ enum Usage {
             if code == 401 { return .needsLogin("Login was rejected.") }
             if code == 429 {
                 let wait = ((resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init) ?? 300
-                return .rateLimited(until: Date().addingTimeInterval(wait))
+                return .rateLimited(until: World.now().addingTimeInterval(wait))
             }
             guard code == 200, let body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return .error("Usage service answered HTTP \(code).")
@@ -341,41 +309,20 @@ enum Usage {
 /// swaps exactly these while Claude is closed, and moves open Code sessions' owner
 /// records to the target account's folder so the same sessions appear after the switch.
 enum ClaudeApp {
-    static let bundleId = "com.anthropic.claudefordesktop"
-    static let dataDir = Paths.home.appendingPathComponent("Library/Application Support/Claude")
-    static let cookies = dataDir.appendingPathComponent("Cookies")
-    static let cookiesJournal = dataDir.appendingPathComponent("Cookies-journal")
-    static let config = dataDir.appendingPathComponent("config.json")
-    static let sessions = dataDir.appendingPathComponent("claude-code-sessions")
-    static let logDir = Paths.home.appendingPathComponent("Library/Logs/Claude")
-    static let log = logDir.appendingPathComponent("main.log")
+    static var bundleId: String { World.claude.bundleId }
+    static var dataDir: URL { World.claude.dataDir }
+    static var cookies: URL { dataDir.appendingPathComponent(ClaudeFiles.cookies) }
+    static var cookiesJournal: URL { dataDir.appendingPathComponent(ClaudeFiles.cookiesJournal) }
+    static var config: URL { dataDir.appendingPathComponent(ClaudeFiles.config) }
+    static var sessions: URL { dataDir.appendingPathComponent(ClaudeFiles.sessions) }
+    static var logDir: URL { World.claude.logDir }
+    static var log: URL { logDir.appendingPathComponent(ClaudeFiles.log) }
 
-    static var executable: String {
-        let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId)?.path ?? "/Applications/Claude.app"
-        return bundle + "/Contents/MacOS/Claude"
-    }
+    static var executable: String { World.claude.executable() }
 
-    /// Claude's main process ids, read from `ps`. Asked from a command-line process, LaunchServices
-    /// once reported a live Claude as not running, and a switch went on to write under it.
-    static func pids() -> [pid_t] {
-        let exe = executable
-        return runProcessBlocking("/bin/ps", ["-axo", "pid=,comm="], env: nil, cwd: nil, timeout: 10).out
-            .split(separator: "\n").compactMap { line in
-                let fields = line.trimmingCharacters(in: .whitespaces)
-                guard let gap = fields.firstIndex(of: " "),
-                      fields[gap...].trimmingCharacters(in: .whitespaces) == exe else { return nil }
-                return pid_t(fields[..<gap])
-            }
-    }
+    static func pids() -> [pid_t] { World.checked(World.claude.pids()) }
 
-    /// Ids of Claude's on-screen windows. Reading ids needs no screen-recording permission.
-    static func windowIDs(_ owners: [pid_t]) -> Set<Int> {
-        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        return Set(list.compactMap { w in
-            guard let owner = w[kCGWindowOwnerPID as String] as? Int32, owners.contains(owner) else { return nil }
-            return w[kCGWindowNumber as String] as? Int
-        })
-    }
+    static func windowIDs(_ owners: [pid_t]) -> Set<Int> { World.claude.windowIDs(owners) }
 
     /// Quit the way ⌘Q does, then wait until the process is gone, so Claude has flushed its
     /// cookies and settings. With a chat mid-reply Claude first asks, in a native alert: Quit
@@ -391,54 +338,49 @@ enum ClaudeApp {
         guard !running.isEmpty else { return (.quit, false) }
         let mark = logMark()
         let windowsBefore = windowIDs(running)
-        for pid in running {
-            if let app = NSRunningApplication(processIdentifier: pid) { app.terminate() }
-            else { _ = await runProcess("/usr/bin/osascript", ["-e", "tell application id \"\(bundleId)\" to quit"]) }
-        }
-        var watch = QuitWatch(unattended: unattended, canAnswer: QuitPrompt.trusted, started: Date())
+        for pid in running { await World.claude.requestQuit(pid) }
+        var watch = QuitWatch(unattended: unattended, canAnswer: World.claude.trusted, started: World.now())
         var firstTry: Date?
         var shown: String?
         while true {
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            await World.sleep(0.5)
             let alive = !pids().isEmpty
             let text = alive ? logText(since: mark) : ""
-            let veto = text.range(of: "vetoed by before-quit interceptor")
+            let veto = text.range(of: ClaudeLog.quitVetoed)
             let afterVeto = veto.map { text[$0.upperBound...] } ?? ""
             let seen = QuitObservation(
                 claudeRunning: alive,
                 // Accessibility finds the prompt by its Quit anyway button; a window Claude opened
                 // after the request also counts, which covers a prompt without that button.
-                promptOpen: alive && (QuitPrompt.isOpen(in: running) || !windowIDs(running).subtracting(windowsBefore).isEmpty),
+                promptOpen: alive && (World.claude.quitPromptOpen(in: running) || !windowIDs(running).subtracting(windowsBefore).isEmpty),
                 vetoLogged: veto != nil,
-                waitLogged: afterVeto.contains("[updater-guard] restart deferred"),
-                quitLoggedAfterVeto: afterVeto.contains("beforeQuit: handler fired"))
-            switch watch.step(seen, now: Date()) {
+                waitLogged: afterVeto.contains(ClaudeLog.quitDeferred),
+                quitLoggedAfterVeto: afterVeto.contains(ClaudeLog.quitHandler))
+            switch watch.step(seen, now: World.now()) {
             case .done(let outcome): return (outcome, watch.answeredAt != nil)
             case .wait(let what):
                 if what != shown { shown = what; progress(what) }
             case .answer:
-                if QuitPrompt.press(QuitPrompt.quitAnyway, in: running) {
-                    watch.answered(at: Date())
-                    progress("Answered Claude's prompt with \(QuitPrompt.quitAnyway)…")
-                } else if Date().timeIntervalSince(firstTry ?? Date()) > QuitPrompt.findTimeout {
+                if World.claude.pressQuitPrompt(ClaudeUI.quitAnyway, in: running) {
+                    watch.answered(at: World.now())
+                    progress("Answered Claude's prompt with \(ClaudeUI.quitAnyway)…")
+                } else if World.now().timeIntervalSince(firstTry ?? World.now()) > QuitPrompt.findTimeout {
                     // A new window with no Quit anyway button is not a prompt this app answers:
                     // leave the answer to a person and keep waiting for it.
                     watch.canAnswer = false
                 }
-                firstTry = firstTry ?? Date()
+                firstTry = firstTry ?? World.now()
             }
         }
     }
 
-    static func launch() async {
-        _ = await runProcess("/usr/bin/open", ["-b", bundleId])
-    }
+    static func launch() async { await World.claude.launch() }
 
     /// The account in Claude's settings, which Claude rewrites whenever its account changes.
     static func savedAccount() -> String? {
         guard let data = try? Data(contentsOf: config),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return obj["lastKnownAccountUuid"] as? String
+        return obj[ClaudeFiles.lastKnownAccount] as? String
     }
 
     // MARK: Log
@@ -466,22 +408,22 @@ enum ClaudeApp {
     /// Everything Claude logged after `mark`, following main.log across a rotation.
     static func logText(since mark: LogMark) -> String {
         if logMark().inode == mark.inode { return readLines(log, from: mark.offset).text }
-        let rotated = (1...4).map { logDir.appendingPathComponent("main\($0).log") }
+        let rotated = ClaudeFiles.rotations.map { logDir.appendingPathComponent(ClaudeFiles.rotatedLog($0)) }
             .first { logMark($0).inode == mark.inode }
         return (rotated.map { readLines($0, from: mark.offset).text } ?? "") + readLines(log, from: 0).text
     }
 
     /// The log of Claude's current run (or its last one, once it has quit), across a rotation.
     static func currentRunText() -> String {
-        let text = readLines(logDir.appendingPathComponent("main1.log"), from: 0).text + readLines(log, from: 0).text
-        return text.range(of: "Starting app {", options: .backwards).map { String(text[$0.lowerBound...]) } ?? text
+        let text = readLines(logDir.appendingPathComponent(ClaudeFiles.rotatedLog(1)), from: 0).text + readLines(log, from: 0).text
+        return text.range(of: ClaudeLog.appStart, options: .backwards).map { String(text[$0.lowerBound...]) } ?? text
     }
 
     /// Claude's last two log files read in order: who it is now (or was when it last quit), since
     /// when, and the organizations whose sign-in it refused.
     static func currentLog() -> LogFollower {
         var follower = LogFollower()
-        follower.read(readLines(logDir.appendingPathComponent("main1.log"), from: 0).text)
+        follower.read(readLines(logDir.appendingPathComponent(ClaudeFiles.rotatedLog(1)), from: 0).text)
         follower.read(readLines(log, from: 0).text)
         return follower
     }
@@ -501,7 +443,7 @@ enum ClaudeApp {
         return files.filter { url in
             guard url.lastPathComponent.hasPrefix("local_"), url.pathExtension == "json",
                   let obj = record(url) else { return false }
-            return (obj["isArchived"] as? Bool) != true && obj["scheduledTaskId"] == nil
+            return (obj[ClaudeFiles.isArchived] as? Bool) != true && obj[ClaudeFiles.scheduledTaskId] == nil
         }
     }
 
@@ -519,7 +461,7 @@ enum ClaudeApp {
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
-    static func lastActivity(_ url: URL) -> Double { (record(url)?["lastActivityAt"] as? Double) ?? 0 }
+    static func lastActivity(_ url: URL) -> Double { (record(url)?[ClaudeFiles.lastActivityAt] as? Double) ?? 0 }
 }
 
 /// Follows Claude's log, reading only what is new: the account Claude reports, for the menu, and
@@ -536,7 +478,7 @@ final class LogWatcher {
             self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
         } else {
             log = LogFollower()
-            log.read(ClaudeApp.readLines(ClaudeApp.logDir.appendingPathComponent("main1.log"), from: 0).text)
+            log.read(ClaudeApp.readLines(ClaudeApp.logDir.appendingPathComponent(ClaudeFiles.rotatedLog(1)), from: 0).text)
             let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: 0)
             log.read(text)
             self.mark = ClaudeApp.LogMark(inode: now.inode, offset: end)
@@ -549,7 +491,7 @@ final class LogWatcher {
 /// Claude's own key, never decrypted here) and the Code tab's token cache from config.json.
 enum LoginSlot {
     static let hosts = "('.claude.ai','claude.ai')"
-    static let configKeys = ["oauth:tokenCache", "oauth:tokenCacheV2", "lastKnownAccountUuid"]
+    static let configKeys = ClaudeFiles.loginConfigKeys
     static let cookieSchemaVersion = "24"
 
     static func dir(_ acct: AccountRecord) -> URL { Paths.stateDir.appendingPathComponent("slots/\(acct.id)") }
@@ -570,14 +512,14 @@ enum LoginSlot {
     static func identity(_ acct: AccountRecord, log: LogFollower) -> Identity? {
         guard let id = savedIdentity(acct),
               let savedAt = (try? dir(acct).appendingPathComponent("slot.json").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-              SaveRule.counts(savedAt: savedAt, refusedAt: log.refusal(of: id, at: Date())) else { return nil }
+              SaveRule.counts(savedAt: savedAt, refusedAt: log.refusal(of: id, at: World.now())) else { return nil }
         return id
     }
 
     private static func savedIdentity(_ acct: AccountRecord) -> Identity? {
         guard let uuid = acct.accountUuid, let meta = meta(acct), let org = meta.orgFolder,
               FileManager.default.fileExists(atPath: dir(acct).appendingPathComponent("cookies.db").path),
-              meta.config["lastKnownAccountUuid"] == uuid, (meta.account ?? uuid) == uuid,
+              meta.config[ClaudeFiles.lastKnownAccount] == uuid, (meta.account ?? uuid) == uuid,
               acct.orgUuid == nil || acct.orgUuid == org else { return nil }
         return Identity(account: uuid, org: org)
     }
@@ -615,7 +557,7 @@ enum LoginSlot {
         }
         // Copied while Claude runs, the file must have sat still for 2 s and through the copy.
         let before = stamp()
-        if whileRunning { guard let b = before, Date().timeIntervalSince(b.modified) >= 2 else { throw SwitchError.cookiesChanging } }
+        if whileRunning { guard let b = before, World.now().timeIntervalSince(b.modified) >= 2 else { throw SwitchError.cookiesChanging } }
         try fm.copyItem(at: ClaudeApp.cookies, to: source)
         if fm.fileExists(atPath: ClaudeApp.cookiesJournal.path) {
             try fm.copyItem(at: ClaudeApp.cookiesJournal, to: slot.appendingPathComponent("source.db-journal"))
@@ -631,7 +573,7 @@ enum LoginSlot {
         try? fm.removeItem(at: fresh)
         let res = await sqlite(fresh, "ATTACH \(quoted(source)) AS c; CREATE TABLE cookies AS SELECT * FROM c.cookies WHERE host_key IN \(hosts);")
         guard res.status == 0 else { throw SwitchError.sqlite(res.err) }
-        let count = await sqlite(fresh, "select count(*) from cookies where name='sessionKey';").out
+        let count = await sqlite(fresh, "select count(*) from cookies where name='\(ClaudeFiles.signInCookie)';").out
         guard count.trimmingCharacters(in: .whitespacesAndNewlines) == "1" else { throw SwitchError.notSignedIn }
 
         let config = try JSONSerialization.jsonObject(with: Data(contentsOf: ClaudeApp.config)) as? [String: Any] ?? [:]
@@ -768,7 +710,7 @@ struct SwitchJournal: Codable {
     var to: Identity?
     var moves: [Move] = []
 
-    static let url = Paths.stateDir.appendingPathComponent("switch-journal.json")
+    static var url: URL { Paths.stateDir.appendingPathComponent("switch-journal.json") }
     static func load() -> SwitchJournal? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(SwitchJournal.self, from: data)
@@ -906,7 +848,7 @@ enum SwitchEngine {
         let movedRecords = journal.moves.map { URL(fileURLWithPath: $0.to) }.filter { $0.deletingLastPathComponent().path == ClaudeApp.folder(want).path }
         let chats = movedRecords.compactMap(ChatResume.chat)
         let mark = ClaudeApp.logMark()
-        let reopenedAt = Date().timeIntervalSince1970 * 1000
+        let reopenedAt = World.now().timeIntervalSince1970 * 1000
         await ClaudeApp.launch()
         switch await confirm(want, since: mark) {
         case .confirmed:
@@ -999,14 +941,14 @@ enum SwitchEngine {
         let bring = previous.map { moving > 0 ? " and brings over the sessions open in \($0.acct.label)" : "" } ?? ""
         progress(instruction + ". Claude Accounts saves it once Claude stays on it for a minute\(bring).")
 
-        let started = Date()
+        let started = World.now()
         var seen = base
         var verdict = SetUpRule.Verdict.waiting
         while verdict == .waiting {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await World.sleep(2)
             seen = base
             seen.read(ClaudeApp.logText(since: mark))
-            verdict = SetUpRule.verdict(for: target, in: accounts, log: seen, started: started, now: Date())
+            verdict = SetUpRule.verdict(for: target, in: accounts, log: seen, started: started, now: World.now())
         }
         // Not on the row: nothing is saved under it, nothing moves, and Claude is left as it is.
         guard case .confirmed(let want) = verdict else {
@@ -1081,7 +1023,7 @@ enum SwitchEngine {
             await ClaudeApp.launch()
             return .failure(OutcomeError(SwitchError.inconsistent.localizedDescription))
         }
-        return .success(Prepared(current: (acct, id), answered: answered, steady: log.steady(at: Date()) == id))
+        return .success(Prepared(current: (acct, id), answered: answered, steady: log.steady(at: World.now()) == id))
     }
 
     struct OutcomeError: Error {
@@ -1092,15 +1034,15 @@ enum SwitchEngine {
     /// Back up Claude's files and record the intent before the first write.
     private static func startJournal(from: Identity?, to: Identity?) -> SwitchJournal? {
         let fm = FileManager.default
-        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let stamp = ISO8601DateFormatter().string(from: World.now()).replacingOccurrences(of: ":", with: "-")
         let backup = Paths.stateDir.appendingPathComponent("backups/\(stamp)")
         do {
             try fm.createDirectory(at: backup, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            try fm.copyItem(at: ClaudeApp.cookies, to: backup.appendingPathComponent("Cookies"))
+            try fm.copyItem(at: ClaudeApp.cookies, to: backup.appendingPathComponent(ClaudeFiles.cookies))
             if fm.fileExists(atPath: ClaudeApp.cookiesJournal.path) {
-                try fm.copyItem(at: ClaudeApp.cookiesJournal, to: backup.appendingPathComponent("Cookies-journal"))
+                try fm.copyItem(at: ClaudeApp.cookiesJournal, to: backup.appendingPathComponent(ClaudeFiles.cookiesJournal))
             }
-            try fm.copyItem(at: ClaudeApp.config, to: backup.appendingPathComponent("config.json"))
+            try fm.copyItem(at: ClaudeApp.config, to: backup.appendingPathComponent(ClaudeFiles.config))
             let journal = SwitchJournal(backup: backup.path, from: from, to: to)
             try journal.save()
             return journal
@@ -1139,18 +1081,18 @@ enum SwitchEngine {
 
     /// Watch the reopened Claude until it reports `want` and holds it for a few seconds.
     private static func confirm(_ want: Identity, since mark: ClaudeApp.LogMark) async -> Verdict {
-        let deadline = Date().addingTimeInterval(60)
+        let deadline = World.now().addingTimeInterval(60)
         var seen: Identity?
-        var seenSince = Date()
-        while Date() < deadline {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        var seenSince = World.now()
+        while World.now() < deadline {
+            await World.sleep(1)
             let text = ClaudeApp.logText(since: mark)
-            guard let start = text.range(of: "Starting app {") else { continue }
+            guard let start = text.range(of: ClaudeLog.appStart) else { continue }
             let run = text[start.upperBound...]
             if run.split(separator: "\n").contains(where: LogFollower.signsOut) { return .signedOut }
             let now = LogFollower.identity(after: String(run), from: nil)
-            if now != seen { seen = now; seenSince = Date() }
-            let held = Date().timeIntervalSince(seenSince)
+            if now != seen { seen = now; seenSince = World.now() }
+            let held = World.now().timeIntervalSince(seenSince)
             if now == want, held >= 4 { return .confirmed }
             if now != nil, now != want, held >= 10 { return .other(now) }
         }
@@ -1168,7 +1110,7 @@ enum SwitchEngine {
         }
         let backup = URL(fileURLWithPath: journal.backup)
         try? fm.removeItem(at: ClaudeApp.cookiesJournal)
-        for (name, live) in [("Cookies", ClaudeApp.cookies), ("Cookies-journal", ClaudeApp.cookiesJournal), ("config.json", ClaudeApp.config)] {
+        for (name, live) in [(ClaudeFiles.cookies, ClaudeApp.cookies), (ClaudeFiles.cookiesJournal, ClaudeApp.cookiesJournal), (ClaudeFiles.config, ClaudeApp.config)] {
             let saved = backup.appendingPathComponent(name)
             guard fm.fileExists(atPath: saved.path) else { continue }
             let staged = ClaudeApp.dataDir.appendingPathComponent(".\(name).restore")
@@ -1199,14 +1141,14 @@ enum SwitchEngine {
 /// retrying the failed message rewinds the chat and starts its transcript over without its
 /// subagents. Each step goes to resume.log in the app's state folder.
 enum ChatResume {
-    static let logURL = Paths.stateDir.appendingPathComponent("resume.log")
+    static var logURL: URL { Paths.stateDir.appendingPathComponent("resume.log") }
 
     /// A moved session record as the resume step needs it.
     static func chat(_ record: URL) -> MovedChat? {
-        guard let obj = ClaudeApp.record(record), let id = obj["sessionId"] as? String else { return nil }
-        return MovedChat(id: id, title: (obj["title"] as? String) ?? id,
-                         interrupted: obj["interruptedByQuitAt"] is NSNumber,
-                         lastActivity: (obj["lastActivityAt"] as? Double) ?? 0)
+        guard let obj = ClaudeApp.record(record), let id = obj[ClaudeFiles.sessionId] as? String else { return nil }
+        return MovedChat(id: id, title: (obj[ClaudeFiles.title] as? String) ?? id,
+                         interrupted: obj[ClaudeFiles.interruptedByQuitAt] is NSNumber,
+                         lastActivity: (obj[ClaudeFiles.lastActivityAt] as? Double) ?? 0)
     }
 
     /// The resume step for chats whose records are in `folder`, Claude having reopened at
@@ -1217,19 +1159,19 @@ enum ChatResume {
         let log = try? FileHandle(forWritingTo: logURL)
         let stamp = ISO8601DateFormatter()
         return ChatResumer(
-            open: { id in _ = await runProcess("/usr/bin/open", ["claude://code/continue?session=\(id)"]) },
+            open: { id in await World.claude.open(link: ClaudeFiles.continueLink(id)) },
             pids: ClaudeApp.pids,
             running: { chat in
                 let obj = ClaudeApp.record(folder.appendingPathComponent(chat.id + ".json"))
-                let lastActivity = (obj?["lastActivityAt"] as? Double) ?? 0
+                let lastActivity = (obj?[ClaudeFiles.lastActivityAt] as? Double) ?? 0
                 // A chat without Claude's mark has nothing to clear; only new activity shows it ran.
                 return chat.interrupted
-                    ? ResumeRule.resumed(markStillSet: obj?["interruptedByQuitAt"] is NSNumber, lastActivity: lastActivity, reopenedAt: reopenedAt)
+                    ? ResumeRule.resumed(markStillSet: obj?[ClaudeFiles.interruptedByQuitAt] is NSNumber, lastActivity: lastActivity, reopenedAt: reopenedAt)
                     : lastActivity > reopenedAt
             },
             progress: progress,
             trace: { step in
-                log?.write(Data("\(stamp.string(from: Date())) \(step)\n".utf8))
+                log?.write(Data("\(stamp.string(from: World.now())) \(step)\n".utf8))
                 echo(step)
             },
             retrying: retrying)
@@ -1371,7 +1313,7 @@ enum AutoSwitchLog {
     static func lastAttempt() -> Date? { load()?.lastAttempt }
 
     /// Rows still counted as out, by id.
-    static func outUntil(now: Date = Date()) -> [String: Date] { (load()?.outUntil ?? [:]).filter { $0.value > now } }
+    static func outUntil(now: Date = World.now()) -> [String: Date] { (load()?.outUntil ?? [:]).filter { $0.value > now } }
 
     /// An automatic switch starts at `date`, leaving `row` out of usage until `until`.
     static func started(_ date: Date, leaving row: String, outUntil until: Date) {
@@ -1414,7 +1356,7 @@ final class Store: ObservableObject {
     @Published var retryAt: [String: Date] = [:]
 
     /// Whether this app may press Claude's quit prompt, which an unattended switch needs.
-    @Published var accessibilityGranted = QuitPrompt.trusted
+    @Published var accessibilityGranted = World.claude.trusted
 
     private var timer: Timer?
     private let logWatcher = LogWatcher()
@@ -1454,7 +1396,7 @@ final class Store: ObservableObject {
     func hasSavedLogin(_ acct: AccountRecord) -> Bool { LoginSlot.exists(acct, log: logWatcher.log) }
 
     /// Claude refused this row's sign-in as too old and hasn't held it steadily since.
-    func isRefused(_ acct: AccountRecord) -> Bool { logWatcher.log.refusal(of: acct.identity, at: Date()) != nil }
+    func isRefused(_ acct: AccountRecord) -> Bool { logWatcher.log.refusal(of: acct.identity, at: World.now()) != nil }
 
     /// The hold whose login was saved, so each steady hold is saved once.
     private var savedHold: String?
@@ -1464,7 +1406,7 @@ final class Store: ObservableObject {
     /// while a switch or set-up runs; the lock is taken without overtaking a resume.
     private func saveSteadyLogin() {
         let log = logWatcher.log
-        guard switching == nil, let held = log.steady(at: Date()), let since = log.heldSince,
+        guard switching == nil, let held = log.steady(at: World.now()), let since = log.heldSince,
               let row = accounts.row(for: held) else { return }
         let hold = "\(row.id) \(since.timeIntervalSince1970)"
         guard savedHold != hold, SwitchJournal.load() == nil, let lock = SwitchLock.acquire(newGeneration: false) else { return }
@@ -1491,7 +1433,7 @@ final class Store: ObservableObject {
         guard !loading else { return }
         accounts = AccountStore.load()
         inUse = logWatcher.poll()
-        let now = Date()
+        let now = World.now()
         let due = accounts.filter { acct in
             if let until = retryAt[acct.id], until > now { return false }
             if acct.id == forcedId { return true }
@@ -1506,10 +1448,10 @@ final class Store: ObservableObject {
         loading = true
         Task {
             await withTaskGroup(of: (String, AccountState).self) { group in
-                for acct in due { group.addTask { (acct.id, await Usage.state(for: acct)) } }
+                for acct in due { group.addTask { (acct.id, await Usage.reader.state(for: acct)) } }
                 for await (id, state) in group { self.record(state, for: id) }
             }
-            self.lastUpdated = Date()
+            self.lastUpdated = World.now()
             self.loading = false
             self.saveCache()
             self.considerAutoSwitch()
@@ -1518,7 +1460,7 @@ final class Store: ObservableObject {
 
     /// A rate-limit answer keeps the last good reading on screen instead of blanking the row.
     private func record(_ state: AccountState, for id: String) {
-        polledAt[id] = Date()
+        polledAt[id] = World.now()
         if case .rateLimited(let until) = state {
             retryAt[id] = until
             if states[id] == nil || states[id] == .loading { states[id] = state }
@@ -1526,7 +1468,7 @@ final class Store: ObservableObject {
         }
         retryAt[id] = nil
         states[id] = state
-        if case .ok = state { readAt[id] = Date() }
+        if case .ok = state { readAt[id] = World.now() }
     }
 
     // MARK: Cache
@@ -1536,7 +1478,7 @@ final class Store: ObservableObject {
         guard !entries.isEmpty else { return }
         for (id, e) in entries {
             polledAt[id] = e.polledAt
-            if let r = e.retryAt, r > Date() { retryAt[id] = r }
+            if let r = e.retryAt, r > World.now() { retryAt[id] = r }
             if e.fiveHour != nil || e.weekly != nil || e.plan != nil {
                 states[id] = .ok(plan: e.plan, fiveHour: e.fiveHour, weekly: e.weekly, loginExpiresAt: e.loginExpiresAt)
                 readAt[id] = e.readAt ?? e.polledAt
@@ -1569,7 +1511,7 @@ final class Store: ObservableObject {
     func considerAutoSwitch() {
         guard settings.autoSwitch, switching == nil else { return }
         inUse = logWatcher.poll()
-        let now = Date()
+        let now = World.now()
         let all = candidates(now: now)
         let current = accounts.row(for: inUse).flatMap { row in all.first { $0.id == row.id } }
         // The log's stops once Claude settled on the account it names, which is `inUse`.
@@ -1612,16 +1554,16 @@ final class Store: ObservableObject {
     /// is off or Claude uses no row this app knows.
     var nextRow: String? {
         guard settings.autoSwitch, let row = accounts.row(for: inUse) else { return nil }
-        let all = candidates(now: Date())
+        let all = candidates(now: World.now())
         guard let current = all.first(where: { $0.id == row.id }) else { return nil }
-        return AutoSwitchRule.next(after: current, in: all, now: Date())?.id
+        return AutoSwitchRule.next(after: current, in: all, now: World.now())?.id
     }
 
     /// Turn auto-switch on or off. Turning it on is a click by the person at the Mac, so this is
     /// when macOS is asked to list the app under Accessibility.
     func setAutoSwitch(_ on: Bool) {
         settings.autoSwitch = on
-        if on, !QuitPrompt.trusted { QuitPrompt.requestAccess() }
+        if on, !World.claude.trusted { QuitPrompt.requestAccess() }
         checkAccessibility()
         considerAutoSwitch()
     }
@@ -1630,7 +1572,7 @@ final class Store: ObservableObject {
     /// Allow line goes as soon as it is granted. A grant is remembered: an update changes the
     /// app's signature, and macOS then stops trusting it while its old entry still shows as on.
     func checkAccessibility() {
-        let trusted = QuitPrompt.trusted
+        let trusted = World.claude.trusted
         if trusted { UserDefaults.standard.set(true, forKey: Self.grantedBeforeKey) }
         if accessibilityGranted != trusted { accessibilityGranted = trusted }
     }
@@ -1876,7 +1818,7 @@ final class LoginFlow: ObservableObject {
         Task {
             if let target {
                 rollback = (await Keychain.snapshot(service: target.keychainService),
-                            try? Data(contentsOf: dir.appendingPathComponent(".claude.json")))
+                            try? Data(contentsOf: dir.appendingPathComponent(ClaudeFiles.cliProfile)))
             } else {
                 do {
                     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
@@ -2030,7 +1972,7 @@ final class LoginFlow: ObservableObject {
             return
         }
         if let snap = rollback?.keychain { await Keychain.restore(service: target.keychainService, snap) }
-        if let file = rollback?.profile { try? file.write(to: dir.appendingPathComponent(".claude.json"), options: .atomic) }
+        if let file = rollback?.profile { try? file.write(to: dir.appendingPathComponent(ClaudeFiles.cliProfile), options: .atomic) }
         phase = .failed("That sign-in was a different account than \(target.label), so the previous login was kept. Try again and pick the Google account \(target.name) belongs to.")
     }
 
@@ -2049,9 +1991,9 @@ final class LoginFlow: ObservableObject {
 
     /// The Claude Code login's profile: account, email and organization. It holds no secret.
     nonisolated static func profile(in dir: URL) -> [String: Any] {
-        guard let data = try? Data(contentsOf: dir.appendingPathComponent(".claude.json")),
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent(ClaudeFiles.cliProfile)),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
-        return obj["oauthAccount"] as? [String: Any] ?? [:]
+        return obj[ClaudeFiles.cliAccount] as? [String: Any] ?? [:]
     }
 }
 
@@ -2074,7 +2016,6 @@ final class LoginFlow: ObservableObject {
 ///   each step. It takes the switch lock, so it never runs during a switch.
 ///
 /// A real run prints the outcome as JSON and saves it to last-switch.json in the state folder.
-@main
 enum Entry {
     static func main() {
         Migration.moveLegacyState()
@@ -2101,7 +2042,7 @@ enum Entry {
                 target = accounts.first { $0.id == id }!
                 autoReason = reason
                 if !dryRun, let current {
-                    AutoSwitchLog.started(Date(), leaving: current.id, outUntil: AutoSwitchRule.outUntil(leaving: current, now: Date()))
+                    AutoSwitchLog.started(World.now(), leaving: current.id, outUntil: AutoSwitchRule.outUntil(leaving: current, now: World.now()))
                 }
             case .nowhere(let why):
                 if dryRun { exit(0) }
@@ -2179,7 +2120,7 @@ enum Entry {
         let log = ClaudeApp.currentLog()
         let all = UsageCache.candidates(accounts.inMenuOrder, UsageCache.load(), log: log)
         let current = accounts.row(for: log.identity).flatMap { row in all.first { $0.id == row.id } }
-        let now = Date()
+        let now = World.now()
         func describe(_ c: SwitchCandidate) -> String {
             let row = accounts.first { $0.id == c.id }
             return c.summary(at: now, setUpStep: row.map {
@@ -2221,7 +2162,7 @@ enum Entry {
         print("Claude settings:  \(name(ClaudeApp.savedAccount()))")
         print("Interrupted switch: \(SwitchJournal.load() == nil ? "none" : "yes")")
         print("Auto-switch:      \(AppSettings.load().autoSwitch ? "on, when Claude stops a chat at the usage limit" : "off")")
-        print("Accessibility:    \(QuitPrompt.trusted ? "granted to this process" : "not granted to this process")")
+        print("Accessibility:    \(World.claude.trusted ? "granted to this process" : "not granted to this process")")
         print("Notifications:    \(Notify.permission())")
         let log = ClaudeApp.currentLog()
         for acct in accounts {
@@ -2253,8 +2194,8 @@ enum Entry {
         let stopped = records.compactMap(ChatResume.chat).filter { log.stoppedByLimit.contains($0.id) }.count
         print("Stopped for usage:  \(stopped) chat\(stopped == 1 ? "" : "s"), sent \u{201C}\(ResumeRule.message)\u{201D} after the switch")
         if unattended {
-            print("Quit prompt:        " + (QuitPrompt.trusted
-                ? "answered with \(QuitPrompt.quitAnyway) through Accessibility"
+            print("Quit prompt:        " + (World.claude.trusted
+                ? "answered with \(ClaudeUI.quitAnyway) through Accessibility"
                 : "waits for a person: this process has no Accessibility access"))
             print("After the switch:   each chat that was working, stopped by the limit or cut off by the quit, runs again: Claude resumes it, or it is sent \u{201C}\(ResumeRule.message)\u{201D}, tried again every minute for 30 minutes while nobody uses the Mac")
         } else {
@@ -2310,13 +2251,13 @@ enum TestResume {
             exit(1)
         }
         guard SwitchLock.acquire() != nil else { say("A switch is running; try again once it's done."); exit(1) }
-        guard AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary) else {
+        guard World.claude.trusted else {
             say("This process has no Accessibility access. Run it through the app, which has its own:")
             say("  open -n -W -o \"$(tty)\" --stderr \"$(tty)\" -a \"\(Bundle.main.bundlePath)\" --args --test-resume \"\(key)\"")
             exit(1)
         }
         say("Chat: \(chat.title) (\(chat.id))")
-        let resumer = ChatResume.resumer(in: folder, reopenedAt: Date().timeIntervalSince1970 * 1000, retrying: false,
+        let resumer = ChatResume.resumer(in: folder, reopenedAt: World.now().timeIntervalSince1970 * 1000, retrying: false,
                                          progress: { _ in }, echo: { say("  " + $0) })
         final class Box: @unchecked Sendable { var reports: [ChatResumer.Report] = [] }
         let box = Box(), done = DispatchSemaphore(value: 0)

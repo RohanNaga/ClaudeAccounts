@@ -11,8 +11,15 @@ OUT="$ROOT/.build-cache"
 mkdir -p "$OUT"
 export CLANG_MODULE_CACHE_PATH="$OUT"
 
+# What the app knows about Claude (app/Claude.swift) and the code that reads Claude's windows.
+CORE=("$ROOT/app/Claude.swift" "$ROOT/app/Rules.swift" "$ROOT/app/QuitPrompt.swift" "$ROOT/app/ChatComposer.swift")
+
+# First the guard every stand-in test relies on: a test world never reaches the real Claude.
+swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/world-guard" "${CORE[@]}" "$ROOT/tests/WorldGuardTest.swift"
+"$OUT/world-guard"
+
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/rules-tests" \
-  "$ROOT/app/Rules.swift" "$ROOT/tests/RulesTests.swift"
+  "${CORE[@]}" "$ROOT/tests/RulesTests.swift"
 "$OUT/rules-tests"
 
 # The menu's status line wraps to every line it needs: a cut-off instruction can't be followed.
@@ -40,9 +47,9 @@ echo "Set up brings the chats: ok"
 
 swiftc -module-cache-path "$OUT" -o "$OUT/prompt-fixture" "$ROOT/tests/PromptFixture.swift"
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/prompt-test" \
-  "$ROOT/app/QuitPrompt.swift" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/PromptTest.swift"
+  "${CORE[@]}" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/PromptTest.swift"
 "$OUT/prompt-test" "$OUT/prompt-fixture"
 
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/resume-test" \
-  "$ROOT/app/Rules.swift" "$ROOT/app/ChatComposer.swift" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/ResumeTest.swift"
+  "${CORE[@]}" "$ROOT/tests/FixtureSupport.swift" "$ROOT/tests/ResumeTest.swift"
 "$OUT/resume-test" "$OUT/prompt-fixture"

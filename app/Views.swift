@@ -288,7 +288,7 @@ struct AccountRow: View {
                 if MeterRule.showsFiveHour(fiveHour: fh, weekly: wk) { Meter(label: "5-hour", window: fh) }
                 Meter(label: "Weekly", window: wk)
                 if let warning = expiryWarning { signInPrompt(warning) }
-                if let until = retryAt, until > Date() {
+                if let until = retryAt, until > World.now() {
                     Text("Rate-limited by the usage service · retrying at \(until.formatted(date: .omitted, time: .shortened))")
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
