@@ -563,6 +563,7 @@ enum SavedLogins {
         } else {
             try? fm.removeItem(at: current)
         }
+        await World.claude.willStep("save.rename")
         try fm.moveItem(at: new, to: current)
         guard check(current, seat) == meta, await signInCount(current.appendingPathComponent("cookies.db")) == 1 else {
             try? fm.removeItem(at: current)
@@ -720,7 +721,8 @@ struct SwitchJournal: Codable, Equatable {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(SwitchJournal.self, from: data)
     }
-    func save() throws {
+    func save() async throws {
+        await World.claude.willStep("journal")
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         try enc.encode(self).write(to: Self.url, options: .atomic)
@@ -789,7 +791,7 @@ enum Switch {
         // Who Claude's files belong to: the seat it holds, or held when it last quit.
         var j = SwitchJournal(kind: r.kind, from: events.hold?.seat, to: r.to, step: .quit,
                               fromSettled: hold?.settled(at: World.now()) ?? false)
-        do { try j.save() } catch {
+        do { try await j.save() } catch {
             unlock()
             return SwitchOutcome(ok: false, text: "Couldn't write the switch's journal, so nothing changed.")
         }
@@ -876,7 +878,7 @@ enum Switch {
                 guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
                 await World.claude.willStep("backUp")
                 j.backup = try backUp()
-                try step(&j, .save)
+                try await step(&j, .save)
             }
             if j.step == .save {
                 if j.fromSettled, let from = j.from {
@@ -884,14 +886,14 @@ enum Switch {
                     progress("Saving \(r.name(from))…")
                     try await SavedLogins.save(from)
                 }
-                try step(&j, .move)
+                try await step(&j, .move)
             }
             if j.step == .move {
                 guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
                 await World.claude.willStep("move")
                 // A seat whose organization is not known yet has no chat folder until Claude names it.
-                if let from = j.from, from != j.to, !j.to.orgUnknown { try moveChats(from: from, to: j.to, journal: &j) }
-                try step(&j, .load)
+                if let from = j.from, from != j.to, !j.to.orgUnknown { try await moveChats(from: from, to: j.to, journal: &j) }
+                try await step(&j, .load)
             }
         } catch {
             var back = await rollback(&j, r, progress: progress)
@@ -904,13 +906,13 @@ enum Switch {
                 await World.claude.willStep("load")
                 progress(j.kind == .setUp ? "Opening Claude's sign-in…" : "Loading \(r.name(j.to))…")
                 try await SavedLogins.load(j.kind == .setUp ? nil : j.to)
-                try step(&j, .launch)
+                try await step(&j, .launch)
             }
             if j.step == .launch {
                 // A person who opened Claude since the load gets it quit once more (section 7).
                 guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
                 j.launchedAt = World.now()
-                try step(&j, .confirm)
+                try await step(&j, .confirm)
                 await World.claude.willStep("launch")
                 await ClaudeApp.launch()
             }
@@ -930,14 +932,14 @@ enum Switch {
             } else {
                 j.launchedAt = ClaudeApp.events().events.last { $0.event == .newRun }?.at ?? World.now()
             }
-            try? j.save()
+            try? await j.save()
         }
         return await confirm(&j, r, progress: progress)
     }
 
-    private static func step(_ j: inout SwitchJournal, _ next: SwitchJournal.Step) throws {
+    private static func step(_ j: inout SwitchJournal, _ next: SwitchJournal.Step) async throws {
         j.step = next
-        try j.save()
+        try await j.save()
     }
 
     /// Claude is closed before a write. A person who opens it between the quit and the launch gets
@@ -945,7 +947,7 @@ enum Switch {
     private static func closed(_ j: inout SwitchJournal, _ r: Request, progress: @escaping Progress) async -> Bool {
         guard !ClaudeApp.pids().isEmpty else { return true }
         j.reopened += 1
-        try? j.save()
+        try? await j.save()
         guard j.reopened < 2 else { return false }
         progress("Quitting Claude…")
         return await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress).outcome == .quit
@@ -1006,7 +1008,7 @@ enum Switch {
                 if now >= deadline, !named || !running {
                     if !running {
                         j.parked = true
-                        try? j.save()
+                        try? await j.save()
                         return SwitchOutcome(ok: false, text: "Open Claude to finish switching to \(r.name(j.to)).", parked: true)
                     }
                     // Claude ran the whole wait and named nobody: its log lacks the line the app reads.
@@ -1037,7 +1039,7 @@ enum Switch {
         if !ClaudeApp.pids().isEmpty {
             guard await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress).outcome == .quit else {
                 j.undoWhenClosed = true
-                try? j.save()
+                try? await j.save()
                 return SwitchOutcome(ok: false, text: j.waitLine(r.name(j.to)) ?? "", parked: true)
             }
         }
@@ -1081,26 +1083,28 @@ enum Switch {
     /// Move each open chat's record from one seat's folder to the other's, keeping its id, each move
     /// written to the journal. A record already at the target (from an interrupted switch) keeps
     /// the newer copy; the older is set aside in the backup, never deleted.
-    private static func moveChats(from: Identity, to: Identity, journal j: inout SwitchJournal) throws {
+    private static func moveChats(from: Identity, to: Identity, journal j: inout SwitchJournal) async throws {
         let fm = FileManager.default
         let dst = ClaudeApp.folder(to)
         let quarantine = URL(fileURLWithPath: j.backup ?? Paths.stateDir.path).appendingPathComponent("quarantine")
         try fm.createDirectory(at: dst, withIntermediateDirectories: true)
-        func move(_ a: URL, _ b: URL) throws {
+        // Written before it is made: a rollback skips a move the record holds but the disk doesn't.
+        func move(_ a: URL, _ b: URL) async throws {
+            await World.claude.willStep("moveChat")
             guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed }
-            try fm.moveItem(at: a, to: b)
             j.moves.append(.init(from: a.path, to: b.path))
-            try j.save()
+            try await j.save()
+            try fm.moveItem(at: a, to: b)
         }
         for record in try ClaudeApp.openSessionRecords(in: ClaudeApp.folder(from)) {
             let dest = dst.appendingPathComponent(record.lastPathComponent)
             if fm.fileExists(atPath: dest.path) {
                 try fm.createDirectory(at: quarantine, withIntermediateDirectories: true)
                 let aside = quarantine.appendingPathComponent(record.lastPathComponent)
-                if ClaudeApp.lastActivity(dest) > ClaudeApp.lastActivity(record) { try move(record, aside); continue }
-                try move(dest, aside)
+                if ClaudeApp.lastActivity(dest) > ClaudeApp.lastActivity(record) { try await move(record, aside); continue }
+                try await move(dest, aside)
             }
-            try move(record, dest)
+            try await move(record, dest)
         }
     }
 
