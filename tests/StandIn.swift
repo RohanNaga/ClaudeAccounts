@@ -36,10 +36,17 @@ final class VirtualClock: AppClock, @unchecked Sendable {
         lock.withLock { t = max(t, end) }
     }
 
+    /// The app sleeps until the scenario moves the clock past its deadline; only the scenario
+    /// moves time, so every wait in the app lasts exactly as long as the scenario says.
     func sleep(_ seconds: TimeInterval) async {
-        advance(seconds)
-        await Task.yield()
+        lock.withLock { sleepers += 1 }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            after(seconds) { [weak self] in self?.lock.withLock { self?.sleepers -= 1 }; c.resume() }
+        }
     }
+    private var sleepers = 0
+    /// How many of the app's tasks are asleep on this clock.
+    var asleep: Int { lock.withLock { sleepers } }
 }
 
 /// A placeholder id in the shape Claude logs ids, a 36-character UUID, so the app's own parsing
