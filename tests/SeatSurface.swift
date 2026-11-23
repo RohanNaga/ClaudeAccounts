@@ -49,6 +49,18 @@ enum ShownState: Equatable { case switching, inUse, needsSignIn, out, ready }
                            content: MenuLayout.contentHeight(seats: store.seats, hasNotice: notice),
                            pinned: MenuLayout.chrome(hasNotice: notice), margin: MenuLayout.screenMargin, row: MenuLayout.line)
     }
+    /// The row's five-hour and weekly percents, as its meters show them.
+    func percents(_ row: String) -> [Double] { [seat(row)?.meters.fiveHour?.percent, seat(row)?.meters.weekly?.percent].compactMap { $0 } }
+    /// How far down the cards a row's card starts, in points, with the menu unscrolled.
+    func cardTop(_ row: String) -> CGFloat? {
+        let cards = MenuLayout.cards(store.seats)
+        guard let i = cards.firstIndex(where: { $0.contains { $0.name == row } }) else { return nil }
+        return cards[..<i].reduce(0) { $0 + MenuLayout.cardHeight($1, expanded: nil) + MenuLayout.cardGap }
+    }
+    /// The stand-in's write mark inside a seat's saved login: which of Claude's cookie writes it copied.
+    func savedMark(_ seat: StandSeat) -> String? {
+        claude.writeMark(in: SavedLogins.dir(seat.identity).appendingPathComponent("current/cookies.db"))
+    }
     func hasSavedLogin(_ seat: StandSeat) -> Bool { savedAt(seat) != nil }
     /// When the seat's login was last saved, so a scenario can tell it was left untouched.
     func savedAt(_ seat: StandSeat) -> Date? { SavedLogins.savedAt(seat.identity) }

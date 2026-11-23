@@ -11,7 +11,8 @@ final class VirtualClock: AppClock, @unchecked Sendable {
     private var t: Date
     private var due: [(at: Date, seq: Int, run: () -> Void)] = []
     private var seq = 0
-    init(start: Date) { t = start }
+    let start: Date
+    init(start: Date) { t = start; self.start = start }
 
     func now() -> Date { lock.withLock { t } }
 
@@ -172,18 +173,44 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
             + "INSERT INTO meta VALUES('version','\(cookieSchema)');"
             + "CREATE TABLE cookies(host_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL); "
             + "INSERT INTO cookies VALUES('.example.org','other','x'); "
-            + (seat == nil ? "" : "INSERT INTO cookies VALUES('.claude.ai','\(ClaudeFiles.signInCookie)','\(value)');")
+            + (seat == nil ? "" : "INSERT INTO cookies VALUES('.claude.ai','\(ClaudeFiles.signInCookie)','\(value)');"
+               + "INSERT INTO cookies VALUES('.claude.ai','\(Self.writeMark)','\(nextMark("sign-in"))');")
+        sqlite(cookies, sql)
+        var cfg: [String: Any] = [:]
+        if let seat { cfg[ClaudeFiles.lastKnownAccount] = seat.account; cfg["oauth:tokenCache"] = "placeholder" }
+        try? JSONSerialization.data(withJSONObject: cfg).write(to: config)
+    }
+
+    /// A sign-in cookie whose value changes on every write Claude makes to its cookie file, so a
+    /// saved login shows which write it copied.
+    static let writeMark = "stand_in_write"
+    private var marks = 0
+    private func nextMark(_ when: String) -> String { lock.withLock { marks += 1; return "\(when)-\(marks)" } }
+    /// The mark Claude wrote as it quit holding each seat (13a.2: Claude writes its cookies at quit).
+    private(set) var quitMarks: [StandSeat: String] = [:]
+
+    private func sqlite(_ db: URL, _ sql: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-        p.arguments = [cookies.path, sql]
+        p.arguments = [db.path, sql]
+        p.standardError = Pipe()
         try? p.run(); p.waitUntilExit()
         // The app judges "sat still" from the file's real modification time. Virtual time runs far
         // ahead of real time, so the write is dated a minute back: by the time the app looks, the
         // stand-in Claude has held the sign-in well past the 2 s the app waits for.
-        try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-60)], ofItemAtPath: cookies.path)
-        var cfg: [String: Any] = [:]
-        if let seat { cfg[ClaudeFiles.lastKnownAccount] = seat.account; cfg["oauth:tokenCache"] = "placeholder" }
-        try? JSONSerialization.data(withJSONObject: cfg).write(to: config)
+        try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-60)], ofItemAtPath: db.path)
+    }
+
+    /// The write mark in a cookie database: Claude's own file, or a saved login's copy.
+    func writeMark(in db: URL) -> String? {
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        p.arguments = [db.path, "SELECT value FROM cookies WHERE name='\(Self.writeMark)'"]
+        p.standardOutput = out; p.standardError = Pipe()
+        guard FileManager.default.fileExists(atPath: db.path), (try? p.run()) != nil else { return nil }
+        p.waitUntilExit()
+        let v = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? nil : v
     }
 
     /// The seat Claude's sign-in files name now (what the next launch signs in as).
@@ -270,8 +297,15 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         name(seat, pid: pid ?? 0)
     }
 
-    /// Claude stops: a crash, or the person quitting it.
-    func stop() {
+    /// Claude stops. A quit, the person's or the app's, writes the cookie file as Claude exits
+    /// (13a.2), so only a copy taken after the quit holds the final bytes. A crash writes nothing.
+    func stop(crashed: Bool = false) {
+        let was: (pid: pid_t?, seat: StandSeat?) = lock.withLock { (pid, held) }
+        if !crashed, was.pid != nil, writeMark(in: cookies) != nil {
+            let mark = nextMark("quit")
+            sqlite(cookies, "UPDATE cookies SET value='\(mark)' WHERE name='\(Self.writeMark)';")
+            if let seat = was.seat { lock.withLock { quitMarks[seat] = mark } }
+        }
         lock.withLock { quitOn = held; pid = nil; held = nil; promptOpen = false }
     }
 
@@ -307,7 +341,9 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         start()
     }
 
-    func open(link: String) async { lock.withLock { actions.append("open \(link)") } }
+    func open(link: String) async { lock.withLock { actions.append("open \(link)"); opened.append(clock.now()) } }
+    /// When each chat link was opened, on the virtual clock.
+    private(set) var opened: [Date] = []
 
     var trusted: Bool { trustedAX }
     func quitPromptOpen(in owners: [pid_t]) -> Bool { lock.withLock { promptOpen && promptHasQuitButton } }
@@ -338,6 +374,11 @@ final class StandInUsage: UsageReader, @unchecked Sendable {
     private let lock = NSLock()
     private var meters: [String: AccountState] = [:]
     private(set) var reads: [String] = []
+    /// When each read happened, on the clock the scenario runs (set by the harness).
+    private(set) var readTimes: [(tag: String, at: Date)] = []
+    var clock: VirtualClock?
+    /// When `seat`'s meter was read, in order.
+    func readsOf(_ seat: StandSeat) -> [Date] { lock.withLock { readTimes.filter { $0.tag == seat.tag }.map(\.at) } }
     func set(_ seat: StandSeat, fiveHour: Double, weekly: Double = 10, resetsAt: Date?) {
         lock.withLock {
             meters[seat.tag] = .ok(fiveHour: UsageWindow(utilization: fiveHour, resetsAt: resetsAt),
@@ -349,6 +390,7 @@ final class StandInUsage: UsageReader, @unchecked Sendable {
         lock.withLock {
             let tag = "\(acct.accountUuid ?? "?")/\(acct.orgUuid ?? "?")"
             reads.append(tag)
+            if let clock { readTimes.append((tag, clock.now())) }
             return meters[tag] ?? .unreadable
         }
     }
