@@ -31,7 +31,13 @@ final class VirtualClock: AppClock, @unchecked Sendable {
                 return e
             }
             guard let e = next else { break }
-            if lock.withLock({ abandoned.contains(e.seq) }) { continue }
+            // A crashed app's sleeper is kept, never run: dropping it would leak its continuation.
+            let isDead = lock.withLock { () -> Bool in
+                guard abandoned.contains(e.seq) else { return false }
+                dead.append(e.run)
+                return true
+            }
+            if isDead { continue }
             e.run()
         }
         lock.withLock { t = max(t, end) }
@@ -54,6 +60,7 @@ final class VirtualClock: AppClock, @unchecked Sendable {
     var activity: Int { lock.withLock { seq * 1_000_003 + due.count } }
     private var sleepers = 0
     private var abandoned = Set<Int>(), sleeperSeqs = Set<Int>()
+    private var dead: [() -> Void] = []
     /// The app crashed: every task asleep now never wakes. Events the stand-in scheduled still run.
     func abandonSleepers() { lock.withLock { abandoned.formUnion(sleeperSeqs); sleepers = 0 } }
     /// How many of the app's tasks are asleep on this clock.
