@@ -748,7 +748,6 @@ let scenarios: [Scenario] = [
         h.check(h.state("Beta") == .needsSignIn, "Beta Needs sign-in")
         h.check(h.hasSavedLogin(A), "Alpha's saved login intact")
     },
-    Scenario(pair: "(Invariant A, faults at every step)", model: "kill app, kill Claude, full disk, failed read: ends signed in to S or T, every saved login intact", body: nil),
     Scenario(pair: "(Any Mac, first launch nothing saved)", model: "first-run screen, then the held seat becomes the first row once settled") { h in
         h.make(); await h.tick()
         h.check(h.firstRun, "the first-run screen shows with no rows")
@@ -799,7 +798,7 @@ enum ScenarioRun {
         var passed = 0, failed = 0, pending = 0
         // One pair by its exact name (each.sh), else every pair whose name contains the argument.
         let only = CommandLine.arguments.dropFirst().first
-        let all = scenarios + bugScenarios
+        let all = scenarios + bugScenarios + faultScenarios
         if only == "--list" { all.forEach { print($0.pair) }; exit(0) }
         let exact = all.contains { $0.pair == only }
         for s in all where only == nil || (exact ? s.pair == only : s.pair.contains(only!)) {
