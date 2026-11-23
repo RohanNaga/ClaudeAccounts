@@ -372,7 +372,14 @@ open "Claude Accounts.app"
 ```
 
 It needs the Xcode Command Line Tools (`xcode-select --install`). `build.sh`
-compiles one binary for Apple Silicon and Intel with `swiftc`. `test.sh` runs
+compiles one binary for Apple Silicon and Intel with `swiftc`.
+
+macOS ties the Accessibility permission to the app's signature, and the ad-hoc
+signature `build.sh` uses by default changes with every build, so each rebuild
+asks for the permission again. If you rebuild often, run
+`scripts/make-signing-identity.sh` once to add a local signing identity to your
+login keychain; `build.sh` signs with it from then on, and after allowing the
+app once more the permission stays across builds. `test.sh` runs
 the tests for the switching rules in `app/Rules.swift`, then drives the quit
 prompt code against a real native alert and the resume step against a
 stand-in chat window, which flash small windows for a moment; those parts need
