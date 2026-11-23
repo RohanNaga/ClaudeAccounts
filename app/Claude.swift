@@ -275,7 +275,17 @@ enum Notify {
 enum ClaudeContract {
     static let recordedVersions: Set<String> = ["6.28899.6"]
 
-    static func recognises(_ version: String?) -> Bool { version.map(recordedVersions.contains) ?? false }
+    /// Claude's version counts as checked when its major version is one the shapes were recorded
+    /// on (main's ruling, 2026-11-23). The run-time shape checks catch a change inside a major
+    /// version: no Named line after a launch, or a quit prompt without its button (model, section 8).
+    static func recognises(_ version: String?) -> Bool {
+        guard let major = version.flatMap(majorVersion) else { return false }
+        return recordedVersions.compactMap(majorVersion).contains(major)
+    }
+
+    private static func majorVersion(_ version: String) -> String? {
+        version.split(separator: ".").first.map(String.init).flatMap { Int($0) != nil ? $0 : nil }
+    }
 }
 
 // MARK: - Claude's files
