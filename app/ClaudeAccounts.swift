@@ -813,6 +813,7 @@ enum Switch {
             unlock()
             return SwitchOutcome(ok: false, text: "Couldn't write the switch's journal, so nothing changed.")
         }
+        await World.claude.willStep("quit")
         progress("Quitting Claude…")
         let quit = await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress)
         switch quit.outcome {
@@ -890,11 +891,13 @@ enum Switch {
         do {
             if j.step < .save {
                 guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
+                await World.claude.willStep("backUp")
                 j.backup = try backUp()
                 try step(&j, .save)
             }
             if j.step == .save {
                 if j.fromSettled, let from = j.from {
+                    await World.claude.willStep("save")
                     progress("Saving \(r.name(from))…")
                     try await SavedLogins.save(from)
                 }
@@ -902,6 +905,7 @@ enum Switch {
             }
             if j.step == .move {
                 guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
+                await World.claude.willStep("move")
                 // A seat whose organization is not known yet has no chat folder until Claude names it.
                 if let from = j.from, from != j.to, !j.to.orgUnknown { try moveChats(from: from, to: j.to, journal: &j) }
                 try step(&j, .load)
@@ -914,6 +918,7 @@ enum Switch {
         do {
             if j.step == .load {
                 guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
+                await World.claude.willStep("load")
                 progress(j.kind == .setUp ? "Opening Claude's sign-in…" : "Loading \(r.name(j.to))…")
                 try await SavedLogins.load(j.kind == .setUp ? nil : j.to)
                 try step(&j, .launch)
@@ -923,6 +928,7 @@ enum Switch {
                 guard await closed(&j, r, progress: progress) else { return await rollback(&j, r, progress: progress) }
                 j.launchedAt = World.now()
                 try step(&j, .confirm)
+                await World.claude.willStep("launch")
                 await ClaudeApp.launch()
             }
         } catch {
@@ -989,6 +995,7 @@ enum Switch {
     /// Wait for Claude to hold the target settled (section 6, step 6). Waits are measured against
     /// the facts: an expired wait reads the log once more, and while Claude is closed it parks.
     private static func confirm(_ j: inout SwitchJournal, _ r: Request, progress: @escaping Progress) async -> SwitchOutcome {
+        await World.claude.willStep("confirm")
         let launch = j.launchedAt ?? World.now()
         let deadline = launch.addingTimeInterval(j.kind == .setUp ? Limits.setUpConfirmWait : Limits.confirmWait)
         progress(j.kind == .setUp ? "Sign in to \(r.name(j.to)) in Claude." : "Waiting for Claude to open as \(r.name(j.to))…")

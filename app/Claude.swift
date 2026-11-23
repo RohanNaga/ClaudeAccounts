@@ -55,11 +55,15 @@ protocol ClaudeWorld: Sendable {
     func idleSeconds() -> TimeInterval
     /// Post a notification on this Mac: an automatic outcome the person may not be watching.
     func notify(title: String, body: String)
+    /// A switch step is about to run, on the switch's own task, after the journal names it.
+    /// Nothing happens on a real Mac; a test faults the step here.
+    func willStep(_ step: String) async
 }
 
 extension ClaudeWorld {
     /// A stand-in Claude is installed unless its test says otherwise.
     var installed: Bool { true }
+    func willStep(_ step: String) async {}
 }
 
 /// The time the app reads and waits on. Tests advance a virtual one instead of sleeping.
