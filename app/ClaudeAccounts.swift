@@ -1439,8 +1439,7 @@ final class Store: ObservableObject {
     var firstRun: Bool { accounts.isEmpty }
 
     /// The menu bar's gauge: the seat in use's meter for the chosen limit, or its weekly meter
-    /// when it has no 5-hour one. The display and limit settings stay working until Rohan rules on
-    /// them (model, section 10).
+    /// when it has no 5-hour one (model, section 10).
     var titleMeter: MeterReading? {
         guard let m = seats.first(where: { $0.state == .inUse })?.meters else { return nil }
         return settings.metric == .fiveHour ? m.fiveHour ?? m.weekly : m.weekly
@@ -1758,8 +1757,8 @@ final class Store: ObservableObject {
         save(AccountStore.load().renamed(row, to: name, organization: organization))
     }
 
-    /// Give a seat's account a new colour, on every one of its rows; each row keeps its place.
-    /// Kept working until Rohan rules on per-account colours (model, section 10).
+    /// Give a seat's account a new colour, on every one of its rows; each row keeps its place
+    /// (model, section 10).
     func recolor(_ seat: Seat, _ color: String) {
         guard let row = record(for: seat) else { return }
         var all = AccountStore.load()
@@ -1769,8 +1768,8 @@ final class Store: ObservableObject {
         save(all)
     }
 
-    /// Show or fold away the organizations of an account in the menu; settings.json keeps it.
-    /// Kept working until Rohan rules on folding (model, section 10).
+    /// Show or fold away the organizations of an account in the menu; settings.json keeps it
+    /// (model, section 10).
     func setShowsOrganizations(of account: String, _ shown: Bool) {
         settings.setShowsOrganizations(of: account, shown)
     }
