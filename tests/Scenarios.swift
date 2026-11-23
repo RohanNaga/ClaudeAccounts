@@ -36,10 +36,10 @@ struct Scenario {
     }
 
     /// Writes the person's rows (F9), one per seat, in menu order.
-    func rows(_ seats: [(String, StandSeat)]) throws {
+    func rows(_ seats: [(String, StandSeat)], orgNames: [String]? = nil) throws {
         let list = seats.enumerated().map { i, s in
             AccountRecord(id: "row\(i)", name: s.0, color: "blue", configDir: claude.root.appendingPathComponent("cli/row\(i)").path,
-                          keychainService: "test-row\(i)", email: nil, accountUuid: s.1.account, orgName: "Team", orgUuid: s.1.org)
+                          keychainService: "test-row\(i)", email: nil, accountUuid: s.1.account, orgName: orgNames?[i] ?? "Team", orgUuid: s.1.org)
         }
         try AccountStore.save(list)
     }
@@ -77,6 +77,26 @@ struct Scenario {
     func pass(_ seconds: TimeInterval) async { await run(until: { false }, limit: seconds) }
 
     func cleanUp() { claude.cleanUp() }
+
+    /// The common start: Alpha (A), Beta (B), Gamma (C), each with a saved login and a fresh meter
+    /// with room; one idle chat in Alpha's folder; Claude holding Alpha settled; the app running.
+    func standard(chat: String? = "local_one", onScreen: Bool = true) async {
+        try? rows([("Alpha", A), ("Beta", B), ("Gamma", C)])
+        for (n, seat) in [("Beta", B), ("Gamma", C), ("Alpha", A)] { try? await savedLogin(n, seat) }
+        for seat in [A, B, C] { usage.set(seat, fiveHour: 20, resetsAt: clock.now().addingTimeInterval(3 * 3600)) }
+        if let chat {
+            claude.addChat(chat, in: A, lastActivity: clock.now())
+            if onScreen { claude.screens[chat] = ChatScreen(busy: false, composer: true, draft: false) }
+        }
+        claudeHoldsSettled()
+        make()
+        await tick(); await settle()
+    }
+
+    func noticeHas(_ text: String) -> Bool { notice.contains { $0.contains(text) } }
+    var quits: Int { claude.actions.filter { $0 == "quit" }.count }
+    var launches: Int { claude.actions.filter { $0 == "launch" }.count }
+    func resumed(_ chat: String) -> Bool { claude.sent.contains("\(chat) resume") }
 }
 
 /// The model's constants (section 5), as the scenarios assume them.
@@ -119,49 +139,371 @@ let scenarios: [Scenario] = [
         h.check(h.state("Gamma") == .ready && h.action("Gamma") == .switchTo, "Gamma, another account in the same organization, stays Ready with Switch: \(String(describing: h.state("Gamma")))")
     },
     // Section 7 rows still to build (each asserts the outcome and the line in quotes).
-    Scenario(pair: "(Needs sign-in, click Set Up on T)", model: "\"Sign in to <T> in Claude.\" then In use, or \"Claude signed in as <X>, not <T>. Back on <S>.\"", body: nil),
-    Scenario(pair: "(In use, click the row in use)", model: "nothing", body: nil),
-    Scenario(pair: "(In use settled, limit stop, target exists)", model: "\"Switched to <T>: <S> is out. N chats resumed.\"", body: nil),
-    Scenario(pair: "(In use settling, limit stop before settle)", model: "not counted against S; chat still resumed; nothing shown", body: nil),
-    Scenario(pair: "(In use, wrap-up: turn ended then 100% read)", model: "same as a limit stop", body: nil),
-    Scenario(pair: "(Every seat out, out signal)", model: "\"Every seat is out. Chats resume when <seat> resets at <time>.\"", body: nil),
-    Scenario(pair: "(Waiting, reset time passes)", model: "read the meter, then resume in place or switch", body: nil),
-    Scenario(pair: "(Not waiting, reset time passes)", model: "meter re-read, row changes", body: nil),
-    Scenario(pair: "(In use, meter reads 100% with no turn ended)", model: "Out on the row, no switch", body: nil),
-    Scenario(pair: "(Refused, Claude falls back to personal)", model: "personal row: In use", body: nil),
-    Scenario(pair: "(No switch, Claude quits or crashes)", model: "\"Claude isn't running.\" Switch still works and opens Claude", body: nil),
-    Scenario(pair: "(Quit wait, the person quits Claude)", model: "the quit succeeded, go on", body: nil),
-    Scenario(pair: "(After launch before confirm, the person quits Claude)", model: "\"Open Claude to finish switching to <T>.\" no rollback while closed", body: nil),
-    Scenario(pair: "(Between quit and launch, the person opens Claude)", model: "quit once more; a second time rolls back; \"Switching…\"", body: nil),
-    Scenario(pair: "(Confirm, Claude restarts by itself)", model: "NewRun then Named: confirm as usual", body: nil),
-    Scenario(pair: "(Any step, the app is quit, crashed or updated)", model: "\"Finished switching to <T>\" or \"Switch to <T> undone\"", body: nil),
-    Scenario(pair: "(Any, sleep then wake)", model: "meters stale then re-read; no automatic decision until a fresh read", body: nil),
-    Scenario(pair: "(Lock held before resume, second switch)", model: "\"Already switching to <T>.\"", body: nil),
-    Scenario(pair: "(During resume, second switch)", model: "resume cancelled, chats carried over", body: nil),
-    Scenario(pair: "(Resume, message box not on screen)", model: "\"Couldn't resume 1 chat: send it a message.\" after 30 min", body: nil),
-    Scenario(pair: "(Any, Accessibility not granted)", model: "\"Allow Accessibility so Claude Accounts can switch on its own and resume chats.\"", body: nil),
-    Scenario(pair: "(Any, Claude not installed)", model: "\"Claude isn't installed.\" Switch hidden", body: nil),
-    Scenario(pair: "(Any, Claude never signed in or signed out)", model: "every seat Needs sign-in; Set Up on each row", body: nil),
-    Scenario(pair: "(Any, unknown Claude version or shape mismatch)", model: "\"Claude updated to a version this app hasn't checked. Switching on its own is paused.\"", body: nil),
-    Scenario(pair: "(Any, row renamed or reordered)", model: "display and automatic order only", body: nil),
-    Scenario(pair: "(Not in use, row removed)", model: "saved login and row deleted; chats stay", body: nil),
-    Scenario(pair: "(In use, row removed)", model: "\"Claude is on an account not in the list.\"", body: nil),
-    Scenario(pair: "(Any, two rows with the same name)", model: "\" · <organization>\", then \" (2)\"; never an email", body: nil),
-    Scenario(pair: "(Any, meter stale or missing)", model: "manual switch allowed, not an automatic target; \"read N min ago\" or \"not read yet\"", body: nil),
+    Scenario(pair: "(Needs sign-in, click Set Up on T)", model: "\"Sign in to <T> in Claude.\" then In use, or \"Claude signed in as <X>, not <T>. Back on <S>.\"") { h in
+        try? h.rows([("Alpha", A), ("Beta", B)])
+        try? await h.savedLogin("Alpha", A)
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        h.check(h.state("Beta") == .needsSignIn && h.action("Beta") == .setUp, "Beta Needs sign-in with Set Up: \(String(describing: h.state("Beta")))")
+        h.claude.signsInAs = B
+        h.click("Beta")
+        await h.run(until: { h.noticeHas("Sign in to Beta in Claude.") }, limit: 120)
+        h.check(h.noticeHas("Sign in to Beta in Claude."), "the notice asks to sign in to Beta: \(h.notice)")
+        await h.run(until: { h.claude.held == B && h.state("Beta") == .inUse }, limit: 900)
+        h.check(h.state("Beta") == .inUse, "Beta In use after the sign-in: \(String(describing: h.state("Beta"))), \(h.notice)")
+        h.check(h.claude.chats(in: B).contains("local_one"), "the chat came over to Beta")
+        h.check(h.hasSavedLogin(B), "Beta's login is saved once confirmed")
+        h.check(h.hasSavedLogin(A), "Alpha's saved login is intact")
+    },
+    Scenario(pair: "(In use, click the row in use)", model: "nothing") { h in
+        await h.standard()
+        h.check(h.state("Alpha") == .inUse && h.action("Alpha") == nil, "Alpha In use with no action")
+        h.click("Alpha")
+        await h.pass(60)
+        h.check(h.claude.actions.isEmpty, "nothing happens: \(h.claude.actions)")
+        h.check(h.claude.held == A, "Claude still holds Alpha")
+    },
+    Scenario(pair: "(In use settled, limit stop, target exists)", model: "\"Switched to <T>: <S> is out. N chats resumed.\"") { h in
+        await h.standard()
+        h.claude.screens["local_one"]?.busy = false
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held == B && h.resumed("local_one") }, limit: 600)
+        h.check(h.claude.held == B, "the automatic switch went to Beta, next down the menu: \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(h.claude.chats(in: B).contains("local_one"), "the stopped chat moved to Beta")
+        h.check(h.resumed("local_one"), "the stopped chat got one \"resume\": \(h.claude.sent)")
+        h.check(h.claude.sent.filter { $0.hasPrefix("local_one") }.count == 1, "exactly one resume")
+        h.check(h.state("Alpha") == .out, "Alpha shows Out after its settled stop: \(String(describing: h.state("Alpha")))")
+    },
+    Scenario(pair: "(In use settling, limit stop before settle)", model: "not counted against S; chat still resumed; nothing shown") { h in
+        await h.standard()
+        h.click("Beta")
+        await h.run(until: { h.claude.held == B }, limit: 300)
+        await h.pass(10)
+        h.claude.logLimitStop("local_one")
+        await h.pass(300)
+        h.check(h.claude.held == B, "no automatic switch away from Beta: \(String(describing: h.claude.held))")
+        h.check(h.quits == 1, "only the manual switch quit Claude: \(h.claude.actions)")
+        h.check(h.state("Beta") == .inUse && h.state("Beta") != .out, "Beta In use, not counted Out")
+        h.check(h.resumed("local_one"), "the chat is still resumed: \(h.claude.sent)")
+    },
+    Scenario(pair: "(In use, wrap-up: turn ended then 100% read)", model: "same as a limit stop") { h in
+        await h.standard()
+        let before = h.usage.reads.count
+        h.claude.logTurnEnded("local_one")
+        h.usage.set(A, fiveHour: 100, resetsAt: h.clock.now().addingTimeInterval(3600))
+        await h.run(until: { h.claude.held == B }, limit: 300)
+        h.check(h.usage.reads.dropFirst(before).contains(A.tag), "the turn's end triggered a read of Alpha's meter")
+        h.check(h.claude.held == B, "a turn ended then a 100% reading switches to Beta: \(String(describing: h.claude.held)), \(h.notice)")
+        await h.run(until: { h.resumed("local_one") }, limit: 120)
+        h.check(h.resumed("local_one"), "the wrapped-up chat gets one resume (13.2)")
+    },
+    Scenario(pair: "(Every seat out, out signal)", model: "\"Every seat is out. Chats resume when <seat> resets at <time>.\"") { h in
+        await h.standard()
+        let reset = h.clock.now().addingTimeInterval(2 * 3600)
+        for s in [A, B, C] { h.usage.set(s, fiveHour: 100, resetsAt: reset) }
+        h.claude.logLimitStop("local_one")
+        await h.pass(120)
+        h.check(h.claude.actions.isEmpty, "no switch when every seat is out: \(h.claude.actions)")
+        h.check(h.noticeHas("Every seat is out. Chats resume when") && h.noticeHas(ClockText.time(reset)), "the waiting line names the reset: \(h.notice)")
+    },
+    Scenario(pair: "(Waiting, reset time passes)", model: "read the meter, then resume in place or switch") { h in
+        await h.standard()
+        let now = h.clock.now()
+        h.usage.set(A, fiveHour: 100, resetsAt: now.addingTimeInterval(7200))
+        h.usage.set(B, fiveHour: 100, resetsAt: now.addingTimeInterval(600))
+        h.usage.set(C, fiveHour: 100, resetsAt: now.addingTimeInterval(7200))
+        h.claude.logLimitStop("local_one")
+        await h.pass(60)
+        h.check(h.noticeHas("Every seat is out"), "waiting first: \(h.notice)")
+        h.clock.after(590) { h.usage.set(B, fiveHour: 0, resetsAt: now.addingTimeInterval(600 + 5 * 3600)) }
+        await h.run(until: { h.claude.held == B && h.resumed("local_one") }, limit: 1200)
+        h.check(h.claude.held == B, "Beta's reset read gives it room and the app switches: \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(h.resumed("local_one"), "the waiting chat is resumed")
+    },
+    Scenario(pair: "(Not waiting, reset time passes)", model: "meter re-read, row changes") { h in
+        await h.standard()
+        let now = h.clock.now()
+        h.usage.set(B, fiveHour: 100, resetsAt: now.addingTimeInterval(600))
+        await h.pass(400)
+        h.check(h.state("Beta") == .out, "Beta Out before its reset: \(String(describing: h.state("Beta")))")
+        h.usage.set(B, fiveHour: 0, resetsAt: now.addingTimeInterval(600 + 5 * 3600))
+        await h.run(until: { h.state("Beta") == .ready }, limit: 400)
+        h.check(h.state("Beta") == .ready, "the reset is re-read and Beta is Ready: \(String(describing: h.state("Beta")))")
+        h.check(h.claude.actions.isEmpty, "no switch")
+    },
+    Scenario(pair: "(In use, meter reads 100% with no turn ended)", model: "Out on the row, no switch") { h in
+        await h.standard()
+        h.usage.set(A, fiveHour: 100, resetsAt: h.clock.now().addingTimeInterval(3600))
+        h.usage.set(B, fiveHour: 100, resetsAt: h.clock.now().addingTimeInterval(3600))
+        await h.pass(900)
+        h.check(h.claude.actions.isEmpty, "a meter alone never starts a switch: \(h.claude.actions)")
+        h.check(h.state("Beta") == .out, "Beta's row shows Out: \(String(describing: h.state("Beta")))")
+        h.check(h.action("Beta") == .switchTo, "an Out row keeps Switch")
+    },
+    Scenario(pair: "(Refused, Claude falls back to personal)", model: "personal row: In use") { h in
+        let P = StandSeat(1, org: 0)
+        try? h.rows([("Alpha", A), ("Alpha home", P)])
+        try? await h.savedLogin("Alpha home", P)
+        try? await h.savedLogin("Alpha", A)
+        h.claude.stale = [A]
+        h.make(); h.claude.start()
+        await h.pass(ClaudeTiming.settle + 30)
+        h.check(h.state("Alpha home") == .inUse, "the personal row is In use: \(String(describing: h.state("Alpha home")))")
+        h.check(h.state("Alpha") == .needsSignIn, "the refused row Needs sign-in")
+    },
+    Scenario(pair: "(No switch, Claude quits or crashes)", model: "\"Claude isn't running.\" Switch still works and opens Claude") { h in
+        await h.standard()
+        h.claude.stop()
+        await h.tick()
+        h.check(h.noticeHas("Claude isn't running."), "the notice says so: \(h.notice)")
+        h.check(h.action("Beta") == .switchTo, "Switch still shows")
+        h.click("Beta")
+        await h.run(until: { h.claude.held == B }, limit: 300)
+        h.check(h.claude.held == B, "Switch opens Claude on Beta: \(String(describing: h.claude.held)), \(h.notice)")
+    },
+    Scenario(pair: "(Quit wait, the person quits Claude)", model: "the quit succeeded, go on") { h in
+        await h.standard()
+        h.claude.quitBehaviour = .promptUnanswered
+        h.click("Beta")
+        await h.pass(20)
+        h.check(h.claude.pids().count == 1, "a manual switch waits for the person at the prompt")
+        h.claude.stop()
+        await h.run(until: { h.claude.held == B && h.state("Beta") == .inUse }, limit: 300)
+        h.check(h.claude.held == B, "the person's quit counts and the switch goes on: \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(!h.claude.actions.contains { $0.hasPrefix("pressed") }, "the app never pressed the prompt on a manual switch")
+    },
+    Scenario(pair: "(After launch before confirm, the person quits Claude)", model: "\"Open Claude to finish switching to <T>.\" no rollback while closed") { h in
+        await h.standard()
+        h.claude.nameAfter = 120
+        h.click("Beta")
+        await h.run(until: { h.launches == 1 }, limit: 120)
+        await h.pass(5)
+        h.claude.stop()
+        await h.pass(240)
+        h.check(h.noticeHas("Open Claude to finish switching to Beta."), "the notice asks to open Claude: \(h.notice)")
+        h.check(h.launches == 1 && h.claude.signInOnDisk() == B, "no rollback while Claude is closed: \(h.claude.actions)")
+        h.claude.nameAfter = 3
+        h.claude.start()
+        await h.run(until: { h.state("Beta") == .inUse }, limit: 300)
+        h.check(h.state("Beta") == .inUse && h.claude.chats(in: B).contains("local_one"), "confirmed when Claude next opens")
+    },
+    Scenario(pair: "(Between quit and launch, the person opens Claude)", model: "quit once more; a second time rolls back; \"Switching…\"") { h in
+        await h.standard()
+        h.claude.reopensAfterQuit = 1
+        h.click("Beta")
+        await h.run(until: { h.claude.held == B && h.state("Beta") == .inUse }, limit: 600)
+        h.check(h.claude.actions.contains("person opened"), "the stand-in reopened Claude mid-switch: \(h.claude.actions)")
+        h.check(h.quits == 2, "the app quit it once more: \(h.claude.actions)")
+        h.check(h.claude.held == B && h.claude.chats(in: B).contains("local_one"), "and carried on to Beta: \(String(describing: h.claude.held)), \(h.notice)")
+    },
+    Scenario(pair: "(Confirm, Claude restarts by itself)", model: "NewRun then Named: confirm as usual") { h in
+        await h.standard()
+        h.click("Beta")
+        await h.run(until: { h.claude.held == B }, limit: 300)
+        await h.pass(10)
+        h.claude.stop(); h.claude.start()
+        await h.run(until: { h.state("Beta") == .inUse }, limit: 300)
+        h.check(h.state("Beta") == .inUse && h.claude.held == B, "NewRun then Named confirms as usual")
+        h.check(h.quits == 1 && h.claude.signInOnDisk() == B, "no rollback: \(h.claude.actions)")
+    },
+    Scenario(pair: "(Any step, the app is quit, crashed or updated)", model: "\"Finished switching to <T>\" or \"Switch to <T> undone\"") { h in
+        await h.standard()
+        h.click("Beta")
+        await h.run(until: { h.quits == 1 && h.claude.pids().isEmpty }, limit: 120)
+        h.crashApp()
+        await h.tick()
+        await h.run(until: { h.claude.held != nil && h.state("Alpha") != .switching && h.state("Beta") != .switching }, limit: 600)
+        h.check(h.claude.held == A || h.claude.held == B, "Claude ends signed in to Alpha or Beta: \(String(describing: h.claude.held))")
+        h.check(h.noticeHas("Finished switching to Beta") || h.noticeHas("Switch to Beta undone"), "the notice says how it ended: \(h.notice)")
+        h.check(h.hasSavedLogin(A) && h.hasSavedLogin(B), "every saved login intact")
+        let where_ = h.claude.held == B ? B : A
+        h.check(h.claude.chats(in: where_).contains("local_one"), "the chat is in the folder Claude holds")
+    },
+    Scenario(pair: "(Any, sleep then wake)", model: "meters stale then re-read; no automatic decision until a fresh read") { h in
+        await h.standard()
+        h.clock.advance(2 * 3600)
+        h.usage.fail(B); h.usage.fail(C)
+        h.claude.logLimitStop("local_one")
+        h.check(h.meterText("Beta") != nil, "after the sleep Beta's meter reads stale before any tick: \(String(describing: h.meterText("Beta")))")
+        await h.tick(); await h.settle()
+        await h.pass(60)
+        h.check(h.claude.actions.isEmpty, "no automatic decision without a fresh read: \(h.claude.actions)")
+        h.usage.set(B, fiveHour: 10, resetsAt: h.clock.now().addingTimeInterval(3600))
+        await h.run(until: { h.claude.held == B }, limit: 600)
+        h.check(h.claude.held == B, "the fresh read makes Beta the target: \(String(describing: h.claude.held))")
+    },
+    Scenario(pair: "(Lock held before resume, second switch)", model: "\"Already switching to <T>.\"") { h in
+        await h.standard()
+        h.claude.quitBehaviour = .promptUnanswered
+        h.click("Beta")
+        await h.pass(10)
+        h.click("Gamma")
+        await h.settle()
+        h.check(h.noticeHas("Already switching to Beta."), "the second request is refused: \(h.notice)")
+    },
+    Scenario(pair: "(During resume, second switch)", model: "resume cancelled, chats carried over") { h in
+        await h.standard(onScreen: false)
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held == B }, limit: 600)
+        await h.pass(90)
+        h.check(!h.resumed("local_one"), "the resume is still retrying (box not on screen)")
+        h.click("Gamma")
+        h.claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
+        await h.run(until: { h.claude.held == C && h.resumed("local_one") }, limit: 600)
+        h.check(h.claude.chats(in: C).contains("local_one"), "the chat carried over to Gamma")
+        h.check(h.resumed("local_one"), "and resumed after Gamma's confirm: \(h.claude.sent)")
+    },
+    Scenario(pair: "(Resume, message box not on screen)", model: "\"Couldn't resume 1 chat: send it a message.\" after 30 min") { h in
+        await h.standard(onScreen: false)
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held == B }, limit: 600)
+        await h.pass(31 * 60)
+        h.check(h.claude.actions.contains { $0.hasPrefix("open ") }, "the chat was opened by its link: \(h.claude.actions)")
+        h.check(h.noticeHas("Couldn't resume 1 chat: send it a message."), "after 30 min the chat is named: \(h.notice)")
+    },
+    Scenario(pair: "(Any, Accessibility not granted)", model: "\"Allow Accessibility so Claude Accounts can switch on its own and resume chats.\"") { h in
+        h.claude.trustedAX = false
+        await h.standard()
+        h.check(h.noticeHas("Allow Accessibility so Claude Accounts can switch on its own and resume chats."), "one line asks for Accessibility: \(h.notice)")
+        h.claude.logLimitStop("local_one")
+        await h.pass(300)
+        h.check(h.claude.actions.isEmpty, "automatic switching is off: \(h.claude.actions)")
+        h.check(h.action("Beta") == .switchTo, "manual Switch still offered")
+    },
+    Scenario(pair: "(Any, Claude not installed)", model: "\"Claude isn't installed.\" Switch hidden") { h in
+        await h.standard()
+        h.claude.stop(); h.claude.installed = false
+        await h.tick()
+        h.check(h.noticeHas("Claude isn't installed."), "the notice says so: \(h.notice)")
+        h.check(h.action("Beta") == nil && h.action("Gamma") == nil, "Switch is hidden")
+        h.check(h.state("Beta") == .ready, "rows and meters still work")
+    },
+    Scenario(pair: "(Any, Claude never signed in or signed out)", model: "every seat Needs sign-in; Set Up on each row") { h in
+        try? h.rows([("Alpha", A), ("Beta", B)])
+        h.claude.writeSignIn(nil)
+        h.claude.start(); h.make()
+        await h.pass(90)
+        h.check(h.state("Alpha") == .needsSignIn && h.state("Beta") == .needsSignIn, "every seat Needs sign-in")
+        h.check(h.action("Alpha") == .setUp && h.action("Beta") == .setUp, "Set Up on each row")
+    },
+    Scenario(pair: "(Any, unknown Claude version or shape mismatch)", model: "\"Claude updated to a version this app hasn't checked. Switching on its own is paused.\"") { h in
+        h.claude.version = "99.0.0"
+        await h.standard()
+        h.check(h.noticeHas("Claude updated to a version this app hasn't checked. Switching on its own is paused."), "the paused line: \(h.notice)")
+        h.claude.logLimitStop("local_one")
+        await h.pass(300)
+        h.check(h.claude.actions.isEmpty, "no automatic switch on an unrecognised Claude: \(h.claude.actions)")
+        h.click("Beta")
+        await h.run(until: { h.claude.held == B }, limit: 300)
+        h.check(h.claude.held == B, "manual Switch still works")
+    },
+    Scenario(pair: "(Any, row renamed or reordered)", model: "display and automatic order only") { h in
+        await h.standard()
+        h.move("Gamma", by: -1)
+        h.rename("Beta", to: "Bee")
+        await h.tick()
+        h.check(h.rowNames == ["Alpha", "Gamma", "Bee"], "renamed and reordered rows: \(h.rowNames)")
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held != A && h.claude.held != nil }, limit: 600)
+        h.check(h.claude.held == C, "the automatic target follows the person's order: \(String(describing: h.claude.held))")
+    },
+    Scenario(pair: "(Not in use, row removed)", model: "saved login and row deleted; chats stay") { h in
+        h.claude.addChat("beta_chat", in: B, lastActivity: h.clock.now())
+        await h.standard()
+        h.remove("Beta")
+        await h.tick()
+        h.check(!h.rowNames.contains("Beta"), "the row is gone: \(h.rowNames)")
+        h.check(!h.hasSavedLogin(B), "its saved login is deleted")
+        h.check(h.claude.chats(in: B).contains("beta_chat"), "its chats stay in Claude's folder")
+    },
+    Scenario(pair: "(In use, row removed)", model: "\"Claude is on an account not in the list.\"") { h in
+        await h.standard()
+        h.remove("Alpha")
+        await h.tick()
+        h.check(h.claude.held == A, "Claude still holds the pair")
+        h.check(h.noticeHas("Claude is on an account not in the list."), "the notice says so: \(h.notice)")
+    },
+    Scenario(pair: "(Any, two rows with the same name)", model: "\" · <organization>\", then \" (2)\"; never an email") { h in
+        let D = StandSeat(4, org: 2)
+        try? h.rows([("Work", A), ("Work", D), ("Work", B)], orgNames: ["Team", "Lab", "Team"])
+        h.make(); await h.tick()
+        h.check(h.rowNames == ["Work · Team", "Work · Lab", "Work · Team (2)"], "unique labels: \(h.rowNames)")
+        h.check(!h.rowNames.contains { $0.contains("@") }, "never an email")
+    },
+    Scenario(pair: "(Any, meter stale or missing)", model: "manual switch allowed, not an automatic target; \"read N min ago\" or \"not read yet\"") { h in
+        try? h.rows([("Alpha", A), ("Beta", B), ("Gamma", C)])
+        for (n, seat) in [("Beta", B), ("Gamma", C), ("Alpha", A)] { try? await h.savedLogin(n, seat) }
+        h.usage.set(A, fiveHour: 20, resetsAt: h.clock.now().addingTimeInterval(3 * 3600))
+        h.usage.set(C, fiveHour: 20, resetsAt: h.clock.now().addingTimeInterval(3 * 3600))
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
+        h.claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        h.check(h.meterText("Beta") == "not read yet", "Beta's meter reads not read yet: \(String(describing: h.meterText("Beta")))")
+        h.check(h.action("Beta") == .switchTo, "manual Switch allowed")
+        h.claude.logLimitStop("local_one")
+        await h.run(until: { h.claude.held != A && h.claude.held != nil }, limit: 600)
+        h.check(h.claude.held == C, "Beta is skipped as an automatic target: \(String(describing: h.claude.held))")
+    },
     Scenario(pair: "(Any, more rows than fit)", model: "cards scroll; title and notice pinned; row in use visible (MenuLayout seam)", body: nil),
     // Section 6 steps, section 8 invariants and section 9 cases.
-    Scenario(pair: "(Switch step 2, quit prompt cancelled)", model: "\"Switch cancelled\", nothing changed", body: nil),
-    Scenario(pair: "(Switch step 6, Claude names another pair)", model: "roll back; \"<seat> asked for a new sign-in. Back on <S>.\"", body: nil),
+    Scenario(pair: "(Switch step 2, quit prompt cancelled)", model: "\"Switch cancelled\", nothing changed") { h in
+        await h.standard()
+        h.claude.quitBehaviour = .promptCancelled
+        h.click("Beta")
+        await h.run(until: { h.noticeHas("Switch cancelled") }, limit: 120)
+        h.check(h.noticeHas("Switch cancelled"), "the notice says so: \(h.notice)")
+        h.check(h.claude.held == A && h.claude.signInOnDisk() == A && h.claude.chats(in: A).contains("local_one"), "nothing changed")
+    },
+    Scenario(pair: "(Switch step 6, Claude names another pair)", model: "roll back; \"<seat> asked for a new sign-in. Back on <S>.\"") { h in
+        await h.standard()
+        h.claude.stale = [B]
+        h.click("Beta")
+        await h.run(until: { h.noticeHas("Back on Alpha") && h.claude.held == A }, limit: 600)
+        h.check(h.noticeHas("Beta asked for a new sign-in. Back on Alpha."), "the row says why: \(h.notice)")
+        h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "rolled back to Alpha with its chats")
+        h.check(h.state("Beta") == .needsSignIn, "Beta Needs sign-in")
+        h.check(h.hasSavedLogin(A), "Alpha's saved login intact")
+    },
     Scenario(pair: "(Invariant A, faults at every step)", model: "kill app, kill Claude, full disk, failed read: ends signed in to S or T, every saved login intact", body: nil),
-    Scenario(pair: "(Any Mac, first launch nothing saved)", model: "first-run screen, then the held seat becomes the first row once settled", body: nil),
-    Scenario(pair: "(Any Mac, one account one organization)", model: "one row, no Switch, automatic stays quiet", body: nil),
-    Scenario(pair: "(Any Mac, one account several organizations)", model: "a row per organization; switching moves chats", body: nil),
+    Scenario(pair: "(Any Mac, first launch nothing saved)", model: "first-run screen, then the held seat becomes the first row once settled") { h in
+        h.make(); await h.tick()
+        h.check(h.firstRun, "the first-run screen shows with no rows")
+        h.claude.writeSignIn(A)
+        h.claude.start()
+        await h.pass(ClaudeTiming.settle + 45)
+        h.check(h.rowNames.count == 1 && h.state(h.rowNames.first ?? "") == .inUse, "the held seat became the first row once settled: \(h.rowNames)")
+        h.check(h.hasSavedLogin(A), "and its login was saved while Claude ran (13a.2)")
+    },
+    Scenario(pair: "(Any Mac, one account one organization)", model: "one row, no Switch, automatic stays quiet") { h in
+        try? h.rows([("Alpha", A)])
+        try? await h.savedLogin("Alpha", A)
+        h.usage.set(A, fiveHour: 20, resetsAt: h.clock.now().addingTimeInterval(3600))
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        h.check(h.rowNames == ["Alpha"] && h.action("Alpha") == nil, "one row, no Switch")
+        h.claude.logLimitStop("local_one")
+        await h.pass(300)
+        h.check(h.claude.actions.isEmpty, "no target, no switch")
+    },
+    Scenario(pair: "(Any Mac, one account several organizations)", model: "a row per organization; switching moves chats") { h in
+        let P = StandSeat(1, org: 0)
+        try? h.rows([("Alpha", A), ("Alpha", P)], orgNames: ["Team", "Personal"])
+        try? await h.savedLogin("Alpha", P)
+        try? await h.savedLogin("Alpha", A)
+        h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
+        h.claudeHoldsSettled(); h.make(); await h.tick()
+        h.check(h.rowNames == ["Alpha · Team", "Alpha · Personal"], "a row per organization: \(h.rowNames)")
+        h.click("Alpha · Personal")
+        await h.run(until: { h.claude.held == P }, limit: 300)
+        h.check(h.claude.held == P && h.claude.chats(in: P).contains("local_one"), "switching moves the chats between them")
+    },
     Scenario(pair: "(Any Mac, twenty rows)", model: "cards scroll, compact rows; height within 900 pt and 1400 pt screens", body: nil),
 ]
 
 @main
 enum ScenarioRun {
     @MainActor static func main() async {
+        setvbuf(stdout, nil, _IOLBF, 0)
         var passed = 0, failed = 0, pending = 0
         let only = CommandLine.arguments.dropFirst().first
         for s in scenarios where only == nil || s.pair.contains(only!) {
