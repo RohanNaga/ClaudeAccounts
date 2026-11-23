@@ -220,6 +220,8 @@ let scenarios: [Scenario] = [
         h.check(h.resumed("local_one"), "the stopped chat got one \"resume\": \(h.claude.sent)")
         h.check(h.claude.sent.filter { $0.hasPrefix("local_one") }.count == 1, "exactly one resume")
         h.check(h.state("Alpha") == .out, "Alpha shows Out after its settled stop: \(String(describing: h.state("Alpha")))")
+        await h.run(until: { !h.claude.notifications.isEmpty }, limit: 120)
+        h.check(h.claude.notifications.contains("Switched to Beta: Switched to Beta: Alpha is out. 1 chat resumed."), "the notification: \(h.claude.notifications)")
     },
     Scenario(pair: "(In use settling, limit stop before settle)", model: "not counted against S; chat still resumed; nothing shown") { h in
         await h.standard()
@@ -441,7 +443,7 @@ let scenarios: [Scenario] = [
         h.check(h.action("Alpha") == .setUp && h.action("Beta") == .setUp, "Set Up on each row")
     },
     Scenario(pair: "(Any, unknown Claude version or shape mismatch)", model: "\"Claude updated to a version this app hasn't checked. Switching on its own is paused.\"") { h in
-        h.claude.version = "99.0.0"
+        h.claude.claudeVersion = "99.0.0"
         await h.standard()
         h.check(h.noticeHas("Claude updated to a version this app hasn't checked. Switching on its own is paused."), "the paused line: \(h.notice)")
         h.claude.logLimitStop("local_one")
