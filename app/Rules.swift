@@ -101,11 +101,6 @@ extension Array where Element == AccountRecord {
         return unnamed.count == 1 ? unnamed[0] : nil
     }
 
-    /// Rows for the same account in other organizations than `row`.
-    func otherOrganizations(of row: AccountRecord) -> [AccountRecord] {
-        filter { $0.id != row.id && $0.accountUuid != nil && $0.accountUuid == row.accountUuid }
-    }
-
     /// The rows grouped by account, in the order each account first appears, so the menu shows
     /// one entry per account with its organizations beneath. A row with no account id stands alone.
     func groupedByAccount() -> [[AccountRecord]] {

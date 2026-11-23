@@ -44,7 +44,6 @@ struct RulesTests {
         check(rows.row(for: Identity(account: "acct", org: "org-z")) == nil, "an organization not added matches no row")
         check(rows.row(for: Identity(account: "other", org: "any"))?.id == "c", "a row saved before organizations still matches")
         check(rows.row(for: nil) == nil, "no identity, no row")
-        check(rows.otherOrganizations(of: personal).map(\.id) == ["b"], "the other organization of an account")
 
         // The menu: one entry per account, its organizations beneath, in first-seen order.
         check(rows.groupedByAccount().map { $0.map(\.id) } == [["a", "b"], ["c"]], "organizations group under their account")
