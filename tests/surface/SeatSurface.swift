@@ -54,3 +54,6 @@ enum ShownAction: Equatable { case switchTo, setUp }
         if s.action == .setUp { store.setUp(s) } else { store.switchTo(s) }
     }
 }
+
+/// The Claude version the stand-in reports: the newest one the contracts were recorded on.
+let standInClaudeVersion = ClaudeContract.recordedVersions.sorted().last!
