@@ -595,9 +595,11 @@ struct MoveItems: View {
 }
 
 /// The mark on the seat the automatic switch goes to next, so the switch order shows in the menu.
+/// The accent alone measures about 3.8:1 on the card; mixed a fifth toward the label colour (darker
+/// in light, lighter in dark) it keeps 4.5:1 or more in both.
 struct NextMark: View {
     var body: some View {
-        Text("Next").font(.caption.weight(.semibold)).foregroundStyle(.tint).fixedSize()
+        Text("Next").font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor.mix(with: .primary, by: 0.2)).fixedSize()
             .help("Auto-switch goes here next when Claude stops a chat for usage. Switch Order in the title's ··· menu, and Move Up and Move Down in a row's ··· menu, change it.")
     }
 }
