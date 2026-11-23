@@ -538,7 +538,162 @@ let gapScenarios: [Scenario] = [
         await h.pass(35 * 60)
         h.check(!h.noticeHas("Couldn't resume") && h.claude.sent == ["local_one resume"], "the stopped in-place resume names nothing later: \(h.notice), typed \(h.claude.sent)")
     },
+    // 25. The upgrade. The previous build kept each row's Claude login in slots/<row id>; on its first
+    // start the new build files each one under its pair and leaves the slots, so a rollback to the
+    // previous build still logs in, and that build reads back the rows and settings the new one saves.
+    Scenario(pair: "(Upgrade from the previous build's saved state)", model: "each seat with a saved login is Ready or In use with it filed under its pair; the old slots stay; the rows keep their order, names and labels; a manual Switch confirms with its chats; the previous build reads back what the new build saves") { h in
+        let work = StandSeat(1, org: 0), lab = StandSeat(1, org: 3), side = StandSeat(2, org: 0), studio = StandSeat(3, org: 5)
+        let old = PreviousBuild(claude: h.claude)
+        // Account 1 has two organizations; its first row and account 2's row were saved before rows
+        // kept organizations. Account 3's row was added but never set up in Claude, so it has no slot.
+        let rows = [
+            old.row(1, "Work", "#3567CF", work, email: "one@example.com", orgName: "one@example.com's Organization", kept: false),
+            old.row(2, "Work", "#3567CF", lab, email: "one@example.com", orgName: "Lab", orgLabel: "Research"),
+            old.row(3, "Side", "#B96E22", side, email: "two@example.com", orgName: "two@example.com's Organization", kept: false),
+            old.row(4, "Studio", "#B3405F", studio, email: "three@example.com", orgName: "Studio"),
+        ]
+        let settings = PreviousBuild.Settings(display: .gaugePercent, metric: .weekly, autoSwitch: false, collapsed: [side.account])
+        do {
+            try old.write(rows, settings)
+            // Each saved at a switch away with Claude quit; Work's personal seat last, so its sign-in is
+            // the one left in Claude's files.
+            for (row, seat) in [(rows[1], lab), (rows[2], side), (rows[0], work)] { try old.saveSlot(row.id, as: seat) }
+        } catch { h.check(false, "setup: writing the previous build's state threw \(error)"); return }
+        let slots = old.slotFiles()
+        let marks = [work: old.slotMark(rows[0].id), lab: old.slotMark(rows[1].id), side: old.slotMark(rows[2].id)]
+        for seat in [work, lab, side, studio] { h.usage.set(seat, fiveHour: 20, resetsAt: h.now.addingTimeInterval(3 * 3600)) }
+        h.claude.addChat("local_one", in: work, lastActivity: h.now)
+        h.claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
+        h.claudeHoldsSettled(); h.make()
+        for (seat, mark) in marks {
+            let filed = h.claude.writeMark(in: h.claude.stateDir.appendingPathComponent("saved/\(seat.account)_\(seat.org)/current/cookies.db"))
+            h.check(mark != nil && filed == mark, "\(seat)'s login is filed in saved/<account>_<org>/current: \(String(describing: filed)), the slot holds \(String(describing: mark))")
+        }
+        await h.tick(); await h.settle()
+        let labels = ["Work · Individual", "Work · Research", "Side", "Studio"]
+        h.check(h.rowNames == labels, "the rows keep their order and labels: \(h.rowNames)")
+        h.check(h.store.accounts.map(\.name) == rows.map(\.name) && h.store.accounts.map(\.color) == rows.map(\.color), "and their names and colours: \(h.store.accounts.map(\.name)), \(h.store.accounts.map(\.color))")
+        h.check(h.state("Work · Individual") == .inUse, "the seat Claude holds is In use: \(String(describing: h.state("Work · Individual")))")
+        for name in ["Work · Research", "Side"] { h.check(h.state(name) == .ready, "\(name) is Ready from its adopted login: \(String(describing: h.state(name)))") }
+        h.check(h.state("Studio") == .needsSignIn, "the row the previous build never set up still needs sign-in: \(String(describing: h.state("Studio")))")
+        h.check(old.slotFiles() == slots, "the previous build's slots are still there, unchanged: \(old.slotFiles().keys.sorted())")
+
+        h.click("Side")
+        await h.run(until: { h.claude.held == side && h.state("Side") == .inUse && !h.switchInFlight }, limit: 600)
+        h.check(h.claude.held == side && h.state("Side") == .inUse, "a manual Switch confirms on Side from its adopted login: holds \(String(describing: h.claude.held)), \(h.notice)")
+        h.check(h.claude.chats(in: side).contains("local_one") && !h.claude.chats(in: work).contains("local_one"), "the chat moved to Side's folder")
+        h.check(h.rowNames == labels, "the rows are unchanged after the switch: \(h.rowNames)")
+
+        // The person recolours an account and picks a switch order, so the new build saves both files.
+        if let seat = h.store.seats.first(where: { $0.name == "Side" }) { h.store.recolor(seat, "#6B5BD2") }
+        h.store.settings.switchOrder = .personalFirst
+        await h.settle()
+        var expected = rows
+        expected[0].orgUuid = work.org; expected[0].orgName = "one@example.com's Organization"
+        expected[2].orgUuid = side.org; expected[2].orgName = "two@example.com's Organization"; expected[2].color = "#6B5BD2"
+        let back = old.read()
+        h.check(back.rows == expected, "the previous build reads every row back from the new build's accounts.json, the old rows now naming their organizations: \(String(describing: back.rows))")
+        h.check(back.settings == settings, "and every setting from its settings.json: \(String(describing: back.settings))")
+        h.check(old.slotFiles() == slots, "the slots are unchanged after the switch and both saves: \(old.slotFiles().keys.sorted())")
+    },
 ]
+
+/// The state folder as the previous build (main at dd5f4f2) wrote it: accounts.json, settings.json,
+/// and each row's saved Claude login in slots/<row id>. The types copy that build's keys, and each
+/// file is written with that build's encoder, layout and permissions.
+private struct PreviousBuild {
+    /// Its AccountRecord as saved: a nil optional is left out.
+    struct Row: Codable, Equatable {
+        let id: String
+        var name: String
+        var color: String
+        var configDir: String
+        var keychainService: String
+        let email: String?
+        let accountUuid: String?
+        var orgName: String?
+        var orgUuid: String?
+        var orgLabel: String? = nil
+    }
+    private struct AccountsFile: Codable { var accounts: [Row] }
+    /// Its LoginSlot.Meta: the pair Claude held at the save, and Claude's sign-in keys from config.json.
+    private struct Slot: Codable { var account: String?; var orgFolder: String?; var config: [String: String] }
+    enum Display: String, Codable { case gauge, gaugePercent, gaugeNamePercent }
+    enum Metric: String, Codable { case fiveHour, weekly }
+    /// Its AppSettings. Every key is required here, so a key the new build drops fails the read.
+    struct Settings: Codable, Equatable { var display: Display; var metric: Metric; var autoSwitch: Bool; var collapsed: Set<String> }
+    private static let configKeys = ["oauth:tokenCache", "oauth:tokenCacheV2", "lastKnownAccountUuid"]
+
+    let claude: StandInClaude
+    private var state: URL { claude.stateDir }
+    private func slot(_ id: String) -> URL { state.appendingPathComponent("slots/\(id)") }
+
+    /// A row with its Claude Code login's profile on disk. `kept: false` is a row saved before rows
+    /// kept organizations. The login folder sits in the stand-in's root, never under the real home.
+    func row(_ n: Int, _ name: String, _ color: String, _ seat: StandSeat, email: String, orgName: String,
+             orgLabel: String? = nil, kept: Bool = true) -> Row {
+        let id = String(format: "acct-%08x", n)
+        let dir = claude.root.appendingPathComponent("cli/\(id)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let profile = [ClaudeFiles.cliAccount: ["accountUuid": seat.account, "emailAddress": email,
+                                                "organizationUuid": seat.org, "organizationName": orgName]]
+        try? JSONSerialization.data(withJSONObject: profile).write(to: dir.appendingPathComponent(ClaudeFiles.cliProfile))
+        return Row(id: id, name: name, color: color, configDir: dir.path, keychainService: "test-\(id)", email: email,
+                   accountUuid: seat.account, orgName: kept ? orgName : nil, orgUuid: kept ? seat.org : nil, orgLabel: orgLabel)
+    }
+
+    func write(_ rows: [Row], _ settings: Settings) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: state, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let accounts = state.appendingPathComponent("accounts.json")
+        try enc.encode(AccountsFile(accounts: rows)).write(to: accounts, options: .atomic)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: accounts.path)
+        try JSONEncoder().encode(settings).write(to: state.appendingPathComponent("settings.json"), options: .atomic)
+    }
+
+    /// Saves the sign-in Claude's files hold as `seat` into the row's slot, as that build's capture did
+    /// with Claude quit: the claude.ai cookie rows into a fresh database, the sign-in keys into slot.json.
+    func saveSlot(_ id: String, as seat: StandSeat) throws {
+        claude.writeSignIn(seat)
+        let fm = FileManager.default, dir = slot(id)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let source = "'" + claude.cookies.path.replacingOccurrences(of: "'", with: "''") + "'"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        p.arguments = ["-bail", dir.appendingPathComponent("cookies.db").path,
+                       "ATTACH \(source) AS c; CREATE TABLE cookies AS SELECT * FROM c.cookies WHERE host_key IN ('.claude.ai','claude.ai');"]
+        try p.run(); p.waitUntilExit()
+        guard p.terminationStatus == 0 else { throw CocoaError(.fileWriteUnknown) }
+        let config = try JSONSerialization.jsonObject(with: Data(contentsOf: claude.config)) as? [String: Any] ?? [:]
+        let keys = Self.configKeys.reduce(into: [String: String]()) { keys, k in keys[k] = config[k] as? String }
+        try JSONEncoder().encode(Slot(account: seat.account, orgFolder: seat.org, config: keys))
+            .write(to: dir.appendingPathComponent("slot.json"), options: .atomic)
+        for f in ["cookies.db", "slot.json"] { try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dir.appendingPathComponent(f).path) }
+    }
+
+    /// The stand-in's write mark in a row's slot: which sign-in it holds.
+    func slotMark(_ id: String) -> String? { claude.writeMark(in: slot(id).appendingPathComponent("cookies.db")) }
+
+    /// Every file under slots/, by its path there, with its bytes.
+    func slotFiles() -> [String: Data] {
+        let root = state.appendingPathComponent("slots")
+        let paths = FileManager.default.subpaths(atPath: root.path) ?? []
+        return paths.reduce(into: [:]) { files, p in
+            if let data = FileManager.default.contents(atPath: root.appendingPathComponent(p).path) { files[p] = data }
+        }
+    }
+
+    /// accounts.json and settings.json as the previous build decodes them; nil where it can't.
+    func read() -> (rows: [Row]?, settings: Settings?) {
+        let accounts = (try? Data(contentsOf: state.appendingPathComponent("accounts.json")))
+            .flatMap { try? JSONDecoder().decode(AccountsFile.self, from: $0) }?.accounts
+        let settings = (try? Data(contentsOf: state.appendingPathComponent("settings.json")))
+            .flatMap { try? JSONDecoder().decode(Settings.self, from: $0) }
+        return (accounts, settings)
+    }
+}
 
 /// Alpha runs out with its chat stopped while Beta and Gamma are out too, so the chat waits; then
 /// `meanwhile` runs, and Alpha's meter shows room again from its reset, off the 5 min grid. Returns
