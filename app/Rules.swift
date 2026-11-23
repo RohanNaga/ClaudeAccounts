@@ -794,11 +794,37 @@ struct ClaudeEvents {
 
 // MARK: Facts
 
-/// Claude as a process: installed (F1), running (F1), and a version the contracts were recorded on (F2).
+/// A shape of Claude's that the app checks each time it relies on it (model, section 8). A missing
+/// shape is never acted on, and switching on its own pauses until that shape is seen whole again.
+/// Claude's version plays no part: an update that changes nothing the app reads changes nothing.
+enum ClaudeShape: String, Codable, CaseIterable, Comparable {
+    /// A Named line in Claude's log after a launch the app made.
+    case namedLine
+    /// The Quit anyway button on Claude's quit prompt.
+    case quitButton
+    /// The schema of Claude's cookie database.
+    case cookieSchema
+
+    /// Why switching on its own is paused, as the person reads it.
+    var why: String {
+        switch self {
+        case .namedLine: return "Claude opened without saying which account it's on"
+        case .quitButton: return "Claude's quit prompt has no Quit anyway button"
+        case .cookieSchema: return "Claude's sign-in file is in a format this app doesn't know"
+        }
+    }
+
+    static func < (a: ClaudeShape, b: ClaudeShape) -> Bool {
+        allCases.firstIndex(of: a)! < allCases.firstIndex(of: b)!
+    }
+}
+
+/// Claude as a process: installed (F1), running (F1), and the shapes the app found missing and
+/// has not seen whole since.
 struct ClaudeFacts: Equatable {
     var installed = true
     var running = false
-    var recognised = true
+    var missing: Set<ClaudeShape> = []
 }
 
 /// The switch in progress, from its journal (F7).
@@ -864,11 +890,11 @@ enum OutRule {
 // MARK: The automatic switch
 
 enum AutoSwitch {
-    enum Status: Equatable { case on, offAccessibility, offUnrecognised, offByPerson }
+    enum Status: Equatable { case on, offAccessibility, offShapeMissing(ClaudeShape), offByPerson }
 
     static func status(_ f: Facts) -> Status {
         if !f.autoChosen { return .offByPerson }
-        if !f.claude.recognised { return .offUnrecognised }
+        if let shape = f.claude.missing.min() { return .offShapeMissing(shape) }
         if !f.trusted { return .offAccessibility }
         return .on
     }
@@ -963,7 +989,7 @@ enum NoticeAction: Equatable { case openAccessibility, addSeat }
 struct Notice: Equatable {
     /// Lower is more important; the menu shows only the first.
     enum Kind: Int, Comparable {
-        case switching, failure, waiting, accessibility, unrecognisedClaude, claude, success
+        case switching, failure, waiting, accessibility, shapeMissing, claude, success
         static func < (a: Kind, b: Kind) -> Bool { a.rawValue < b.rawValue }
     }
     let kind: Kind
@@ -998,17 +1024,21 @@ enum AppState {
         if let failure { all.append(Notice(kind: .failure, text: failure)) }
         if case .wait(let seat, let at) = AutoSwitch.decide(f, now: now), f.waitingChats > 0 {
             let when = at.map { " at \(ClockText.time($0))" } ?? ""
-            all.append(Notice(kind: .waiting, text: "Every seat is out. Chats resume\(when).",
-                              detail: "Every seat is out. Chats resume when \(name(seat) ?? "a seat") resets\(when)."))
+            if f.rows.compactMap(\.identity).count == 1 {
+                all.append(Notice(kind: .waiting, text: "\(name(seat) ?? "Your seat") is out. Chats resume when it resets\(when)."))
+            } else {
+                all.append(Notice(kind: .waiting, text: "Every seat is out. Chats resume\(when).",
+                                  detail: "Every seat is out. Chats resume when \(name(seat) ?? "a seat") resets\(when)."))
+            }
         }
         if !f.trusted {
             all.append(Notice(kind: .accessibility, text: "Allow Accessibility to switch on its own.",
                               detail: "Allow Accessibility so Claude Accounts can switch on its own and resume chats.",
                               action: .openAccessibility))
         }
-        if !f.claude.recognised {
-            all.append(Notice(kind: .unrecognisedClaude, text: "Claude updated. Switching on its own is paused.",
-                              detail: "Claude updated to a version this app hasn't checked. Switching on its own is paused."))
+        if let shape = f.claude.missing.min() {
+            all.append(Notice(kind: .shapeMissing, text: "Switching on its own is paused. \(shape.why).",
+                              detail: "Switching on its own is paused. \(shape.why). It turns back on by itself once that changes."))
         }
         if !f.claude.installed { all.append(Notice(kind: .claude, text: "Claude isn't installed.")) }
         else if !f.claude.running { all.append(Notice(kind: .claude, text: "Claude isn't running.")) }
