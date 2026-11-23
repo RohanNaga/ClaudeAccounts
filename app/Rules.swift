@@ -910,3 +910,433 @@ enum ComposerRule {
         return nil
     }
 }
+
+// MARK: - The model
+//
+// One seat is one Claude account in one organization, keyed by the pair (Identity). Every state
+// the menu shows comes from `seatState` and `AppState`, which read the facts below fresh and
+// store no guesses. The only stored memories are facts: saved logins, meter readings, the time
+// Claude stopped a chat for usage on a seat, a target whose switch failed, and the switch journal.
+
+/// Every time and length the model waits on, each with its reason.
+enum Limits {
+    /// Claude refuses a too-old sign-in 4 to 21 s after naming the organization, then falls back
+    /// to the personal one; three times the slowest fall-back seen. A hold this old is settled:
+    /// its login may be saved, and a stop or a wrap-up counts against it.
+    static let settle: TimeInterval = 60
+    /// An older reading can't choose an automatic target.
+    static let freshness: TimeInterval = 15 * 60
+    /// At most one usage read per seat per minute for the wrap-up check.
+    static let meterOnTurnEnd: TimeInterval = 60
+    /// Background meter refresh.
+    static let meterEvery: TimeInterval = 5 * 60
+    /// Every reset time schedules a read this long after it.
+    static let meterAfterReset: TimeInterval = 60
+    /// A target whose switch failed is skipped this long, so a failure never repeats in a loop.
+    static let coolDown: TimeInterval = 10 * 60
+    /// A stop with no reset ahead counts the seat out this long: the shorter usage window.
+    static let outWithoutReset: TimeInterval = 5 * 3600
+    /// An unattended switch that can't get Claude to quit this long cancels and stops. A manual
+    /// switch has no limit: the person answers Claude's prompt.
+    static let autoQuitWait: TimeInterval = 3 * 60
+    /// Time for a relaunched Claude to name and settle on the target.
+    static let confirmWait: TimeInterval = 3 * 60
+    /// Set Up waits for a person to sign in.
+    static let setUpConfirmWait: TimeInterval = 10 * 60
+    /// A chat not on screen, or still running, is retried this often for this long, then named.
+    static let resumeEvery: TimeInterval = 60
+    static let resumeFor: TimeInterval = 30 * 60
+    /// A meter at or above this is out.
+    static let full: Double = 100
+}
+
+/// One usage meter as read from the usage service.
+struct MeterReading: Equatable, Codable {
+    var percent: Double
+    var resetsAt: Date?
+}
+
+/// A seat's meters; nil readAt means not read yet.
+struct SeatMeters: Equatable, Codable {
+    var fiveHour: MeterReading?
+    var weekly: MeterReading?
+    var readAt: Date?
+
+    /// The fuller of the two meters: the one a compact row and the menu bar show.
+    var fuller: MeterReading? { [fiveHour, weekly].compactMap { $0 }.max { $0.percent < $1.percent } }
+    func isFresh(at now: Date) -> Bool { readAt.map { now.timeIntervalSince($0) < Limits.freshness } ?? false }
+    func isStale(at now: Date) -> Bool { readAt != nil && !isFresh(at: now) }
+
+    /// "not read yet", "read 40 min ago", or nil while fresh.
+    func readText(at now: Date) -> String? {
+        guard let readAt else { return "not read yet" }
+        guard !isFresh(at: now) else { return nil }
+        let minutes = Int(now.timeIntervalSince(readAt) / 60)
+        return minutes < 120 ? "read \(minutes) min ago" : "read \(minutes / 60) h ago"
+    }
+
+    /// A fresh reading with a full meter whose reset is still ahead: out until that reset.
+    func fullUntil(at now: Date) -> Date? {
+        guard isFresh(at: now) else { return nil }
+        return [fiveHour, weekly].compactMap { $0 }
+            .filter { $0.percent >= Limits.full }
+            .compactMap { m in m.resetsAt.flatMap { $0 > now ? $0 : nil } }.max()
+    }
+
+    /// Any meter at or above full on this reading, fresh or not.
+    var showsFull: Bool { [fiveHour, weekly].contains { ($0?.percent ?? 0) >= Limits.full } }
+}
+
+/// Claude stopped a chat for usage while holding a seat settled; `resetsAt` is from the reading
+/// taken at that stop. The one stored memory of section 4, a fact per pair.
+struct StopMark: Equatable, Codable {
+    var at: Date
+    var resetsAt: Date?
+    var until: Date { resetsAt.flatMap { $0 > at ? $0 : nil } ?? at.addingTimeInterval(Limits.outWithoutReset) }
+}
+
+// MARK: Claude's log as events
+
+/// The facts Claude's main.log states, in order, each line by its own time.
+enum LogEvent: Equatable {
+    case named(Identity), refused(Identity), newRun, signedOut
+    case turnEnded(chat: String), limitStop(chat: String), cutByQuit(chat: String)
+}
+
+/// One event with the seat Claude held when it was logged and how long it had held it.
+struct StampedEvent: Equatable {
+    let event: LogEvent
+    let at: Date
+    let held: Identity?
+    let heldFor: TimeInterval
+    /// Logged on a settled hold: a stop or a wrap-up here counts against `held`.
+    var settled: Bool { held != nil && heldFor >= Limits.settle }
+}
+
+/// Claude holds a seat from the time its log names that pair; a refusal of the pair starts the
+/// hold over.
+struct Hold: Equatable {
+    let seat: Identity
+    let since: Date
+    func settled(at now: Date) -> Bool { now.timeIntervalSince(since) >= Limits.settle }
+}
+
+/// Claude's log read in order into events, the seat it holds, and the last refusal per pair.
+struct ClaudeEvents {
+    private(set) var events: [StampedEvent] = []
+    private(set) var hold: Hold?
+    private(set) var refusedAt: [Identity: Date] = [:]
+
+    mutating func read(_ text: String) {
+        for line in text.split(separator: "\n") {
+            guard let at = Self.time(line), let event = Self.event(line, held: hold?.seat) else { continue }
+            events.append(StampedEvent(event: event, at: at, held: hold?.seat,
+                                       heldFor: hold.map { at.timeIntervalSince($0.since) } ?? 0))
+            switch event {
+            case .named(let seat): if hold?.seat != seat { hold = Hold(seat: seat, since: at) }
+            case .refused(let seat):
+                refusedAt[seat] = at
+                if hold?.seat == seat { hold = Hold(seat: seat, since: at) }
+            case .newRun, .signedOut: hold = nil
+            case .turnEnded, .limitStop, .cutByQuit: break
+            }
+        }
+    }
+
+    /// Chats in the current run (since the last NewRun) whose last word was a usage stop or a cut
+    /// by quit: the chats a switch resumes. A healthy turn after either clears it.
+    var stoppedChats: (byLimit: Set<String>, byQuit: Set<String>) {
+        var limit = Set<String>(), quit = Set<String>()
+        for e in events {
+            switch e.event {
+            case .newRun, .signedOut: limit = []; quit = []
+            case .named(let s) where e.held != s: limit = []; quit = []
+            case .limitStop(let c): limit.insert(c)
+            case .cutByQuit(let c): quit.insert(c)
+            case .turnEnded(let c): limit.remove(c); quit.remove(c)
+            default: break
+            }
+        }
+        return (limit, quit)
+    }
+
+    /// The last settled TurnEnded on `seat`: a reading after it at 100 means the seat wrapped up.
+    func lastTurnEnd(on seat: Identity) -> Date? {
+        events.last { e in if case .turnEnded = e.event { return e.held == seat && e.settled }; return false }?.at
+    }
+
+    /// The last settled LimitStop on `seat`.
+    func lastLimitStop(on seat: Identity) -> Date? {
+        events.last { e in if case .limitStop = e.event { return e.held == seat && e.settled }; return false }?.at
+    }
+
+    static func event<S: StringProtocol>(_ line: S, held: Identity?) -> LogEvent? {
+        if line.contains(ClaudeLog.identity), let a = field(line, ClaudeLog.accountField), let o = field(line, ClaudeLog.orgField) {
+            return .named(Identity(account: a, org: o))
+        }
+        if line.contains(ClaudeLog.refusal), let held {
+            let org = field(line, ClaudeLog.orgField) ?? held.org
+            return .refused(Identity(account: held.account, org: org))
+        }
+        if line.contains(ClaudeLog.appStart) { return .newRun }
+        if ClaudeLog.signOut.contains(where: { line.contains($0) }) { return .signedOut }
+        guard line.contains(ClaudeLog.cycle) else { return nil }
+        if let c = session(after: ClaudeLog.healthyCycle, in: line) { return .turnEnded(chat: c) }
+        if let c = session(after: ClaudeLog.unhealthyCycle, in: line), line.contains(ClaudeLog.quitReason) { return .cutByQuit(chat: c) }
+        if let c = session(after: ClaudeLog.cycle, in: line), line.contains(ClaudeLog.apiError),
+           ClaudeLog.limitTexts.contains(where: { line.contains($0) }) { return .limitStop(chat: c) }
+        return nil
+    }
+
+    static func time<S: StringProtocol>(_ line: S) -> Date? { timeFormat.date(from: String(line.prefix(19))) }
+
+    private static let timeFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = ClaudeLog.timeFormat
+        return f
+    }()
+
+    private static func field<S: StringProtocol>(_ line: S, _ key: String) -> String? {
+        guard let r = line.range(of: key) else { return nil }
+        let value = line[r.upperBound...].prefix { $0.isHexDigit || $0 == "-" }
+        return value.count == 36 ? String(value) : nil
+    }
+
+    private static func session<S: StringProtocol>(after marker: String, in line: S) -> String? {
+        guard let r = line.range(of: marker) else { return nil }
+        let id = line[r.upperBound...].prefix { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+        return id.hasPrefix(ClaudeLog.sessionPrefix) ? String(id) : nil
+    }
+}
+
+// MARK: Facts
+
+/// Claude as a process: installed (F1), running (F1), and a version the contracts were recorded on (F2).
+struct ClaudeFacts: Equatable {
+    var installed = true
+    var running = false
+    var recognised = true
+}
+
+/// The switch in progress, from its journal (F7).
+struct SwitchFacts: Equatable {
+    var target: Identity
+    var step: String
+}
+
+/// Everything the model reads, read fresh. Nothing in here is inferred.
+struct Facts {
+    /// F9: the seats, in the person's order.
+    var rows: [AccountRecord] = []
+    var claude = ClaudeFacts()
+    /// F3.
+    var log = ClaudeEvents()
+    /// F4: when each pair's saved login was proven.
+    var saved: [Identity: Date] = [:]
+    /// F5, per seat: each seat reads usage through its own Claude Code sign-in.
+    var meters: [Identity: SeatMeters] = [:]
+    var stops: [Identity: StopMark] = [:]
+    /// When an automatic switch to each pair last failed.
+    var failedTargets: [Identity: Date] = [:]
+    /// F7.
+    var switching: SwitchFacts?
+    /// F8.
+    var trusted = false
+    /// The person's Auto-Switch choice.
+    var autoChosen = true
+    /// Chats stopped for usage or wrapped up that wait for a seat with room.
+    var waitingChats = 0
+
+    /// The seat Claude holds, while it runs.
+    var hold: Hold? { claude.running ? log.hold : nil }
+}
+
+// MARK: One function: state of a seat
+
+enum SeatState: Equatable {
+    case switching(step: String), inUse, needsSignIn, out(resetsAt: Date?), ready
+}
+
+/// The one function that decides what a row shows and does (model, section 3).
+func seatState(_ seat: Identity, _ f: Facts, now: Date) -> SeatState {
+    if let s = f.switching, s.target == seat { return .switching(step: s.step) }
+    if f.hold?.seat == seat { return .inUse }
+    guard let savedAt = f.saved[seat], !(f.log.refusedAt[seat].map { $0 > savedAt } ?? false) else { return .needsSignIn }
+    if let until = OutRule.until(seat, f, now: now) { return .out(resetsAt: until) }
+    return .ready
+}
+
+/// Section 4: a seat is out on a fresh full meter whose reset is ahead, or after a settled usage
+/// stop until the reset of the reading taken at that stop.
+enum OutRule {
+    static func until(_ seat: Identity, _ f: Facts, now: Date) -> Date? {
+        let byMeter = f.meters[seat]?.fullUntil(at: now)
+        let byStop = f.stops[seat].map(\.until).flatMap { $0 > now ? $0 : nil }
+        return [byMeter, byStop].compactMap { $0 }.max()
+    }
+}
+
+// MARK: The automatic switch
+
+enum AutoSwitch {
+    enum Status: Equatable { case on, offAccessibility, offUnrecognised, offByPerson }
+
+    static func status(_ f: Facts) -> Status {
+        if !f.autoChosen { return .offByPerson }
+        if !f.claude.recognised { return .offUnrecognised }
+        if !f.trusted { return .offAccessibility }
+        return .on
+    }
+
+    enum Decision: Equatable {
+        case none
+        case switchTo(Identity)
+        /// Every seat is out; `resumesAt` is the earliest known reset, at `seat`.
+        case wait(seat: Identity?, resumesAt: Date?)
+        case resumeInPlace
+    }
+
+    /// Claude itself showed the settled seat in use is done: a settled limit stop (recorded as a
+    /// StopMark), or a settled turn end followed by a later reading at 100. A meter alone never is.
+    static func isDone(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
+        if let mark = f.stops[seat], mark.until > now { return true }
+        guard let ended = f.log.lastTurnEnd(on: seat), let m = f.meters[seat], let readAt = m.readAt,
+              readAt > ended, m.isFresh(at: now), m.showsFull else { return false }
+        return true
+    }
+
+    /// Going down the menu from `from`, wrapping round: the first Ready seat with a fresh reading
+    /// that has not failed as a target within coolDown.
+    static func target(from: Identity, _ f: Facts, now: Date) -> Identity? {
+        let seats = f.rows.compactMap(\.identity)
+        guard let i = seats.firstIndex(of: from), seats.count > 1 else { return nil }
+        return (1..<seats.count).map { seats[(i + $0) % seats.count] }.first { s in
+            seatState(s, f, now: now) == .ready && (f.meters[s]?.isFresh(at: now) ?? false)
+                && !(f.failedTargets[s].map { now.timeIntervalSince($0) < Limits.coolDown } ?? false)
+        }
+    }
+
+    static func decide(_ f: Facts, now: Date) -> Decision {
+        guard status(f) == .on, f.switching == nil, let hold = f.hold, hold.settled(at: now),
+              f.rows.contains(where: { $0.identity == hold.seat }) else { return .none }
+        guard isDone(hold.seat, f, now: now) else { return f.waitingChats > 0 ? .resumeInPlace : .none }
+        if let t = target(from: hold.seat, f, now: now) { return .switchTo(t) }
+        let resets = f.rows.compactMap(\.identity).compactMap { s in OutRule.until(s, f, now: now).map { (s, $0) } }
+        let first = resets.min { $0.1 < $1.1 }
+        return .wait(seat: first?.0, resumesAt: first?.1)
+    }
+}
+
+// MARK: Seats and the notice, as the menu reads them
+
+enum SeatAction: Equatable { case switchTo, setUp }
+
+struct Seat: Equatable, Identifiable {
+    let id: Identity
+    /// Unique label: the name, then " · <organization>", then " (2)".
+    let name: String
+    let accountName: String
+    let organization: String
+    let state: SeatState
+    let meters: SeatMeters
+    let action: SeatAction?
+}
+
+enum Seats {
+    static func build(_ f: Facts, now: Date) -> [Seat] {
+        let rows = f.rows.filter { $0.identity != nil }
+        let labels = unique(rows.map { ($0.label.isEmpty ? $0.name : $0.label, $0.organization) })
+        return zip(rows, labels).map { row, label in
+            let id = row.identity!
+            let state = seatState(id, f, now: now)
+            let action: SeatAction?
+            switch state {
+            case .switching, .inUse: action = nil
+            case .needsSignIn: action = f.claude.installed && f.switching == nil ? .setUp : nil
+            case .out, .ready: action = f.claude.installed && f.switching == nil ? .switchTo : nil
+            }
+            return Seat(id: id, name: label, accountName: f.rows.accountName(for: row), organization: row.organization,
+                        state: state, meters: f.meters[id] ?? SeatMeters(), action: action)
+        }
+    }
+
+    /// Equal names get " · <organization>"; still equal, " (2)", " (3)". Never an email.
+    static func unique(_ named: [(name: String, org: String)]) -> [String] {
+        let counts = Dictionary(named.map { ($0.name, 1) }, uniquingKeysWith: +)
+        var labels = named.map { counts[$0.name]! > 1 ? "\($0.name) · \($0.org)" : $0.name }
+        var seen: [String: Int] = [:]
+        for i in labels.indices {
+            seen[labels[i], default: 0] += 1
+            if seen[labels[i]]! > 1 { labels[i] += " (\(seen[labels[i]]!))" }
+        }
+        return labels
+    }
+}
+
+enum NoticeAction: Equatable { case openAccessibility, addSeat }
+
+struct Notice: Equatable {
+    /// Lower is more important; the menu shows only the first.
+    enum Kind: Int, Comparable {
+        case switching, failure, waiting, accessibility, unrecognisedClaude, claude, success
+        static func < (a: Kind, b: Kind) -> Bool { a.rawValue < b.rawValue }
+    }
+    let kind: Kind
+    let text: String
+    var detail: String? = nil
+    var action: NoticeAction? = nil
+}
+
+/// What the first-run screen says. Shown exactly while there are no rows.
+enum FirstRun {
+    static let title = "Claude Accounts"
+    static let lines = [
+        "Shows each of your Claude seats and how much usage it has left.",
+        "Switches Claude to another seat when you ask, or on its own when the one in use runs out, then resumes your chats.",
+        "It reads Claude's log and chat list, and keeps a copy of each seat's sign-in in its own folder on this Mac.",
+        "Nothing leaves this Mac. Its one network call reads each seat's usage from Anthropic.",
+    ]
+    static let waiting = "Open Claude and sign in. Your seat appears here a minute later."
+}
+
+enum AppState {
+    /// The one notice: the most important of every line that applies (model, section 11).
+    /// `failure` and `success` are the last switch's outcome; `finishing` is a journal whose
+    /// target waits for Claude to be opened again.
+    static func notice(_ f: Facts, now: Date, failure: String? = nil, success: String? = nil, finishing: String? = nil) -> Notice? {
+        var all: [Notice] = []
+        let name = { (s: Identity?) in f.rows.first { $0.identity == s && s != nil }.map { $0.label.isEmpty ? $0.name : $0.label } }
+        if let s = f.switching {
+            all.append(finishing.map { Notice(kind: .switching, text: "Open Claude to finish switching to \($0).") }
+                       ?? Notice(kind: .switching, text: "Switching to \(name(s.target) ?? "a seat")… \(s.step)"))
+        }
+        if let failure { all.append(Notice(kind: .failure, text: failure)) }
+        if case .wait(let seat, let at) = AutoSwitch.decide(f, now: now), f.waitingChats > 0 {
+            let when = at.map { " at \(ClockText.time($0))" } ?? ""
+            all.append(Notice(kind: .waiting, text: "Every seat is out. Chats resume\(when).",
+                              detail: "Every seat is out. Chats resume when \(name(seat) ?? "a seat") resets\(when)."))
+        }
+        if !f.trusted {
+            all.append(Notice(kind: .accessibility, text: "Allow Accessibility to switch on its own.",
+                              detail: "Allow Accessibility so Claude Accounts can switch on its own and resume chats.",
+                              action: .openAccessibility))
+        }
+        if !f.claude.recognised {
+            all.append(Notice(kind: .unrecognisedClaude, text: "Claude updated. Switching on its own is paused.",
+                              detail: "Claude updated to a version this app hasn't checked. Switching on its own is paused."))
+        }
+        if !f.claude.installed { all.append(Notice(kind: .claude, text: "Claude isn't installed.")) }
+        else if !f.claude.running { all.append(Notice(kind: .claude, text: "Claude isn't running.")) }
+        else if let hold = f.hold, hold.settled(at: now), !f.rows.contains(where: { $0.identity == hold.seat }), !f.rows.isEmpty {
+            all.append(Notice(kind: .claude, text: "Claude is on an account not in the list.", action: .addSeat))
+        }
+        if let success { all.append(Notice(kind: .success, text: success)) }
+        return all.min { $0.kind < $1.kind }
+    }
+}
+
+/// A time as the menu says it, in the person's own format ("3:40 PM").
+enum ClockText {
+    static func time(_ date: Date) -> String { DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short) }
+}
