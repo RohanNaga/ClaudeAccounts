@@ -400,7 +400,7 @@ enum ClaudeApp {
     // MARK: Log
 
     /// A place in Claude's log that survives rotation, which renames main.log to main1.log.
-    struct LogMark: Equatable { let inode: UInt64; let offset: UInt64 }
+    struct LogMark: Equatable, Codable { let inode: UInt64; let offset: UInt64 }
 
     static func logMark(_ url: URL = log) -> LogMark {
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -419,7 +419,19 @@ enum ClaudeApp {
         return (String(decoding: whole, as: UTF8.self), offset + UInt64(whole.count))
     }
 
-    /// Claude's last two log files read in order as the model's events (F3).
+    /// Where Claude's current run began: its last "Starting app" line, in main.log or, after a
+    /// rotation, main1.log; with none, the start of main.log.
+    static func startMark() -> LogMark {
+        for url in [log, logDir.appendingPathComponent(ClaudeFiles.rotatedLog(1))] {
+            guard let data = try? Data(contentsOf: url), let r = data.range(of: Data(ClaudeLog.appStart.utf8), options: .backwards) else { continue }
+            let line = data[..<r.lowerBound].lastIndex(of: UInt8(ascii: "\n")).map { $0 + 1 } ?? data.startIndex
+            return LogMark(inode: logMark(url).inode, offset: UInt64(line - data.startIndex))
+        }
+        return LogMark(inode: logMark().inode, offset: 0)
+    }
+
+    /// Claude's last two log files read whole, in order, for the seat it holds and the chats its
+    /// run stopped: none of it is timed, so no hold in it settles.
     static func events() -> ClaudeEvents {
         var events = ClaudeEvents()
         for url in [logDir.appendingPathComponent(ClaudeFiles.rotatedLog(1)), log] { events.read(readLines(url, from: 0).text) }
@@ -512,6 +524,9 @@ enum SavedLogins {
         /// When the copy was proven, on the app's clock.
         var savedAt: Date
         var config: [String: String]
+        /// When the app saw Claude refuse this copy arrive, on its own clock: the seat needs a new
+        /// sign-in until a newer copy replaces this one.
+        var refusedAt: Date? = nil
     }
 
     static var root: URL { Paths.stateDir.appendingPathComponent("saved") }
@@ -536,8 +551,16 @@ enum SavedLogins {
         return nil
     }
 
-    /// When the seat's login was saved, if it has one.
-    static func savedAt(_ seat: Identity) -> Date? { proven(seat)?.meta.savedAt }
+    /// The seat has a saved login that Claude has not refused since.
+    static func usable(_ seat: Identity) -> Bool { proven(seat).map { $0.meta.refusedAt == nil } ?? false }
+
+    /// The app saw Claude refuse `seat`'s sign-in arrive at `seen`: a copy saved before then is
+    /// marked refused, so the seat reads Needs sign-in across relaunches until a newer copy.
+    static func refused(_ seat: Identity, seen: Date) {
+        guard var copy = proven(seat), copy.meta.refusedAt == nil, copy.meta.savedAt < seen else { return }
+        copy.meta.refusedAt = seen
+        try? JSONEncoder().encode(copy.meta).write(to: copy.folder.appendingPathComponent("login.json"), options: .atomic)
+    }
 
     /// Save the login Claude holds as `seat`: with Claude quit, or `whileRunning` once Claude has
     /// held the seat settled. Claude's settings must name the seat's account, and while Claude runs
@@ -754,7 +777,11 @@ struct SwitchJournal: Codable, Equatable {
     var resume: [String] = []
     /// Times the person opened Claude again between the quit and the launch.
     var reopened = 0
+    /// When the app launched Claude, on its own clock: the confirm's deadline and the resume's start.
     var launchedAt: Date? = nil
+    /// Where Claude's log stood just before that launch: the confirm reads only what Claude logged
+    /// after it, so no line from before the launch, whatever its printed time, can confirm it.
+    var logMark: ClaudeApp.LogMark? = nil
     /// Claude was closed when the confirm wait ran out: confirm whenever it next opens.
     var parked = false
     /// An undo couldn't quit Claude: undo whenever Claude is next closed, the mirror of `parked`.
@@ -797,6 +824,8 @@ enum Switch {
         /// The chats an automatic switch is for: those Claude stopped for the limit of the seat in
         /// use (AutoSwitch.stoppedNow). A switch by hand takes every chat its run stopped for a limit.
         var resume: Set<String> = []
+        /// The app saw Claude hold its seat settled, on its own clock: that login is saved once Claude quits.
+        var fromSettled = false
         func name(_ id: Identity?) -> String { id.flatMap { names[$0] } ?? "another account" }
     }
 
@@ -844,8 +873,7 @@ enum Switch {
             return o
         }
         // Who Claude's files belong to: the seat it holds, or held when it last quit.
-        var j = SwitchJournal(kind: r.kind, from: events.hold?.seat, to: r.to, step: .quit,
-                              fromSettled: hold?.settled(at: World.now()) ?? false)
+        var j = SwitchJournal(kind: r.kind, from: events.hold?.seat, to: r.to, step: .quit, fromSettled: hold != nil && r.fromSettled)
         do { try await j.save() } catch {
             unlock()
             return SwitchOutcome(ok: false, text: "Couldn't write the switch's journal, so nothing changed.")
@@ -986,6 +1014,7 @@ enum Switch {
                 // A person who opened Claude since the load gets it quit once more (section 7).
                 guard await closed(&j, r, progress: progress) else { return await rolledBack(&j, r, "Claude was opened during the switch.", progress: progress) }
                 j.launchedAt = World.now()
+                j.logMark = ClaudeApp.logMark()
                 try await step(&j, .confirm)
                 await World.claude.willStep("launch")
                 await ClaudeApp.launch()
@@ -997,14 +1026,16 @@ enum Switch {
             return back
         }
         // Recovering a confirm: the wait starts over from Claude's run, its own or one a person
-        // opened while the switch was parked. A Claude that is closed is opened again.
+        // opened while the switch was parked, read from where that run began. A Claude that is
+        // closed is opened again.
         if recovering, j.parked || ClaudeApp.pids().isEmpty {
             j.parked = false
+            j.launchedAt = World.now()
             if ClaudeApp.pids().isEmpty {
-                j.launchedAt = World.now()
+                j.logMark = ClaudeApp.logMark()
                 await ClaudeApp.launch()
             } else {
-                j.launchedAt = ClaudeApp.events().events.last { $0.event == .newRun }?.at ?? World.now()
+                j.logMark = ClaudeApp.startMark()
             }
             try? await j.save()
         }
@@ -1029,25 +1060,24 @@ enum Switch {
 
     enum Verdict: Equatable { case confirmed, waiting, refused, other(Identity?) }
 
-    /// What Claude's log says since the launch: it holds the target settled, refused it, named
-    /// another pair, or hasn't decided yet. A Set Up waits through a sign-out; a switch reads one
-    /// as the target's login refused.
-    static func verdict(_ events: ClaudeEvents, to: Identity, kind: SwitchJournal.Kind, since launch: Date, running: Bool, now: Date) -> Verdict {
-        let start = launch.addingTimeInterval(-1)
-        for e in events.events where e.at >= start {
+    /// What Claude logged since the launch (`events` holds only those lines): it holds the target
+    /// settled, refused it, named another pair, or hasn't decided yet. A Set Up waits through a
+    /// sign-out; a switch reads one as the target's login refused.
+    static func verdict(_ events: ClaudeEvents, to: Identity, kind: SwitchJournal.Kind, running: Bool, now: Date) -> Verdict {
+        for (i, e) in events.events.enumerated() {
             switch e.event {
             case .refused(let s) where to.matches(s): return .refused
             case .signedOut where kind != .setUp: return .refused
             case .named(let s) where !to.matches(s):
                 // A fall-back after the target's refusal is the refusal, read on the next line.
-                if events.events.contains(where: { r in
-                    if r.at >= e.at, case .refused(let x) = r.event { return to.matches(x) } else { return false }
+                if events.events.dropFirst(i + 1).contains(where: { r in
+                    if case .refused(let x) = r.event { return to.matches(x) } else { return false }
                 }) { return .refused }
                 return .other(s)
             default: continue
             }
         }
-        if running, let hold = events.hold, to.matches(hold.seat), hold.since >= start, hold.settled(at: now) { return .confirmed }
+        if running, let hold = events.hold, to.matches(hold.seat), hold.settled(at: now) { return .confirmed }
         return .waiting
     }
 
@@ -1058,12 +1088,15 @@ enum Switch {
         let launch = j.launchedAt ?? World.now()
         let deadline = launch.addingTimeInterval(j.kind == .setUp ? Limits.setUpConfirmWait : Limits.confirmWait)
         progress(j.kind == .setUp ? "Sign in to \(r.name(j.to)) in Claude." : "Waiting for Claude to open as \(r.name(j.to))…")
+        // Only what Claude logs after the launch counts, each line timed by when the app saw it.
+        var log = LogReader(from: j.logMark ?? ClaudeApp.startMark())
         while true {
             let now = World.now()
             let running = !ClaudeApp.pids().isEmpty
-            let events = ClaudeApp.events()
-            let named = events.hold.map { j.to.matches($0.seat) && $0.since >= launch.addingTimeInterval(-1) } ?? false
-            switch verdict(events, to: j.to, kind: j.kind, since: launch, running: running, now: now) {
+            log.poll(now: now)
+            let events = log.events
+            let named = events.hold.map { j.to.matches($0.seat) } ?? false
+            switch verdict(events, to: j.to, kind: j.kind, running: running, now: now) {
             case .confirmed:
                 SwitchJournal.clear()
                 pruneBackups()
@@ -1084,10 +1117,9 @@ enum Switch {
                     }
                     // Claude ran the whole wait and named nobody: its log lacks the line the app reads.
                     // A Set Up's wait is the person's to sign in, so a silent one says nothing.
-                    let since = launch.addingTimeInterval(-1)
                     if j.kind != .setUp, !events.events.contains(where: { e in
-                        if case .named = e.event { return e.at >= since } else { return false }
-                    }) { ShapeMisses.missed(.namedLine, since: since) }
+                        if case .named = e.event { return true } else { return false }
+                    }) { ShapeMisses.missed(.namedLine, since: launch) }
                     return await rolledBack(&j, r, "\(r.name(j.to)) didn't open in time.", progress: progress)
                 }
             }
@@ -1367,7 +1399,7 @@ enum ShapeMisses {
         try? data.write(to: url, options: .atomic)
     }
 
-    /// `shape` was relied on and was not there. A Named line logged from `since` on clears it.
+    /// `shape` was relied on and was not there. A Named line the app sees arrive from `since` on clears it.
     static func missed(_ shape: ClaudeShape, since: Date = World.now()) {
         var misses = load()
         guard misses[shape] == nil else { return }
@@ -1384,10 +1416,10 @@ enum ShapeMisses {
         Diagnostics.record(.shape, ["shape": shape.rawValue, "state": "seen"])
     }
 
-    /// The Named miss clears once the log has a Named line from the miss's start on.
+    /// The Named miss clears once the app sees a Named line arrive from the miss's start on.
     static func clearNamed(seenIn events: ClaudeEvents) {
         guard let since = load()[.namedLine] else { return }
-        if events.events.contains(where: { e in if case .named = e.event { return e.at >= since } else { return false } }) {
+        if events.events.contains(where: { e in if case .named = e.event { return e.seen.map { $0 >= since } ?? false } else { return false } }) {
             seen(.namedLine)
         }
     }
@@ -1401,6 +1433,10 @@ enum ShapeMisses {
 struct LogReader {
     private(set) var events = ClaudeEvents()
     private var mark: ClaudeApp.LogMark?
+
+    /// A reader from `mark` on: every line after it reads as arriving. With none, the first read
+    /// takes the log whole, as lines that were already there.
+    init(from mark: ClaudeApp.LogMark? = nil) { self.mark = mark }
 
     mutating func poll(now: Date = World.now()) {
         let current = ClaudeApp.logMark()
@@ -1559,7 +1595,7 @@ final class Store: ObservableObject {
         let installed = World.claude.installed
         f.claude = ClaudeFacts(installed: installed, running: running, missing: installed ? Set(ShapeMisses.load().keys) : [])
         f.log = log.events
-        f.saved = Dictionary(accounts.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
+        f.saved = Set(accounts.compactMap(\.identity).filter(SavedLogins.usable))
         f.meters = meters
         f.failedTargets = failedTargets
         f.switching = switchingTo ?? SwitchJournal.load().map {
@@ -1632,8 +1668,10 @@ final class Store: ObservableObject {
         accounts = AccountStore.load().labelled()
         running = !ClaudeApp.pids().isEmpty
         trusted = World.claude.trusted
+        let read = log.events.events.count
         log.poll()
         ShapeMisses.clearNamed(seenIn: log.events)
+        for e in log.events.events.dropFirst(read) { if case .refused(let seat) = e.event, let seen = e.seen { SavedLogins.refused(seat, seen: seen) } }
     }
 
     /// Save the login of a hold once it settles while Claude runs, so the seat Claude is on gets
@@ -1671,8 +1709,8 @@ final class Store: ObservableObject {
             let readAt = meters[seat]?.readAt ?? .distantPast
             let resets = [meters[seat]?.fiveHour?.resetsAt, meters[seat]?.weekly?.resetsAt].compactMap { $0 }
             if resets.contains(where: { readAt < $0 + Limits.meterAfterReset && $0 + Limits.meterAfterReset <= now }) { return true }
-            if let signal = log.events.lastSignal(on: seat), !ClaudeEvents.readAfter(signal.at, readAt: readAt),
-               since >= Limits.meterOnTurnEnd { return true }
+            // Only a reading taken after the app saw the signal arrive is after it.
+            if let seen = log.events.lastSignal(on: seat)?.seen, readAt <= seen, since >= Limits.meterOnTurnEnd { return true }
             return false
         }
     }
@@ -1970,7 +2008,8 @@ final class Store: ObservableObject {
         let rows = accounts.map(\.seat)
         Diagnostics.record(.switchStarted, ["type": kind.rawValue, "from": from.map { rows.firstIndex(of: $0) ?? -1 } ?? NSNull(),
                                             "to": rows.firstIndex(of: target) ?? -1, "trigger": trigger ?? NSNull()])
-        let request = Switch.Request(kind: kind, to: target, names: names, resume: resume)
+        let request = Switch.Request(kind: kind, to: target, names: names, resume: resume,
+                                     fromSettled: running && log.events.hold?.settled(at: World.now()) == true)
         return start(target, from: from, byHand: kind != .auto) { progress, switched in await Switch.run(request, progress: progress, switched: switched) } then: { outcome in
             if kind == .auto { self.autoFinished(outcome, from: from, fromHold: fromHold, to: target) }
         }
@@ -2457,7 +2496,7 @@ enum StatusReport {
         f.claude = ClaudeFacts(installed: installed, running: !ClaudeApp.pids().isEmpty,
                                missing: installed ? Set(ShapeMisses.load().keys) : [])
         f.log = log.events
-        f.saved = Dictionary(f.rows.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
+        f.saved = Set(f.rows.compactMap(\.identity).filter(SavedLogins.usable))
         f.meters = meters
         f.failedTargets = PairFile<Date>(name: "failed-targets.json").load()
         f.switching = SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "parked until Claude opens" : $0.undoWhenClosed ? "undo waits for Claude to quit" : "in progress") }

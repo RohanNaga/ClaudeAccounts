@@ -243,7 +243,8 @@ let scenarios: [Scenario] = [
         h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
         h.claudeHoldsSettled()
         h.make()
-        await h.tick()
+        // The app has watched Claude hold Alpha for a minute: only then is Alpha's login saved at the quit.
+        await h.pass(ClaudeTiming.settle)
         h.check(h.state("Beta") == .ready && h.action("Beta") == .switchTo, "Beta is Ready with Switch: \(String(describing: h.state("Beta")))")
         h.click("Beta")
         await h.settle()

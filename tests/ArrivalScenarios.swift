@@ -107,6 +107,22 @@ let arrivalScenarios: [Scenario] = [
         await h.pass(15 * 60)
         h.check(h.quits == 0 && h.claude.sent.isEmpty && h.claude.notifications.isEmpty, "nothing quit, typed or posted: \(h.seen)")
     },
+    Scenario(pair: "(Claude refuses Beta's saved login, the app relaunches, then Claude refuses Gamma while the app is quit)",
+             model: "a refusal the app saw arrive after the login was saved marks that login, and the mark outlives a relaunch; a refusal already in the log at launch marks nothing") { h in
+        await h.standard()
+        await h.pass(ClaudeTiming.settle)
+        h.claude.stale = [B, C]
+        h.click("Beta")
+        await h.run(until: { h.noticeHas("Back on Alpha") && h.claude.held == A && !h.switchInFlight }, limit: 600)
+        h.check(h.state("Beta") == .needsSignIn && h.action("Beta") == .setUp, "Beta reads Needs sign-in with Set Up: \(h.seen)")
+        h.killApp(); h.clock.advance(60); h.make(); await h.tick(); await h.settle()
+        h.check(h.state("Beta") == .needsSignIn && h.action("Beta") == .setUp, "after a relaunch Beta still reads Needs sign-in: \(h.seen)")
+        h.killApp()
+        h.claude.signIn(C)
+        h.clock.advance(60)
+        h.make(); await h.tick(); await h.settle()
+        h.check(h.state("Gamma") == .ready, "a refusal logged while the app was quit marks nothing: \(String(describing: h.state("Gamma")))")
+    },
     Scenario(pair: "(Every seat out and a chat waits, the Mac sleeps three hours, Alpha still reads 100, Beta reads with room)",
              model: "a run of full readings starts again after the Mac wakes: a stop from before the sleep never switches") { h in
         await h.everySeatOutAndAChatWaits()

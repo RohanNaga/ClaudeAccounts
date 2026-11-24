@@ -306,7 +306,8 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// Claude starts as it would from its own sign-in files, and names (or refuses) the seat.
     func start() {
         let seat = signInOnDisk()
-        let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; runsOn = seat; return nextPid }
+        // A newly started Claude prints the Mac's zone.
+        let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; runsOn = seat; printZone = nil; return nextPid }
         log("\(ClaudeLog.appStart) }")
         guard let seat else {
             if let who = signsInAs { clock.after(60) { [weak self] in self?.signIn(who, pid: p) } }

@@ -110,6 +110,8 @@ final class Strike: @unchecked Sendable {
     } else {
         await h.standard()
     }
+    // The app has watched Claude hold Alpha for a minute, so the switch saves Alpha's login at its save step.
+    await h.pass(ClaudeTiming.settle)
     let saved = step.setUp ? [("Alpha", A), ("Beta", B)] : [("Alpha", A), ("Beta", B), ("Gamma", C)]
     let gammaAt = h.savedAt(C)
     let strike = Strike()
@@ -295,6 +297,7 @@ let midStepFaultScenarios: [Scenario] = [
                         when: @escaping @Sendable () -> Bool = { true }) async {
     await h.standard()
     secondChat(h)
+    await h.pass(ClaudeTiming.settle)
     let strike = Strike()
     defer { strike.restore() }
     let clock = h.clock, claude = h.claude

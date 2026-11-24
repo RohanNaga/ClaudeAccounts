@@ -176,7 +176,7 @@ let holdScenarios: [Scenario] = [
     },
 
     Scenario(pair: "(Click Switch back to Alpha, the Mac moves from Eastern to Pacific while Claude keeps Eastern time, the app restarts, Alpha reads 100, then Claude stops a chat)",
-             model: "Claude's log times are read in the zone Claude printed them in, learned from the file's last write: the hold settles on time, a stop from before the switch by hand never counts, a new stop does") { h in
+             model: "the app never reads Claude's printed times: the switches confirm, the hold settles on the app's clock, a stop from before the switch by hand never counts, a new stop does") { h in
         guard let east = TimeZone(identifier: "America/New_York"), let west = TimeZone(identifier: "America/Los_Angeles") else { return }
         NSTimeZone.default = east
         h.claude.printZone = east
@@ -192,12 +192,13 @@ let holdScenarios: [Scenario] = [
         }
         let quits = h.quits, sent = h.claude.sent.count
         // The Mac lands in Pacific time; Claude, still running, prints Eastern time; the app restarts.
+        h.claude.printZone = east
         NSTimeZone.default = west
         h.check(NSTimeZone.default.identifier == west.identifier, "setup: the app's zone is Pacific: \(NSTimeZone.default.identifier)")
         h.killApp(); h.clock.advance(60); h.make(); await h.tick(); await h.settle()
-        let hold = h.store.facts().hold
-        h.check(hold.map { abs($0.since.timeIntervalSince(h.now)) < 30 * 60 } ?? false,
-                "the hold reads at its true time, not three hours off: since \(String(describing: hold?.since)), now \(h.now)")
+        await h.pass(ClaudeTiming.settle + 5)
+        h.check(h.state("Alpha") == .inUse && h.store.facts().hold?.settled(at: h.now) == true,
+                "Alpha is In use, and its hold settles a minute after the app read it, whatever time Claude prints: \(h.seen)")
         h.usage.set(A, fiveHour: 100, resetsAt: h.now.addingTimeInterval(3 * 3600))
         let reads = h.usage.readsOf(A).count
         await h.pass(10 * 60)

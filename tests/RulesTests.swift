@@ -217,7 +217,7 @@ struct RulesTests {
             f.trusted = true
             f.log.read(held, readAt: now.addingTimeInterval(-7200))
             if stopped { f.log.read(stop, readAt: now.addingTimeInterval(-300), arrived: true) }
-            for s in [labs, research] { f.saved[s] = now.addingTimeInterval(-86400) }
+            f.saved = [labs, research]
             let reset = now.addingTimeInterval(3 * 3600)
             f.meters[labs] = SeatMeters(fiveHour: MeterReading(percent: labsFull ? 100 : 40, resetsAt: reset), readAt: now.addingTimeInterval(-60))
             f.meters[research] = SeatMeters(fiveHour: MeterReading(percent: 10, resetsAt: reset), readAt: now.addingTimeInterval(-60))

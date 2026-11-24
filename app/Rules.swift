@@ -669,61 +669,58 @@ enum LogEvent: Equatable {
     case turnEnded(chat: String), limitStop(chat: String), cutByQuit(chat: String)
 }
 
-/// One event with the seat Claude held when it was logged and how long it had held it.
+/// One event, with the seat Claude held when it was logged.
 struct StampedEvent: Equatable {
     let event: LogEvent
-    let at: Date
     let held: Identity?
-    let heldFor: TimeInterval
     /// When the app read this line as it arrived, on its own clock: set only for a line Claude
     /// appended after the app's first read of the log since it launched.
     var seen: Date? = nil
-    /// Logged on a settled hold: a usage stop here counts against `held`.
-    var settled: Bool { held != nil && heldFor >= Limits.settle }
+    /// Seen arriving, and logged at least `Limits.settle` after the line that began its hold: a
+    /// usage stop here counts against `held`.
+    var settled = false
 }
 
 /// Claude holds a seat from the line in its log that names that pair: Claude opened on it, or was
 /// switched to it. A refusal of the pair starts the hold over, and Claude closing ends it. `start`
-/// is that line's place among the events. `key` names the hold by its seat and the line's printed
-/// time. `seen` is when the app read that line, on its own clock; a whole read of the log for a
-/// switch's confirm has none, and times the hold by Claude's printed time.
+/// is that line's place among the events, and `key` names the hold by its seat and that place.
+/// `printed` is that line's own time, set only against Claude's later lines. `seen` is when the app
+/// read that line, on its own clock: the hold settles by it, and a hold read with no clock never does.
 struct Hold: Equatable {
     let seat: Identity
-    let since: Date
+    let printed: Date
     var start = 0
     var key = ""
     var seen: Date? = nil
-    func settled(at now: Date) -> Bool { now.timeIntervalSince(seen ?? since) >= Limits.settle }
+    func settled(at now: Date) -> Bool { seen.map { now.timeIntervalSince($0) >= Limits.settle } ?? false }
 }
 
-/// Claude's log read in order into events, the seat it holds, and the last refusal per pair.
+/// Claude's log read in order into events and the seat it holds.
 struct ClaudeEvents {
     private(set) var events: [StampedEvent] = []
     private(set) var hold: Hold?
-    private(set) var refusedAt: [Identity: Date] = [:]
 
-    /// Reads `text`, lines of Claude's log in order. Claude prints its local time with no zone; the
-    /// printed times are read in the Mac's current zone and compared only with each other and with
-    /// the launch of a Claude the app itself just started. `readAt` is the app's clock at this read,
-    /// and `arrived` says Claude appended these lines since the app's last read: only those are
-    /// timed by it (`StampedEvent.seen`), so nothing Claude logged before the app launched can count.
+    /// Reads `text`, lines of Claude's log in order. `readAt` is the app's clock at this read, and
+    /// `arrived` says Claude appended these lines since the app's last read: only those are timed
+    /// by it (`StampedEvent.seen`), so nothing Claude logged before the app launched can count.
+    /// Claude prints its local time with no zone. A printed time is only ever set against another
+    /// line's, how long Claude held a seat before a line, so each is read as if in UTC: the Mac's
+    /// zone plays no part, and no printed time meets the app's clock.
     mutating func read(_ text: String, readAt: Date? = nil, arrived: Bool = false) {
-        NSTimeZone.resetSystemTimeZone()
         let format = DateFormatter()
         format.locale = Locale(identifier: "en_US_POSIX")
-        format.timeZone = NSTimeZone.default
+        format.timeZone = TimeZone(identifier: "UTC")
         format.dateFormat = ClaudeLog.timeFormat
         for line in text.split(separator: "\n") {
-            guard let at = format.date(from: String(line.prefix(19))), let event = Self.event(line, held: hold?.seat) else { continue }
-            events.append(StampedEvent(event: event, at: at, held: hold?.seat,
-                                       heldFor: hold.map { at.timeIntervalSince($0.since) } ?? 0, seen: arrived ? readAt : nil))
+            guard let printed = format.date(from: String(line.prefix(19))), let event = Self.event(line, held: hold?.seat) else { continue }
+            let seen = arrived ? readAt : nil
+            let settled = seen != nil && hold.map { printed.timeIntervalSince($0.printed) >= Limits.settle } ?? false
+            events.append(StampedEvent(event: event, held: hold?.seat, seen: seen, settled: settled))
             let start = events.count - 1
-            let begins = { (seat: Identity) in Hold(seat: seat, since: at, start: start, key: "\(seat.account) \(seat.org) \(line.prefix(19))", seen: readAt) }
+            let begins = { (seat: Identity) in Hold(seat: seat, printed: printed, start: start, key: "\(seat.account) \(seat.org) #\(start)", seen: readAt) }
             switch event {
             case .named(let seat): if hold?.seat != seat { hold = begins(seat) }
-            case .refused(let seat):
-                refusedAt[seat] = at
-                if hold?.seat == seat { hold = begins(seat) }
+            case .refused(let seat): if hold?.seat == seat { hold = begins(seat) }
             case .newRun, .signedOut: hold = nil
             case .turnEnded, .limitStop, .cutByQuit: break
             }
@@ -747,10 +744,6 @@ struct ClaudeEvents {
         return (limit, quit)
     }
 
-    /// Log lines carry whole seconds: an event stamped S happened within [S, S+1), so a reading
-    /// is after it only from S+1 on.
-    static func readAfter(_ logged: Date, readAt: Date) -> Bool { readAt >= logged.addingTimeInterval(1) }
-
     /// The chats Claude stopped for a limit in `hold` and has not served since, each with the stop's
     /// place among the events: each chat whose last word in the hold is a usage stop the app saw
     /// arrive, logged once the hold had settled, with no turn on the seat ended normally after it. A
@@ -761,7 +754,7 @@ struct ClaudeEvents {
         var stops: [String: Int] = [:]
         for (i, e) in events.enumerated().dropFirst(hold.start) {
             switch e.event {
-            case .limitStop(let c): stops[c] = e.settled && e.seen != nil ? i : nil
+            case .limitStop(let c): stops[c] = e.settled ? i : nil
             case .cutByQuit(let c): stops[c] = nil
             case .turnEnded: stops = [:]
             default: break
@@ -787,7 +780,7 @@ struct ClaudeEvents {
     func lastSignal(on seat: Identity) -> StampedEvent? {
         events.last { e in
             switch e.event {
-            case .limitStop, .turnEnded: return e.held == seat && e.settled && e.seen != nil
+            case .limitStop, .turnEnded: return e.held == seat && e.settled
             default: return false
             }
         }
@@ -874,8 +867,8 @@ struct Facts {
     var claude = ClaudeFacts()
     /// F3.
     var log = ClaudeEvents()
-    /// F4: when each pair's saved login was proven.
-    var saved: [Identity: Date] = [:]
+    /// F4: the pairs with a saved login that Claude has not refused since the app saw it saved.
+    var saved: Set<Identity> = []
     /// F5, per seat: each seat reads usage through its own Claude Code sign-in.
     var meters: [Identity: SeatMeters] = [:]
     /// When an automatic switch to each pair last failed.
@@ -913,7 +906,7 @@ enum SeatState: Equatable {
 func seatState(_ seat: Identity, _ f: Facts, now: Date) -> SeatState {
     if let s = f.switching, s.target == seat { return .switching(step: s.step) }
     if f.hold?.seat == seat { return .inUse }
-    guard let savedAt = f.saved[seat], !(f.log.refusedAt[seat].map { $0 > savedAt } ?? false) else { return .needsSignIn }
+    guard f.saved.contains(seat) else { return .needsSignIn }
     if let until = f.meters[seat]?.fullUntil(at: now) { return .out(resetsAt: until) }
     return .ready
 }
