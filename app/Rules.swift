@@ -286,6 +286,8 @@ struct AppSettings: Codable, Equatable {
     /// Accounts whose organizations the menu folds under the account's name. Empty at first, so
     /// every organization shows.
     var collapsed: Set<String> = []
+    /// Seats whose row the person opened to both meters. Empty at first, so a new seat is one line.
+    var expanded: Set<Identity> = []
 
     init() {}
 
@@ -297,6 +299,7 @@ struct AppSettings: Codable, Equatable {
         autoSwitch = try c.decodeIfPresent(Bool.self, forKey: .autoSwitch) ?? true
         switchOrder = try c.decodeIfPresent(SwitchOrder.self, forKey: .switchOrder) ?? .topToBottom
         collapsed = try c.decodeIfPresent(Set<String>.self, forKey: .collapsed) ?? []
+        expanded = try c.decodeIfPresent(Set<Identity>.self, forKey: .expanded) ?? []
     }
 
     /// Whether the menu shows the organizations of `account`.
@@ -305,6 +308,21 @@ struct AppSettings: Codable, Equatable {
     /// Show or fold away the organizations of `account`.
     mutating func setShowsOrganizations(of account: String, _ shown: Bool) {
         if shown { collapsed.remove(account) } else { collapsed.insert(account) }
+    }
+
+    /// Whether the menu opens `seat`'s row to both meters.
+    func showsMeters(of seat: Identity) -> Bool { expanded.contains(seat) }
+
+    /// Open `seat`'s row to both meters, or close it to one line.
+    mutating func setShowsMeters(of seat: Identity, _ shown: Bool) {
+        if shown { expanded.insert(seat) } else { expanded.remove(seat) }
+    }
+
+    /// Forget what the menu kept for seats and accounts no longer in it, so one added again
+    /// starts as a new one does.
+    mutating func keepMenuState(for seats: [Identity]) {
+        expanded.formIntersection(seats)
+        collapsed.formIntersection(seats.map(\.account))
     }
 }
 

@@ -51,13 +51,18 @@ enum MenuLayout {
         return (fiveHour ? [("5-hour", meters.fiveHour)] : []) + [("Weekly", meters.weekly)]
     }
 
-    /// Whether a row shows both meters: the seat in use always, another seat while it is expanded
-    /// and has a reading to show.
-    static func showsMeters(_ seat: Seat, expanded: Identity?) -> Bool {
-        seat.state == .inUse || (seat.id == expanded && (seat.meters.fiveHour != nil || seat.meters.weekly != nil))
+    /// Whether a row opens to both meters, and so shows a chevron: any seat but the one in use,
+    /// which always shows them, once it has a reading to show. An out seat opens like any other.
+    static func canExpand(_ seat: Seat) -> Bool {
+        seat.state != .inUse && (seat.meters.fiveHour != nil || seat.meters.weekly != nil)
     }
 
-    static func rowHeight(_ seat: Seat, expanded: Identity?) -> CGFloat {
+    /// Whether a row shows both meters: the seat in use always, another seat while it is expanded.
+    static func showsMeters(_ seat: Seat, expanded: Set<Identity>) -> Bool {
+        seat.state == .inUse || (expanded.contains(seat.id) && canExpand(seat))
+    }
+
+    static func rowHeight(_ seat: Seat, expanded: Set<Identity>) -> CGFloat {
         showsMeters(seat, expanded: expanded)
             ? line + CGFloat(meterLines(seat.meters).count) * meterLine + meterFoot
             : line
@@ -67,7 +72,7 @@ enum MenuLayout {
     /// the person folded away.
     static func isFolded(_ card: [Seat], folded: Set<String>) -> Bool { card.count > 1 && folded.contains(card[0].id.account) }
 
-    static func cardHeight(_ card: [Seat], expanded: Identity?, folded: Set<String> = []) -> CGFloat {
+    static func cardHeight(_ card: [Seat], expanded: Set<Identity>, folded: Set<String> = []) -> CGFloat {
         if isFolded(card, folded: folded) { return line }
         let rows = card.reduce(0) { $0 + rowHeight($1, expanded: expanded) }
         return card.count == 1 ? rows : line + CGFloat(card.count) * hairline + rows
@@ -76,27 +81,27 @@ enum MenuLayout {
     /// Everything above the cards, plus the menu's padding: the part that never scrolls.
     static func chrome(hasNotice: Bool) -> CGFloat { 2 * padding + titleBar + (hasNotice ? notice : 0) }
 
-    static func cardsHeight(seats: [Seat], expanded: Identity?, folded: Set<String> = []) -> CGFloat {
+    static func cardsHeight(seats: [Seat], expanded: Set<Identity>, folded: Set<String> = []) -> CGFloat {
         let cards = cards(seats)
         return cards.reduce(0) { $0 + cardHeight($1, expanded: expanded, folded: folded) } + CGFloat(max(cards.count - 1, 0)) * cardGap
     }
 
     /// The menu's height if the screen were tall enough for every row.
-    static func contentHeight(seats: [Seat], hasNotice: Bool, expanded: Identity? = nil, folded: Set<String> = []) -> CGFloat {
+    static func contentHeight(seats: [Seat], hasNotice: Bool, expanded: Set<Identity> = [], folded: Set<String> = []) -> CGFloat {
         chrome(hasNotice: hasNotice) + cardsHeight(seats: seats, expanded: expanded, folded: folded)
     }
 
     /// The menu's height on a screen whose visible part (below the menu bar) is
     /// `visibleScreenHeight` tall: every row when they fit, else as tall as the screen allows,
     /// with the cards scrolling under the pinned title bar and notice.
-    static func height(visibleScreenHeight: CGFloat, seats: [Seat], hasNotice: Bool, expanded: Identity? = nil,
+    static func height(visibleScreenHeight: CGFloat, seats: [Seat], hasNotice: Bool, expanded: Set<Identity> = [],
                        folded: Set<String> = []) -> CGFloat {
         chrome(hasNotice: hasNotice) + cardsViewport(visibleScreenHeight: visibleScreenHeight, seats: seats,
                                                      hasNotice: hasNotice, expanded: expanded, folded: folded)
     }
 
     /// The height the cards get, which scroll when it is less than they need.
-    static func cardsViewport(visibleScreenHeight: CGFloat, seats: [Seat], hasNotice: Bool, expanded: Identity?,
+    static func cardsViewport(visibleScreenHeight: CGFloat, seats: [Seat], hasNotice: Bool, expanded: Set<Identity>,
                               folded: Set<String> = []) -> CGFloat {
         let room = max(visibleScreenHeight - screenMargin - chrome(hasNotice: hasNotice), minimumCards)
         return min(cardsHeight(seats: seats, expanded: expanded, folded: folded), room)
@@ -263,6 +268,18 @@ struct RenameField: View {
     }
 }
 
+/// The chevron after a name that opens or closes what is under it: an account's organizations, or
+/// a seat's meters. It points right while closed and down while open.
+struct Disclosure: View {
+    let open: Bool
+    /// Between the name and the chevron.
+    static let gap: CGFloat = 4
+    var body: some View {
+        Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(Color.quietText)
+            .rotationEffect(.degrees(open ? 90 : 0)).fixedSize().accessibilityHidden(true)
+    }
+}
+
 /// An account's colour dot, before its name.
 struct ColorDot: View {
     let hex: String
@@ -330,6 +347,8 @@ struct MenuActions {
     var recolor: (Seat, String) -> Void = { _, _ in }
     /// Shows (true) or folds away (false) an account's organizations, by account id.
     var showOrganizations: (String, Bool) -> Void = { _, _ in }
+    /// Opens (true) or closes (false) a seat's row to both meters.
+    var showMeters: (Seat, Bool) -> Void = { _, _ in }
     var setDisplay: (MenuBarDisplay) -> Void = { _ in }
     var setMetric: (UsageMetric) -> Void = { _ in }
     var setSwitchOrder: (SwitchOrder) -> Void = { _ in }
@@ -346,13 +365,15 @@ struct MenuHeader {
     var switchOrder = SwitchOrder.topToBottom
 }
 
-/// What the person chose for how accounts look: colours, folded accounts, and which names they
-/// changed, so Reset Name shows only where it does something.
+/// What the person chose for how accounts look: colours, folded accounts, opened rows, and which
+/// names they changed, so Reset Name shows only where it does something.
 struct MenuLooks {
     /// Each account's colour by account id, defaults already filled in (`resolvedColors`).
     var colors: [String: String] = [:]
     /// Accounts whose organizations are folded under the account's name.
     var folded: Set<String> = []
+    /// Seats whose row is opened to both meters.
+    var expanded: Set<Identity> = []
     /// Accounts whose name is not the default one.
     var renamedAccounts: Set<String> = []
     /// Seats whose organization's name is not the default one.
@@ -373,8 +394,6 @@ struct MenuPanel: View {
     var looks = MenuLooks()
     var actions = MenuActions()
     var now: Date = World.now()
-    /// The one row expanded to both meters. Never remembered: it is cleared whenever the menu opens.
-    @State var expanded: Identity? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -388,8 +407,6 @@ struct MenuPanel: View {
         }
         .padding(MenuLayout.padding)
         .frame(width: MenuLayout.width)
-        // The menu window can be kept between openings, so the expansion is dropped on close.
-        .onDisappear { expanded = nil }
     }
 
     private var cards: some View {
@@ -398,14 +415,14 @@ struct MenuPanel: View {
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: MenuLayout.cardGap) {
                     ForEach(MenuLayout.cards(seats), id: \.[0].id.account) { card in
-                        AccountCard(seats: card, expanded: $expanded, busy: busy, looks: looks, actions: actions, now: now)
+                        AccountCard(seats: card, busy: busy, looks: looks, actions: actions, now: now)
                             .id(card[0].id.account)
                     }
                 }
             }
             .scrollIndicators(.automatic)
             .frame(height: MenuLayout.cardsViewport(visibleScreenHeight: visibleScreenHeight, seats: seats,
-                                                    hasNotice: notice != nil, expanded: expanded, folded: looks.folded))
+                                                    hasNotice: notice != nil, expanded: looks.expanded, folded: looks.folded))
             .onAppear { if let target = MenuLayout.openScrollTarget(seats) { proxy.scrollTo(target, anchor: .center) } }
         }
     }
@@ -501,7 +518,6 @@ struct NoticeLine: View {
 /// away. The account in use has an accent edge, and its organization in use is lit.
 struct AccountCard: View {
     let seats: [Seat]
-    @Binding var expanded: Identity?
     let busy: Bool
     let looks: MenuLooks
     let actions: MenuActions
@@ -515,14 +531,14 @@ struct AccountCard: View {
              edge: inUse ? .accentColor : nil) {
             VStack(alignment: .leading, spacing: 0) {
                 if seats.count == 1 {
-                    SeatRow(seat: seats[0], title: seats[0].name, inCard: false, expanded: $expanded, busy: busy,
+                    SeatRow(seat: seats[0], title: seats[0].name, inCard: false, busy: busy,
                             looks: looks, actions: actions, now: now)
                 } else {
                     accountName(inUse: inUse)
                     if !MenuLayout.isFolded(seats, folded: looks.folded) {
                         ForEach(seats) { seat in
                             Divider().frame(height: MenuLayout.hairline).padding(.leading, 10)
-                            SeatRow(seat: seat, title: seat.organization, inCard: true, expanded: $expanded, busy: busy,
+                            SeatRow(seat: seat, title: seat.organization, inCard: true, busy: busy,
                                     looks: looks, actions: actions, now: now)
                         }
                     }
@@ -542,10 +558,9 @@ struct AccountCard: View {
                 Button {
                     withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { actions.showOrganizations(account, folded) }
                 } label: {
-                    HStack(spacing: 6) {
+                    HStack(spacing: Disclosure.gap) {
                         Text(first.accountName).fontWeight(.semibold).lineLimit(1).truncationMode(.middle)
-                        Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                            .rotationEffect(.degrees(folded ? 0 : 90))
+                        Disclosure(open: !folded)
                         // Folded away, the account holding the next seat carries its mark.
                         if folded && seats.contains(where: \.isNext) { NextMark() }
                         Spacer(minLength: 4)
@@ -604,13 +619,12 @@ struct NextMark: View {
 }
 
 /// One seat. A Ready, Out, Needs-sign-in or Switching seat is one line; the seat in use, and a
-/// seat whose name was clicked, also lists both meters.
+/// seat the person opened by its name or chevron, also lists both meters.
 struct SeatRow: View {
     let seat: Seat
     let title: String
     /// One of several organizations inside an account's card.
     let inCard: Bool
-    @Binding var expanded: Identity?
     let busy: Bool
     var looks = MenuLooks()
     let actions: MenuActions
@@ -627,7 +641,7 @@ struct SeatRow: View {
                 if confirmingRemove { removeLine } else { summaryLine }
             }
             .frame(height: MenuLayout.line)
-            if MenuLayout.showsMeters(seat, expanded: expanded) {
+            if MenuLayout.showsMeters(seat, expanded: looks.expanded) {
                 ForEach(MenuLayout.meterLines(seat.meters), id: \.label) { line in
                     MeterLine(label: line.label, meter: line.meter, stale: stale, now: now)
                 }
@@ -650,7 +664,8 @@ struct SeatRow: View {
         } else {
             name
             if seat.isNext { NextMark() }
-            Spacer(minLength: 4)
+            // The row's own spacing already keeps the status clear of the name.
+            Spacer(minLength: 0)
             status
             actionButton
             MoreMenu(name: seat.name) {
@@ -665,20 +680,24 @@ struct SeatRow: View {
         }
     }
 
-    /// The name, which shows or hides both meters on a row that isn't in use.
+    /// The name, and on a row that opens to both meters its chevron: one button opens or closes it,
+    /// the way an account's name folds its organizations.
     @ViewBuilder private var name: some View {
         let label = Text(title).fontWeight(inCard ? .regular : .semibold).lineLimit(1).truncationMode(.middle)
-            .layoutPriority(1)
-        if seat.state == .inUse || (seat.meters.fiveHour == nil && seat.meters.weekly == nil) {
-            label.accessibilityValue(summary)
-        } else {
+        if MenuLayout.canExpand(seat) {
+            let open = looks.expanded.contains(seat.id)
             Button {
-                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { expanded = expanded == seat.id ? nil : seat.id }
-            } label: { label.contentShape(Rectangle()) }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { actions.showMeters(seat, !open) }
+            } label: {
+                HStack(spacing: Disclosure.gap) { label; Disclosure(open: open) }.contentShape(Rectangle())
+            }
                 .buttonStyle(.plain)
-                .help(expanded == seat.id ? "Hide the meters" : "Show both meters")
+                .layoutPriority(1)
+                .help(open ? "Hide the meters" : "Show both meters")
                 .accessibilityValue(summary)
-                .accessibilityHint(expanded == seat.id ? "Hides both meters" : "Shows both meters")
+                .accessibilityHint(open ? "Hides both meters" : "Shows both meters")
+        } else {
+            label.layoutPriority(1).accessibilityValue(summary)
         }
     }
 
@@ -701,7 +720,7 @@ struct SeatRow: View {
             MeterBar(meter: seat.meters.fuller, stale: stale).frame(width: 40)
         case .ready:
             if let fuller = seat.meters.fuller, !stale {
-                Text("\(Int(fuller.percent.rounded()))%").font(.caption).monospacedDigit().fontWeight(.semibold)
+                Text("\(Int(fuller.percent.rounded()))%").font(.caption).monospacedDigit().fontWeight(.semibold).fixedSize()
             } else {
                 quiet(readAge(seat.meters, now: now) ?? "Not read yet")
             }
@@ -713,14 +732,15 @@ struct SeatRow: View {
         Text(text).font(.caption).foregroundStyle(Color.quietText).lineLimit(1).fixedSize()
     }
 
+    /// Never narrower than its title: on a crowded row the name gives way instead.
     @ViewBuilder private var actionButton: some View {
         switch seat.action {
         case .switchTo?:
-            Button("Switch") { actions.switchTo(seat) }.controlSize(.small).disabled(busy)
+            Button("Switch") { actions.switchTo(seat) }.controlSize(.small).fixedSize().disabled(busy)
                 .help("Quit Claude, open it on this seat, and bring your chats along")
                 .accessibilityLabel("Switch to \(seat.name)")
         case .setUp?:
-            Button("Set Up") { actions.setUp(seat) }.controlSize(.small).disabled(busy)
+            Button("Set Up") { actions.setUp(seat) }.controlSize(.small).fixedSize().disabled(busy)
                 .help("Quit Claude and reopen it at the sign-in page for this seat")
                 .accessibilityLabel("Set up \(seat.name)")
         case nil:
@@ -792,7 +812,8 @@ struct MenuContent: View {
             }
     }
 
-    private var actions: MenuActions {
+    /// The menu's controls, wired to the store; the scenarios press them the way the menu does.
+    var actions: MenuActions {
         MenuActions(switchTo: { store.switchTo($0) }, setUp: { store.setUp($0) },
                     rename: { store.rename($0, to: $1, organization: $2) },
                     canMove: { store.canMove($0, by: $1, organization: $2) },
@@ -808,12 +829,13 @@ struct MenuContent: View {
                     toggleOpenAtLogin: { store.toggleOpenAtLogin() },
                     recolor: { store.recolor($0, $1) },
                     showOrganizations: { store.setShowsOrganizations(of: $0, $1) },
+                    showMeters: { store.setShowsMeters(of: $0, $1) },
                     setDisplay: { store.settings.display = $0 }, setMetric: { store.settings.metric = $0 },
                     setSwitchOrder: { store.setSwitchOrder($0) })
     }
 
-    /// The rows' colours, folds and changed names, keyed the way the menu's seats are.
-    private var looks: MenuLooks {
+    /// The rows' colours, folds, opened rows and changed names, keyed the way the menu's seats are.
+    var looks: MenuLooks {
         let rows = store.accounts
         let account = { (row: AccountRecord) in row.seat.account }
         func differs(_ row: AccountRecord, organization: Bool) -> Bool {
@@ -822,6 +844,7 @@ struct MenuContent: View {
         }
         return MenuLooks(colors: resolvedColors(rows.map { (account($0), $0.color) }),
                          folded: Set(rows.map(account).filter { !store.settings.showsOrganizations(of: $0) }),
+                         expanded: store.settings.expanded,
                          renamedAccounts: Set(rows.filter { differs($0, organization: false) }.map(account)),
                          renamedOrganizations: Set(rows.filter { differs($0, organization: true) }.map(\.seat)))
     }

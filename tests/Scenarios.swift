@@ -1,4 +1,5 @@
-import Foundation
+import AppKit
+import SwiftUI
 import Darwin
 
 /// Live child processes of this test (the app runs sqlite3 as one). Called with no buffer,
@@ -47,6 +48,11 @@ struct Scenario {
     let claude: StandInClaude
     let usage = StandInUsage()
     var store: Store!
+    /// The menu's window and its drawing, kept between openings as the menu bar keeps them. Made
+    /// only by a scenario that opens the menu, so no other scenario starts AppKit.
+    lazy var menuWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: MenuLayout.width, height: 400),
+                              styleMask: [.borderless], backing: .buffered, defer: true)
+    var menuHost: NSHostingView<MenuContent>?
     private(set) var failures: [String] = []
     var checks = 0
 
@@ -828,6 +834,47 @@ let scenarios: [Scenario] = [
         let top = h.cardTop("Row 25")
         h.check(top.map { $0 > m.height - m.pinned } == true, "Row 25's card starts below the unscrolled cards: at \(String(describing: top)) of a \(m.height - m.pinned) pt viewport")
         h.check(h.openScrollCard?.contains("Row 25") == true, "the menu opens scrolled to Row 25's card: it scrolls to \(String(describing: h.openScrollCard))")
+    },
+    Scenario(pair: "(Menu, a row opened to both meters)", model: "10: a row's name or chevron opens it to both meters; it stays open through refreshes, closing the menu and a relaunch, until the person closes it") { h in
+        let delta1 = StandSeat(4, org: 1), delta2 = StandSeat(4, org: 2)
+        let all = [("Alpha", A), ("Beta", B), ("Gamma", C), ("Delta", delta1), ("Delta", delta2)]
+        try? h.rows(all, orgNames: ["Team", "Team", "Team", "Studio", "Labs"])
+        // Alpha's login is saved last, so Claude opens on it.
+        for (n, seat) in all.dropFirst() + all.prefix(1) { try? await h.savedLogin(n, seat) }
+        let reset = h.clock.now().addingTimeInterval(3 * 3600)
+        for seat in [A, B, delta1, delta2] { h.usage.set(seat, fiveHour: 20, resetsAt: reset) }
+        h.usage.set(C, fiveHour: 100, resetsAt: reset)
+        h.claudeHoldsSettled(); h.make(); await h.tick(); await h.settle()
+        h.check(h.state("Alpha") == .inUse && h.state("Gamma") == .out, "setup: Alpha in use, Gamma out: \(String(describing: h.state("Alpha"))), \(String(describing: h.state("Gamma")))")
+        h.check(!h.hasChevron("Alpha"), "the row in use, which always shows its meters, has no chevron")
+        h.check(["Beta", "Gamma", "Delta · Studio", "Delta · Labs"].allSatisfy(h.hasChevron), "every other read row has one: a seat alone, an out seat, and organizations in an account")
+
+        await h.openMenu()
+        h.menuShowsOpened([], "a new seat starts closed")
+        h.pressName("Beta")
+        h.menuShowsOpened(["Beta"], "clicking Beta's name opens it")
+        await h.pass(3 * h.tickEvery)
+        h.menuShowsOpened(["Beta"], "it stays open through three refresh ticks")
+        h.closeMenu(); await h.openMenu()
+        h.menuShowsOpened(["Beta"], "and through closing and reopening the menu")
+        h.pressName("Gamma"); h.pressName("Delta · Labs")
+        h.menuShowsOpened(["Beta", "Gamma", "Delta · Labs"], "several rows stay open at once, the out seat and an organization among them")
+        h.pressAccount("Delta · Labs")
+        h.menuShowsOpened(["Beta", "Gamma"], "folding Delta's organizations hides its opened one")
+
+        h.closeMenu(); h.crashApp(); await h.tick(); await h.settle(); await h.openMenu()
+        h.menuShowsOpened(["Beta", "Gamma"], "a relaunch keeps the opened rows and the folded account")
+        h.pressAccount("Delta · Labs")
+        h.menuShowsOpened(["Beta", "Gamma", "Delta · Labs"], "showing Delta again shows Labs still open")
+        h.pressName("Beta")
+        h.menuShowsOpened(["Gamma", "Delta · Labs"], "clicking Beta's name again closes it")
+
+        // A seat that goes is forgotten, so the same seat added again starts closed.
+        h.remove("Gamma")
+        await h.run(until: { !h.rowNames.contains("Gamma") }, limit: 60)
+        try? h.rows(all, orgNames: ["Team", "Team", "Team", "Studio", "Labs"])
+        await h.run(until: { h.hasChevron("Gamma") }, limit: 600)
+        h.menuShowsOpened(["Delta · Labs"], "Gamma, added again and read, starts closed")
     },
     // Section 6 steps, section 8 invariants and section 9 cases.
     Scenario(pair: "(Switch step 2, quit prompt cancelled)", model: "\"Switch cancelled\", nothing changed") { h in

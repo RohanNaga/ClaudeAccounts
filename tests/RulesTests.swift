@@ -217,6 +217,15 @@ struct RulesTests {
               "folding one account's organizations is remembered across launches, for that account only")
         folded.setShowsOrganizations(of: "acct", true)
         check(folded.showsOrganizations(of: "acct") && folded.collapsed.isEmpty, "and showing them again clears it")
+
+        let kept = Identity(account: "acct", org: "team"), gone = Identity(account: "left", org: "team")
+        check(old?.expanded.isEmpty == true && !AppSettings().showsMeters(of: kept), "every row starts closed, from an older settings file too")
+        var menu = AppSettings()
+        menu.setShowsMeters(of: kept, true); menu.setShowsMeters(of: gone, true)
+        menu.setShowsOrganizations(of: "acct", false); menu.setShowsOrganizations(of: "left", false)
+        menu.keepMenuState(for: [kept, Identity(account: "acct", org: "personal")])
+        check(menu.expanded == [kept] && menu.collapsed == ["acct"],
+              "a seat or account no longer in the menu is forgotten, the rest kept: \(menu.expanded), \(menu.collapsed)")
     }
 
     // MARK: Resume
