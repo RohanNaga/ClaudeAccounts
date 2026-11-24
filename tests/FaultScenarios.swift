@@ -426,7 +426,7 @@ let autoFaultScenarios: [Scenario] = [
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
     Scenario(pair: "(Automatic switch at confirm, a failed read)",
-             model: "6.6: the rollback marks Beta failedTarget; 8 B: confirm that can't read the log rolls back; Claude reopened on Alpha is a new hold, so nothing retries until Claude stops a chat again") { h in
+             model: "6.6: the rollback marks Beta failedTarget; 8 B: confirm that can't read the log rolls back; Claude reopened on Alpha is a new hold, so nothing retries until Claude stops a chat again, and that waits out the spacing") { h in
         let lines = await autoStart(h)
         let strike = autoStrike(h, at: "confirm", .failedRead)
         await startAuto(h)
@@ -441,8 +441,10 @@ let autoFaultScenarios: [Scenario] = [
         h.check(h.quits == quits && h.claude.sent.isEmpty && h.notice.first == "Didn't switch to Beta. Switch by hand.",
                 "back on Alpha, nothing retries or is typed by itself, and the line says what works: \(h.claude.actions), typed \(h.claude.sent), \(h.notice)")
         h.claude.logLimitStop("local_one", seatReadsFull: true)
-        await h.run(until: { h.claude.held == C && !h.switchInFlight && h.resumed("local_one") }, limit: 900)
-        h.check(h.claude.held == C && h.claude.sent == ["local_one resume"], "Claude's next stop switches to Gamma, resumed once (6.7); typed \(h.claude.sent)")
+        await h.pass(60)
+        h.check(h.quits == quits && h.noticeHas("Switching to Gamma at"), "Claude's next stop waits out the 15 minutes from the failed switch (review F1): \(h.seen)")
+        await h.run(until: { h.claude.held != A && !h.switchInFlight && h.resumed("local_one") }, limit: 1200)
+        h.check(h.claude.held != A && h.claude.sent == ["local_one resume"], "then switches, resumed once (6.7); typed \(h.claude.sent)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },

@@ -132,7 +132,7 @@ let gapScenarios: [Scenario] = [
     },
 
     // 5. Sections 5 and 6.6: a failed automatic switch.
-    Scenario(pair: "(Automatic switch fails at confirm)", model: "6.6: the target gets failedTarget; Claude reopened on Alpha is a new hold, so nothing retries until Claude stops a chat again, which skips the target for its 10 min coolDown (5) and resumes once (6.7)") { h in
+    Scenario(pair: "(Automatic switch fails at confirm)", model: "6.6: the target gets failedTarget; Claude reopened on Alpha is a new hold, so nothing retries until Claude stops a chat again; that waits out the 15 minutes from the failed switch's start (review F1), skipping the target while its 10 min coolDown (5) runs, and resumes once (6.7)") { h in
         await h.standard()
         h.claude.opensAsOnce = X
         h.claude.logLimitStop("local_one", seatReadsFull: true)
@@ -144,13 +144,15 @@ let gapScenarios: [Scenario] = [
         await h.pass(5 * 60)
         h.check(h.quits == quits && h.claude.held == A && h.claude.sent.isEmpty, "nothing retries by itself: \(h.claude.actions), typed \(h.claude.sent)")
         h.check(h.notice.first == "Didn't switch to Beta. Switch by hand.", "the line says what still works: \(h.notice)")
-        // Claude stops the chat again inside Beta's cool-down: the switch skips Beta for Gamma.
+        // Claude stops the chat again inside Beta's cool-down and the spacing: the line names Gamma.
         h.claude.logLimitStop("local_one", seatReadsFull: true)
-        await h.run(until: { h.claude.held == C && h.state("Gamma") == .inUse && !h.switchInFlight && h.resumed("local_one") }, limit: 900)
-        let next = h.claude.at("quit").dropFirst(quits).first
-        h.check(h.claude.held == C, "the next target, Gamma, is tried, not Beta again: holds \(String(describing: h.claude.held)), \(h.claude.actions)")
-        h.check(next.map { $0.timeIntervalSince(failed) < Spec.coolDown } ?? false, "inside Beta's cool-down: next quit \(secs(failed, next)) after the undo")
-        h.check(h.claude.sent == ["local_one resume"], "the chat the limit stopped is resumed once on Gamma (6.7): sent \(h.claude.sent)")
+        await h.pass(60)
+        h.check(h.quits == quits && h.noticeHas("Switching to Gamma at"), "inside Beta's cool-down the next target is Gamma, and the switch waits out the spacing: \(h.seen)")
+        await h.run(until: { h.quits > quits && h.claude.held != A && !h.switchInFlight && h.resumed("local_one") }, limit: 1200)
+        let first = h.claude.at("quit").first, next = h.claude.at("quit").dropFirst(quits).first
+        h.check(first.flatMap { f in next.map { $0.timeIntervalSince(f) >= Spec.autoSwitchSpacing } } ?? false,
+                "the next quit comes 15 min after the failed switch began: \(secs(first ?? failed, next)) after it, \(secs(failed, next)) after the undo")
+        h.check(h.claude.held != A && h.claude.sent == ["local_one resume"], "it lands on the first Ready seat then, and the chat is resumed once (6.7): \(h.seen)")
         h.check(Limits.coolDown == Spec.coolDown, "coolDown is 10 min: \(Limits.coolDown)")
         h.check(Limits.autoSwitchSpacing == Spec.autoSwitchSpacing, "autoSwitchSpacing is 15 min: \(Limits.autoSwitchSpacing)")
         h.check(Limits.settle == Spec.settle, "a relaunched hold settles for 60 s: \(Limits.settle)")

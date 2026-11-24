@@ -89,8 +89,8 @@ any other stop.
    started waits for your answer. **Cancel** ends it with "Switch cancelled."
    and nothing changed.
 2. **Back up and save.** It backs up Claude's cookie database and settings
-   file. If the app had seen Claude stay on the current seat for a minute, it
-   saves that seat's login ("Saving <seat>…"). A login is written to a new file, checked,
+   file. If Claude stayed on the current seat for a minute, by the app's clock
+   or by Claude's own log, it saves that seat's login ("Saving <seat>…"). A login is written to a new file, checked,
    then renamed over the old one, and the previous copy is kept until the new
    one checks out.
 3. **Move chats.** Each open chat's record moves from the current seat's folder
@@ -139,8 +139,8 @@ or the stop came before the app started, nothing is quit: the row shows the full
 switches when Claude stops a chat.", and the switch comes when Claude stops a
 chat. A stop on a seat that reads with room never starts a switch either:
 Claude can stop a chat for a limit the seat's meters don't show, and the seat
-then stays as it reads. After an automatic switch, the next one waits at least
-15 minutes, and a chat stopped meanwhile waits too. The notice says when, as
+then stays as it reads. After an automatic switch, whether it worked or not,
+the next one waits at least 15 minutes, and a chat stopped meanwhile waits too. The notice says when, as
 in "Switching to Research at 3:25 PM.", and a relaunch of the app keeps the 15
 minutes.
 
@@ -149,13 +149,15 @@ against its own clock: it uses them only to tell how long Claude held a seat
 before a later line. Moving between time zones, daylight saving, or a Mac
 asleep for hours changes nothing it decides. When Claude's log is rotated or
 cut short, the app reads on from where it was, so it loses no line it saw and
-counts none twice.
+counts none twice. At launch it reads back through the rotated logs to the
+line that names the seat Claude is on, however long Claude has run.
 
 If an automatic switch fails and Claude reopens on the seat it left, nothing
 retries by itself, since Claude reopening starts over. The notice reads
 "Didn't switch to Research. Switch by hand.", the full sentence on hover and the
-notification say it tries again when Claude next stops a chat, and the line
-stays until the next switch starts. If Claude doesn't quit, nothing changes and
+notification say it tries again when Claude next stops a chat, 15 minutes after
+the failed switch began at the earliest. The line stays until that stop, when it
+says when the switch goes. If Claude doesn't quit, nothing changes and
 the app asks Claude to quit only once: it doesn't try again, or try another
 seat, until Claude reopens, you switch by hand, or Auto-Switch is turned off
 and on. The notice reads the same line, and its full sentence on hover and the
@@ -172,9 +174,11 @@ away, the mark is on the account's name. Because nobody is there to answer Claud
 quit prompt, the automatic switch presses **Quit anyway** itself. It looks for
 the button again at every look, however late the prompt shows or slowly
 Accessibility answers. While a prompt is up that it can't press, the notice
-reads "Answer Claude: Quit anyway to switch, Cancel to stay." If Claude still
-hasn't quit after 3 minutes, it cancels and changes nothing; when it can't find
-the prompt to cancel, the full sentence on hover says the prompt is still open.
+reads "Answer Claude: Quit anyway to switch, Cancel to stay.", and after 10
+seconds one notification says the same. If Claude still hasn't quit after 3
+minutes, it cancels and changes nothing; when it can't find the prompt to
+cancel, the full sentence on hover says the prompt is still open, until Claude
+quits or reopens.
 If Claude shows no prompt and hasn't quit after 90 seconds, it stops there.
 
 When every other seat reads out or still needs setting up, it stays put, and
@@ -204,8 +208,9 @@ It pauses itself, with one line in the menu saying why:
   and it rolls back if the line never comes. An unknown cookie format stops it
   too, before anything changes.
 
-The app posts notifications only for automatic outcomes: a switch that
-succeeded or failed, and every seat being out.
+The app posts notifications only for automatic switches: one that succeeded or
+failed, a quit prompt it can't press, and every seat being out. One automatic
+switch posts at most two.
 
 ## After the switch
 
@@ -236,8 +241,8 @@ folder.
 - **Claude may refuse a saved login at any time**, for a sign-in that is too
   old or a change on its side. The switch rolls back, and the row asks you to
   sign in once more, across relaunches, until you do. A refusal Claude logged
-  while the app wasn't running isn't counted: the app learns it the next time
-  Claude refuses that login in front of it.
+  while the app wasn't running marks no saved login, but while it is Claude's
+  last word on that seat, the row reads Needs sign-in and no switch goes there.
 - **Typing "resume" depends on Claude's window and on Accessibility.** If
   either fails, the app names the chats that need a message.
 - **Usage credits.** A seat at 100 percent with credits still available reads
@@ -273,7 +278,7 @@ connections as usual.
 | Where | What | When |
 |---|---|---|
 | `~/Library/Application Support/ClaudeAccounts` | Everything the app keeps: `accounts.json`, settings, each seat's Claude Code login folder, saved Claude logins, meter readings, the switch journal, backups, `resume.log`, and `diagnostics.jsonl` | Always |
-| `diagnostics.jsonl` | One line per change of Claude's state, a seat's state or the automatic decision, and each switch's start and end, with times, state names and row numbers only; and while a switch waits for Claude to quit, each look at Claude's windows that differs from the last or takes a second or more, with its time in milliseconds, window roles and button titles. No names, emails, ids, tokens, window titles or chat content. It rotates at 4 MB | Always |
+| `diagnostics.jsonl` | One line per change of Claude's state, a seat's state or the automatic decision, each switch's start and end, each limit stop as it arrives (whether Claude had held the seat a minute), and each new run of the seat in use's readings (full or not, and since when), with times, state names and row numbers only; and while a switch waits for Claude to quit, each look at Claude's windows that differs from the last or takes a second or more, with its time in milliseconds, window roles and button titles. No names, emails, ids, tokens, window titles or chat content. It rotates at 4 MB | Always |
 | Login keychain | One `Claude Code-credentials-<hash>` item per seat, written by Claude Code. The app reads its token for the usage service | Always |
 | `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Written only during a switch, with Claude quit. Read to save the seat in use's login once Claude has stayed on it for a minute |
 | `~/Library/Logs/Claude/main.log` | Read only: which seat Claude is on and since when, refused sign-ins, chats stopped at a limit, and turns that ended | Always |

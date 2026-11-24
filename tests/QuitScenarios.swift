@@ -42,7 +42,7 @@ private func failedQuit(_ why: String) -> [String] {
 
 let quitScenarios: [Scenario] = [
     Scenario(pair: "(Automatic switch, Accessibility lists Claude's quit prompt 45 s after it opens)",
-             model: "a prompt not listed yet is looked for again at every look, and pressed once it shows; the line says what to do meanwhile; one quit, no pause (review E1)") { h in
+             model: "a prompt not listed yet is looked for again at every look, and pressed once it shows; the line says what to do meanwhile; one quit, no pause (review E1; the 10 s notification is the EM ruling of round 5)") { h in
         await h.standard()
         h.claude.quitBehaviour = .promptUnanswered
         h.claude.promptListedAfter = 45
@@ -53,7 +53,8 @@ let quitScenarios: [Scenario] = [
         let pressed = h.claude.at("pressed \(ClaudeUI.quitAnyway)")
         h.check(pressed.count == 1 && pressed.first.map { $0.timeIntervalSince(asked) >= 45 } ?? false, "Quit anyway pressed once, once it showed: \(h.seen)")
         h.check(h.claude.held == B && h.quits == 1 && h.resumes("local_one") == 1, "on Beta after one quit, \"resume\" typed once: \(h.seen)")
-        h.check(h.claude.notifications == ["Switched to Beta: Alpha is out. 1 chat resumed."], "one notification: \(h.claude.notifications)")
+        h.check(h.claude.notifications == ["Switching to Beta: \(QuitWatch.answerPrompt)", "Switched to Beta: Alpha is out. 1 chat resumed."],
+                "one notification at 10 s unpressed, then the switch's: \(h.claude.notifications)")
         h.check(ShapeMisses.load().isEmpty && !h.noticeHas(pausedLine), "no missing shape is recorded: \(h.seen)")
         await h.handSwitchWorks("Gamma", C)
     },
@@ -70,7 +71,8 @@ let quitScenarios: [Scenario] = [
         let pressed = h.claude.at("pressed \(ClaudeUI.quitAnyway)")
         h.check(pressed.count == 1 && pressed.first.map { $0.timeIntervalSince(asked) >= 100 } ?? false, "Quit anyway pressed once Accessibility answered: \(h.seen)")
         h.check(h.claude.held == B && h.quits == 1 && h.resumes("local_one") == 1, "on Beta after one quit, \"resume\" typed once: \(h.seen)")
-        h.check(h.claude.notifications == ["Switched to Beta: Alpha is out. 1 chat resumed."], "one notification: \(h.claude.notifications)")
+        h.check(h.claude.notifications == ["Switching to Beta: \(QuitWatch.answerPrompt)", "Switched to Beta: Alpha is out. 1 chat resumed."],
+                "one notification at 10 s unpressed, then the switch's: \(h.claude.notifications)")
         h.check(ShapeMisses.load().isEmpty && !h.noticeHas(pausedLine), "no missing shape is recorded: \(h.seen)")
         let looks = ((try? String(contentsOf: Diagnostics.url, encoding: .utf8)) ?? "").split(separator: "\n")
             .compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }.filter { $0["kind"] as? String == "quitLook" }
@@ -89,11 +91,12 @@ let quitScenarios: [Scenario] = [
         await h.run(until: { !h.switchInFlight }, limit: 5 * 60)
         let why = "Claude didn't quit, so nothing changed. Its prompt is still open: Cancel keeps Claude as it is."
         h.check(h.notice == failedQuit(why), "the line says what didn't happen and that the prompt is still open: \(h.seen)")
-        h.check(h.claude.notifications == ["Didn't switch to Beta: \(why) \(AutoSwitch.afterQuitFailure)"], "one notification says the same: \(h.claude.notifications)")
+        h.check(h.claude.notifications == ["Switching to Beta: \(QuitWatch.answerPrompt)", "Didn't switch to Beta: \(why) \(AutoSwitch.afterQuitFailure)"],
+                "the 10 s notification, then one that says the same: \(h.claude.notifications)")
         h.check(!h.claude.actions.contains { $0.hasPrefix("pressed") } && h.claude.promptOpen, "the prompt is left to the person: \(h.seen)")
         h.check(ShapeMisses.load().isEmpty, "no missing shape is recorded for a prompt it never saw: \(ShapeMisses.load())")
         await h.stopsAgain(for: 40)
-        h.check(h.quits == 1 && h.claude.notifications.count == 1 && h.claude.held == A, "no second quit, notification or other seat in 40 min of stops: \(h.seen)")
+        h.check(h.quits == 1 && h.claude.notifications.count == 2 && h.claude.held == A, "no second quit, further notification or other seat in 40 min of stops: \(h.seen)")
         h.claude.personAnswers(ClaudeUI.cancel)
         await h.handSwitchWorks("Gamma", C)
     },

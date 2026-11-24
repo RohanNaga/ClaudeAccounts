@@ -61,7 +61,8 @@ func limitStop(_ date: Date, _ chat: String) -> String {
 /// `staleWait` is `allOut` 20 minutes later, with every reading stale while the usage service stalls.
 /// `brake` is the seat in use out with a chat stopped, 5 minutes after an automatic switch.
 /// `switchFailed` is the seat in use at 100 after an automatic switch to Research failed and reopened Claude.
-/// `answerPrompt` is an automatic switch to Research waiting on Claude's quit prompt it can't press.
+/// `answerPrompt` is an automatic switch to Research, the seat in use out with a chat stopped,
+/// waiting on Claude's quit prompt it can't press.
 enum Scenario { case spread, allOut, noAccessibility, stale, upgrade, fullNoStop, staleWait, brake, switchFailed, answerPrompt }
 
 /// A desktop-like backdrop that differs from the panel in both appearances.
@@ -90,11 +91,11 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
             f.meters[baseRows[1].seat] = m(64, at(16, 10), 38, thursday9, read: now.addingTimeInterval(-42 * 60))
             f.meters[baseRows[5].seat] = nil
         }
-        if s == .brake {
+        if s == .brake || s == .answerPrompt {
             f.log.read(limitStop(now.addingTimeInterval(-3 * 60), "local_build"), readAt: now.addingTimeInterval(-3 * 60), arrived: true)
             f.meters[baseRows[1].seat] = m(100, at(16, 10), 38, thursday9, read: fresh)
-            f.lastAutoSwitch = now.addingTimeInterval(-5 * 60)
         }
+        if s == .brake { f.lastAutoSwitch = now.addingTimeInterval(-5 * 60) }
         if s == .answerPrompt { f.switching = SwitchFacts(target: baseRows[2].seat, step: QuitWatch.answerPrompt) }
         if s == .switchFailed { f.failedTargets[baseRows[2].seat] = now.addingTimeInterval(-60) }
         if s == .fullNoStop || s == .switchFailed {

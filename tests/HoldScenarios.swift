@@ -78,7 +78,7 @@ let holdScenarios: [Scenario] = [
     },
 
     Scenario(pair: "(Each earlier build's state file at launch, with the seat in use full and with room)",
-             model: "no file on disk acts by itself: build 10's and the unreleased build's auto-switch.json are never read, stops.json goes, a corrupt or foreign switch-memory.json reads as empty; the next real stop still switches (reviews C5, C6, C11)") { h in
+             model: "no file on disk acts by itself: build 10's and the unreleased build's auto-switch.json and build 11's stops.json are never read, a corrupt or foreign switch-memory.json reads as empty; the next real stop still switches (reviews C5, C6, C11)") { h in
         await h.standard()
         let dir = Paths.stateDir
         let t = h.now.timeIntervalSinceReferenceDate
@@ -96,7 +96,6 @@ let holdScenarios: [Scenario] = [
             await h.pass(10 * 60)
             h.check(h.claude.actions.isEmpty && h.claude.sent.isEmpty && h.claude.notifications.isEmpty,
                     "launch \(i + 1): nothing quit, typed or posted: \(h.seen)")
-            h.check(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("stops.json").path), "launch \(i + 1): stops.json is gone")
         }
         h.check(h.store.facts().wait == nil, "a wait on file is never read: \(String(describing: h.store.facts().wait))")
         h.usage.set(A, fiveHour: 30, resetsAt: h.now.addingTimeInterval(3 * 3600))
@@ -158,7 +157,7 @@ let holdScenarios: [Scenario] = [
     },
 
     Scenario(pair: "(Click Switch on a seat that reads out, then Claude stops a chat there)",
-             model: "Claude's refusal after a switch by hand moves it on, like any stop (AutoSwitch.stopsMoveOnFromHandChoice; review C10)") { h in
+             model: "Claude's refusal after a switch by hand moves it on, like any stop (AutoSwitch.stopped; review C10)") { h in
         await h.standard()
         h.usage.set(B, fiveHour: 100, resetsAt: h.now.addingTimeInterval(3 * 3600))
         await h.pass(ClaudeTiming.meterEvery + 5)

@@ -682,7 +682,8 @@ let scenarios: [Scenario] = [
         h.check(h.notice == ["Didn't switch to Beta. Switch by hand.",
                              "Didn't switch to Beta: Claude's quit prompt has no Quit anyway button, so nothing changed. Its prompt is still open: Cancel keeps Claude as it is. \(AutoSwitch.afterQuitFailure)"],
                 "the failed quit holds the notice: \(h.notice)")
-        h.check(h.quits == 1 && h.claude.notifications.count == 1, "one quit request, one notification: \(h.seen)")
+        h.check(h.quits == 1 && h.claude.notifications == ["Switching to Beta: \(QuitWatch.answerPrompt)", "Didn't switch to Beta: Claude's quit prompt has no Quit anyway button, so nothing changed. Its prompt is still open: Cancel keeps Claude as it is. \(AutoSwitch.afterQuitFailure)"],
+                "one quit request; one notification at 10 s unpressed and one at the failure: \(h.seen)")
         h.store.closeNotice()
         await h.tick()
         h.check(h.noticeHas(pausedLine), "a prompt without its button pauses automatic switching, in one line, once the failure is closed: \(h.notice)")
@@ -904,7 +905,7 @@ enum ScenarioRun {
         var passed = 0, failed = 0, pending = 0, skipped = 0
         // One pair by its exact name (each.sh), else every pair whose name contains the argument.
         let only = CommandLine.arguments.dropFirst().first
-        let all = scenarios + bugScenarios + faultScenarios + gapScenarios + waitScenarios + holdScenarios + arrivalScenarios + quitScenarios
+        let all = scenarios + bugScenarios + faultScenarios + gapScenarios + waitScenarios + holdScenarios + arrivalScenarios + quitScenarios + reviewFiveScenarios
         if only == "--list" { all.forEach { print($0.pair) }; exit(0) }
         let exact = all.contains { $0.pair == only }
         for s in all where only == nil || (exact ? s.pair == only : s.pair.contains(only!)) {
