@@ -141,11 +141,10 @@ func severity(_ pct: Int) -> Color { pct >= 80 ? .red : pct >= 60 ? .orange : .g
 /// A one-line row says only the day of a reset after today ("Thu"); its meters say the hour.
 func shortReset(_ date: Date?, now: Date, dayOnly: Bool = false) -> String? {
     guard let date, date > now else { return nil }
-    if Calendar.current.isDate(date, inSameDayAs: now) { return date.formatted(date: .omitted, time: .shortened) }
-    if date.timeIntervalSince(now) < 6 * 86400 {
-        return date.formatted(dayOnly ? .dateTime.weekday(.abbreviated) : .dateTime.weekday(.abbreviated).hour().minute())
+    if dayOnly, !Calendar.current.isDate(date, inSameDayAs: now), date.timeIntervalSince(now) < 6 * 86400 {
+        return date.formatted(.dateTime.weekday(.abbreviated))
     }
-    return date.formatted(.dateTime.month(.abbreviated).day())
+    return ClockText.time(date, now: now)
 }
 
 extension Color {

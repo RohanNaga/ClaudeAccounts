@@ -55,6 +55,7 @@ struct Scenario {
         claude = try StandInClaude(clock: clock)
         try World.install(claude, clock: clock)
         usage.clock = clock
+        claude.usage = usage
         Usage.install(usage)
     }
 
@@ -348,7 +349,8 @@ let scenarios: [Scenario] = [
         h.click("Beta")
         await h.run(until: { h.claude.held == B }, limit: 300)
         await h.pass(10)
-        h.claude.logLimitStop("local_one")
+        // A stop logged before Beta's hold settled is not Beta's: Beta's meter still reads with room.
+        h.claude.logLimitStop("local_one", seatReadsFull: false)
         await h.pass(300)
         h.check(h.claude.held == B, "no automatic switch away from Beta: \(String(describing: h.claude.held))")
         h.check(h.quits == 1, "only the manual switch quit Claude: \(h.claude.actions)")

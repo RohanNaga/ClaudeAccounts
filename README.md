@@ -107,10 +107,13 @@ Each switch leaves a folder in `backups` with the files from before it and
 
 ## Automatic switching
 
-The automatic switch runs only when the seat in use is truly out. Claude must
-have stayed on that seat for a minute, and then either stopped a chat because
-the seat hit its limit, or ended a turn after which the seat's meter reads 100
-percent. The meters alone never start a switch.
+The automatic switch runs only when the seat in use is truly out. A seat is out
+only when a reading from the last 15 minutes shows its 5-hour or weekly meter
+at 100 percent, until that meter's own reset. Claude must have stayed on the
+seat for a minute and stopped a chat for usage or ended a turn there. The
+meters alone never start a switch, and neither does a stop alone: Claude can
+stop a chat for a limit the seat's meters don't show, and the seat then stays
+as it reads.
 
 It goes down the menu from the seat in use, wrapping round to the top, and
 picks the first seat that is ready, has a reading from the last 15 minutes, and
@@ -123,8 +126,10 @@ away, the mark is on the account's name. Because nobody is there to answer Claud
 quit prompt, the automatic switch presses **Quit anyway** itself. If Claude
 still hasn't quit after 3 minutes, it cancels and changes nothing.
 
-When every seat is out, it stays put, and the notice says which seat resets
-first. With more than one seat, one notification says so too.
+When every other seat reads out or still needs setting up, it stays put, and
+the notice says which seat resets first. With more than one seat, one
+notification says so too. A seat not read yet is never counted as out: the
+app reads it, then decides.
 
 It pauses itself, with one line in the menu saying why:
 

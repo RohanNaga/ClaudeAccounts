@@ -543,8 +543,10 @@ enum ComposerRule {
 //
 // One seat is one Claude account in one organization, keyed by the pair (Identity). Every state
 // the menu shows comes from `seatState` and `AppState`, which read the facts below fresh and
-// store no guesses. The only stored memories are facts: saved logins, meter readings, the time
-// Claude stopped a chat for usage on a seat, a target whose switch failed, and the switch journal.
+// store no guesses. The only stored memories are facts: saved logins, meter readings, a target
+// whose switch failed, and the switch journal. A seat is out only on a reading: a stop in Claude's
+// log never marks a seat out by itself, because Claude may stop a chat for a limit the seat's
+// meters don't show, and a guessed reset would keep a seat with room out for hours.
 
 /// Every time and length the model waits on, each with its reason.
 enum Limits {
@@ -562,8 +564,6 @@ enum Limits {
     static let meterAfterReset: TimeInterval = 60
     /// A target whose switch failed is skipped this long, so a failure never repeats in a loop.
     static let coolDown: TimeInterval = 10 * 60
-    /// A stop with no reset ahead counts the seat out this long: the shorter usage window.
-    static let outWithoutReset: TimeInterval = 5 * 3600
     /// An unattended switch that can't get Claude to quit this long cancels and stops. A manual
     /// switch has no limit: the person answers Claude's prompt.
     static let autoQuitWait: TimeInterval = 3 * 60
@@ -624,14 +624,6 @@ struct SeatMeters: Equatable, Codable {
 
     /// Any meter at or above full on this reading, fresh or not.
     var showsFull: Bool { [fiveHour, weekly].contains { ($0?.percent ?? 0) >= Limits.full } }
-}
-
-/// Claude stopped a chat for usage while holding a seat settled; `resetsAt` is from the reading
-/// taken at that stop. The one stored memory of section 4, a fact per pair.
-struct StopMark: Equatable, Codable {
-    var at: Date
-    var resetsAt: Date?
-    var until: Date { resetsAt.flatMap { $0 > at ? $0 : nil } ?? at.addingTimeInterval(Limits.outWithoutReset) }
 }
 
 // MARK: Claude's log as events
@@ -699,6 +691,24 @@ struct ClaudeEvents {
         return (limit, quit)
     }
 
+    /// Chats in the current run whose last word is a usage stop logged before the hold settled:
+    /// a stop counted against no seat (Claude may still be falling back from a refused sign-in),
+    /// so it is resumed once the seat in use reads with room.
+    var stoppedUncounted: Set<String> {
+        var last: [String: StampedEvent] = [:]
+        for e in events {
+            switch e.event {
+            case .newRun, .signedOut: last = [:]
+            case .named(let s) where e.held != s: last = [:]
+            case .limitStop(let c), .turnEnded(let c), .cutByQuit(let c): last[c] = e
+            default: break
+            }
+        }
+        return Set(last.compactMap { chat, e in
+            if case .limitStop = e.event, !e.settled { return chat } else { return nil }
+        })
+    }
+
     /// The last settled TurnEnded on `seat`: a reading after it at 100 means the seat wrapped up.
     /// Log lines carry whole seconds: an event stamped S happened within [S, S+1), so a reading
     /// is after it only from S+1 on.
@@ -739,6 +749,17 @@ struct ClaudeEvents {
 
     func lastTurnEnd(on seat: Identity) -> Date? {
         events.last { e in if case .turnEnded = e.event { return e.held == seat && e.settled }; return false }?.at
+    }
+
+    /// Claude's last word that `seat` may be done, logged on a settled hold of it: a usage stop or
+    /// a turn that ended. Only a reading taken after it can say whether the seat is out.
+    func lastSignal(on seat: Identity) -> StampedEvent? {
+        events.last { e in
+            switch e.event {
+            case .limitStop, .turnEnded: return e.held == seat && e.settled
+            default: return false
+            }
+        }
     }
 
     static func event<S: StringProtocol>(_ line: S, held: Identity?) -> LogEvent? {
@@ -835,7 +856,6 @@ struct Facts {
     var saved: [Identity: Date] = [:]
     /// F5, per seat: each seat reads usage through its own Claude Code sign-in.
     var meters: [Identity: SeatMeters] = [:]
-    var stops: [Identity: StopMark] = [:]
     /// When an automatic switch to each pair last failed.
     var failedTargets: [Identity: Date] = [:]
     /// F7.
@@ -846,7 +866,9 @@ struct Facts {
     var autoChosen = true
     /// The person's order for the automatic switch.
     var order: SwitchOrder = .topToBottom
-    /// Chats stopped for usage or wrapped up that wait for a seat with room.
+    /// Chats that wait for a seat with room: those the seat in use's running out stopped, not yet
+    /// resumed. A usage stop on a seat whose reading has room is not one: typing into it again
+    /// would only meet the same refusal.
     var waitingChats = 0
 
     /// The seat Claude holds, while it runs.
@@ -864,18 +886,8 @@ func seatState(_ seat: Identity, _ f: Facts, now: Date) -> SeatState {
     if let s = f.switching, s.target == seat { return .switching(step: s.step) }
     if f.hold?.seat == seat { return .inUse }
     guard let savedAt = f.saved[seat], !(f.log.refusedAt[seat].map { $0 > savedAt } ?? false) else { return .needsSignIn }
-    if let until = OutRule.until(seat, f, now: now) { return .out(resetsAt: until) }
+    if let until = f.meters[seat]?.fullUntil(at: now) { return .out(resetsAt: until) }
     return .ready
-}
-
-/// Section 4: a seat is out on a fresh full meter whose reset is ahead, or after a settled usage
-/// stop until the reset of the reading taken at that stop.
-enum OutRule {
-    static func until(_ seat: Identity, _ f: Facts, now: Date) -> Date? {
-        let byMeter = f.meters[seat]?.fullUntil(at: now)
-        let byStop = f.stops[seat].map(\.until).flatMap { $0 > now ? $0 : nil }
-        return [byMeter, byStop].compactMap { $0 }.max()
-    }
 }
 
 // MARK: The automatic switch
@@ -900,25 +912,24 @@ enum AutoSwitch {
     enum Decision: Equatable {
         case none
         case switchTo(Identity)
-        /// Every seat is out; `resumesAt` is the earliest known reset, at `seat`.
+        /// Every seat is read out or needs sign-in; `resumesAt` is the earliest reset, at `seat`.
         case wait(seat: Identity?, resumesAt: Date?)
         case resumeInPlace
     }
 
-    /// Claude itself showed the settled seat in use is done: a settled limit stop (recorded as a
-    /// StopMark), or a settled turn end followed by a later, current reading at 100. A meter alone never is.
+    /// The settled seat in use is done: its current reading is out (a full meter whose reset is
+    /// ahead), and chats wait on it or Claude stopped a chat for usage or ended a turn on it since
+    /// it began holding it. Neither alone is: a meter at 100 with no chat stopped leaves Claude to
+    /// say so, and a stop on a seat that reads with room leaves the seat as it reads.
     static func isDone(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
-        if let mark = f.stops[seat], mark.until > now { return true }
-        guard let ended = f.log.lastTurnEnd(on: seat), let m = f.meters[seat], let readAt = m.readAt,
-              ClaudeEvents.readAfter(ended, readAt: readAt), m.isCurrent(at: now), m.showsFull else { return false }
-        return true
+        guard let hold = f.hold, hold.seat == seat, let m = f.meters[seat], m.isCurrent(at: now), m.fullUntil(at: now) != nil else { return false }
+        return f.waitingChats > 0 || (f.log.lastSignal(on: seat).map { $0.at >= hold.since } ?? false)
     }
 
-    /// A current reading with room, taken once the seat's last stop had run out (section 4: the
-    /// reset is read a minute later, then the chats resume). A stop mark running out is not room by itself.
+    /// A current reading with room: the chats a wait stopped resume in place on it.
     static func hasRoom(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
-        guard let m = f.meters[seat], let readAt = m.readAt, m.isCurrent(at: now), !m.showsFull else { return false }
-        return readAt >= f.stops[seat]?.until ?? .distantPast
+        guard let m = f.meters[seat], m.isCurrent(at: now) else { return false }
+        return !m.showsFull
     }
 
     /// The order the automatic switch tries the other seats in: down the menu from `from`,
@@ -962,7 +973,14 @@ enum AutoSwitch {
         }
         guard status == .on else { return .none }
         if let t = target(from: hold.seat, f, now: now) { return .switchTo(t) }
-        let resets = f.rows.compactMap(\.identity).compactMap { s in OutRule.until(s, f, now: now).map { (s, $0) } }
+        // A wait says every seat is out, so it needs every other seat read out or unusable. A seat
+        // not read yet, stale or cooling down after a failed switch is read again on its schedule,
+        // and the decision runs again then.
+        let others = order(from: hold.seat, f)
+        guard others.allSatisfy({ s in
+            switch seatState(s, f, now: now) { case .out, .needsSignIn: return true; default: return false }
+        }) else { return .none }
+        let resets = f.rows.compactMap(\.identity).compactMap { s in f.meters[s]?.fullUntil(at: now).map { (s, $0) } }
         let first = resets.min { $0.1 < $1.1 }
         return .wait(seat: first?.0, resumesAt: first?.1)
     }
@@ -1056,7 +1074,7 @@ enum AppState {
         }
         if let failure { all.append(Notice(kind: .failure, text: failure)) }
         if case .wait(let seat, let at) = AutoSwitch.decide(f, now: now), f.waitingChats > 0 {
-            let when = at.map { " at \(ClockText.time($0))" } ?? ""
+            let when = at.map { " at \(ClockText.time($0, now: now))" } ?? ""
             if f.rows.compactMap(\.identity).count == 1 {
                 all.append(Notice(kind: .waiting, text: "\(name(seat) ?? "Your seat") is out. Chats resume when it resets\(when)."))
             } else {
@@ -1083,7 +1101,13 @@ enum AppState {
     }
 }
 
-/// A time as the menu says it, in the person's own format ("3:40 PM").
+/// A time as the menu says it, in the person's own format, as short as it reads: "3:40 PM" today,
+/// "Thu 3:40 PM" within the week, "Dec 2" later. A reset on another day never reads as today's hour.
 enum ClockText {
-    static func time(_ date: Date) -> String { DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short) }
+    static func time(_ date: Date, now: Date) -> String {
+        let hour = DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short)
+        if Calendar.current.isDate(date, inSameDayAs: now) { return hour }
+        if date > now, date.timeIntervalSince(now) < 6 * 86400 { return "\(date.formatted(.dateTime.weekday(.abbreviated))) \(hour)" }
+        return date.formatted(.dateTime.month(.abbreviated).day())
+    }
 }

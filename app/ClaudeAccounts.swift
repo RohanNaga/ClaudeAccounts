@@ -1247,6 +1247,53 @@ struct PairFile<Value: Codable> {
     }
 }
 
+/// The previous build's last readings, carried into this build's meters once, on the first launch
+/// that has none of its own, so an upgrade shows every seat's meters as they were read, with their
+/// age, instead of "Not read yet". The previous build's file stays, for a return to that build.
+enum UsageCarry {
+    /// One row's entry in the previous build's usage-cache.json, keyed there by row id.
+    private struct Entry: Decodable {
+        /// An older cache kept only the rounded `pct`.
+        struct Window: Decodable {
+            let utilization: Double?
+            let pct: Int?
+            let resetsAt: Date?
+            var reading: MeterReading? { (utilization ?? pct.map(Double.init)).map { MeterReading(percent: $0, resetsAt: resetsAt) } }
+        }
+        let polledAt: Date
+        let retryAt: Date?
+        let fiveHour: Window?
+        let weekly: Window?
+        let readAt: Date?
+    }
+
+    static var url: URL { Paths.stateDir.appendingPathComponent("usage-cache.json") }
+
+    /// The previous build's readings by seat, and its rate-limit waits still ahead; nil once this
+    /// build has meters of its own or there is nothing to carry.
+    static func readings(_ rows: [AccountRecord], now: Date) -> (meters: [Identity: SeatMeters], retryAt: [Identity: Date])? {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: Paths.stateDir.appendingPathComponent("meters.json").path),
+              let data = try? Data(contentsOf: url),
+              let entries = try? JSONDecoder().decode([String: Entry].self, from: data) else { return nil }
+        var meters: [Identity: SeatMeters] = [:], waits: [Identity: Date] = [:]
+        for row in rows {
+            guard let seat = row.identity, let e = entries[row.id] else { continue }
+            if let wait = e.retryAt, wait > now { waits[seat] = wait }
+            let fiveHour = e.fiveHour?.reading, weekly = e.weekly?.reading
+            guard fiveHour != nil || weekly != nil else { continue }
+            meters[seat] = SeatMeters(fiveHour: fiveHour, weekly: weekly, readAt: e.readAt ?? e.polledAt)
+        }
+        return meters.isEmpty && waits.isEmpty ? nil : (meters, waits)
+    }
+
+    /// Build 11 kept a guessed "out" per seat in stops.json; out is now only ever read, so the
+    /// file goes.
+    static func dropStopMarks() {
+        try? FileManager.default.removeItem(at: Paths.stateDir.appendingPathComponent("stops.json"))
+    }
+}
+
 /// The Claude shapes found missing, each with the time from which seeing it clears the miss
 /// (model, section 8). Kept on disk, so the pause outlasts a restart of the app and `--status`
 /// reads it. Each place that relies on a shape reports it here, missing or whole.
@@ -1347,7 +1394,6 @@ final class Store: ObservableObject {
     private var running = false
     private var trusted = World.claude.trusted
     private var meters = PairFile<SeatMeters>(name: "meters.json").load()
-    private var stops = PairFile<StopMark>(name: "stops.json").load()
     private var failedTargets = PairFile<Date>(name: "failed-targets.json").load()
     /// When each seat's meters were last asked for, and when the service lets it be asked again.
     private var askedAt: [Identity: Date] = [:]
@@ -1386,6 +1432,15 @@ final class Store: ObservableObject {
 
     init() {
         SavedLogins.adopt(accounts)
+        if let carried = UsageCarry.readings(accounts, now: World.now()) {
+            meters = carried.meters
+            retryAt = carried.retryAt
+            PairFile<SeatMeters>(name: "meters.json").save(meters)
+        }
+        UsageCarry.dropStopMarks()
+        // A seat read moments ago is not asked again at once: the usage service answers a second
+        // ask within a minute with a wait of several minutes, and the seat would read as not read.
+        askedAt = meters.compactMapValues(\.readAt)
         publish()
         resumeLeftOver()
     }
@@ -1444,7 +1499,6 @@ final class Store: ObservableObject {
         f.log = log.events
         f.saved = Dictionary(accounts.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
         f.meters = meters
-        f.stops = stops
         f.failedTargets = failedTargets
         f.switching = switchingTo ?? SwitchJournal.load().map {
             SwitchFacts(target: $0.to, step: $0.parked ? "Open Claude to finish." : $0.undoWhenClosed ? "Quit Claude to undo." : "Finishing…")
@@ -1456,11 +1510,11 @@ final class Store: ObservableObject {
         return f
     }
 
-    /// Chats that wait for a seat with room: those Claude stopped for usage in its current run and
-    /// those the out signal stopped, through any undone switch, that were not resumed yet.
+    /// Chats that wait for a seat with room: those the seat in use's running out stopped, through
+    /// any undone switch, and those a stop counted against no seat stopped, not resumed yet.
     private func waitingChats(_ f: Facts) -> Set<String> {
         guard f.hold != nil else { return [] }
-        return f.log.stoppedChats.byLimit.union(waiting.keys).subtracting(resumed.keys)
+        return f.log.stoppedUncounted.union(waiting.keys).subtracting(resumed.keys)
     }
 
     /// Rebuild the rows and the notice from the facts.
@@ -1494,8 +1548,8 @@ final class Store: ObservableObject {
 
     // MARK: Tick
 
-    /// Do everything due at the clock's now: read the new log lines and Claude's process, record
-    /// new usage stops, save a newly settled hold's login, read the meters that are due, then run
+    /// Do everything due at the clock's now: read the new log lines and Claude's process, save a
+    /// newly settled hold's login, read the meters that are due, then run
     /// the automatic decision. An automatic switch it starts is awaited.
     func tick() async {
         guard !ticking else { return }
@@ -1522,31 +1576,10 @@ final class Store: ObservableObject {
         trusted = World.claude.trusted
         log.poll()
         ShapeMisses.clearNamed(seenIn: log.events)
-        recordStops()
         // A chat that ran again since it began to wait, or since it was resumed, is done with both.
         let events = log.events
         waiting = waiting.filter { (events.lastWord(of: $0.key) ?? .distantPast) <= $0.value }
         resumed = resumed.filter { (events.lastWord(of: $0.key) ?? .distantPast) <= $0.value }
-    }
-
-    /// Each settled usage stop becomes the seat's stop mark, with the reset of the reading taken
-    /// at the stop (model, section 4). A meter read follows the stop and completes the mark.
-    private func recordStops() {
-        let new = Self.newStops(log.events, stops: stops, meters: meters)
-        guard !new.isEmpty else { return }
-        stops.merge(new) { _, b in b }
-        forced.formUnion(new.keys)
-        PairFile<StopMark>(name: "stops.json").save(stops)
-    }
-
-    /// The settled usage stops in `events` later than each seat's stop mark, as new marks.
-    nonisolated static func newStops(_ events: ClaudeEvents, stops: [Identity: StopMark], meters: [Identity: SeatMeters]) -> [Identity: StopMark] {
-        var new: [Identity: StopMark] = [:]
-        for e in events.events where e.settled {
-            guard case .limitStop = e.event, let seat = e.held, e.at > (new[seat]?.at ?? stops[seat]?.at ?? .distantPast) else { continue }
-            new[seat] = StopMark(at: e.at, resetsAt: meters[seat]?.fullUntil(at: e.at) ?? meters[seat]?.fuller?.resetsAt)
-        }
-        return new
     }
 
     /// Save the login of a hold once it settles while Claude runs, so the seat Claude is on gets
@@ -1571,8 +1604,8 @@ final class Store: ObservableObject {
     // MARK: Meters
 
     /// The seats whose meters are due (model, section 5): never read, older than meterEvery, a
-    /// reset passed since the reading, a settled turn ended since it (at most once per
-    /// meterOnTurnEnd), a stop since it, or asked for. A rate-limit wait is always honoured.
+    /// reset passed since the reading, a settled usage stop or turn end since it (at most once per
+    /// meterOnTurnEnd), or asked for. A rate-limit wait is always honoured.
     private func dueSeats(now: Date) -> [AccountRecord] {
         accounts.filter { row in
             guard let seat = row.identity else { return false }
@@ -1584,7 +1617,7 @@ final class Store: ObservableObject {
             let readAt = meters[seat]?.readAt ?? .distantPast
             let resets = [meters[seat]?.fiveHour?.resetsAt, meters[seat]?.weekly?.resetsAt].compactMap { $0 }
             if resets.contains(where: { readAt < $0 + Limits.meterAfterReset && $0 + Limits.meterAfterReset <= now }) { return true }
-            if let ended = log.events.lastTurnEnd(on: seat), !ClaudeEvents.readAfter(ended, readAt: readAt),
+            if let signal = log.events.lastSignal(on: seat), !ClaudeEvents.readAfter(signal.at, readAt: readAt),
                since >= Limits.meterOnTurnEnd { return true }
             return false
         }
@@ -1610,22 +1643,16 @@ final class Store: ObservableObject {
     }
 
     /// A reading replaces the seat's meters; a rate limit or a failed read keeps the last one,
-    /// which goes stale on its own. The first reading after a stop sets that stop's reset.
+    /// which goes stale on its own.
     private func record(_ state: AccountState, for seat: Identity, at readAt: Date) {
         switch state {
         case .ok(let fh, let wk):
-            let before = meters[seat]?.readAt ?? .distantPast
             if let last = meters[seat], !last.showsFull, let at = last.readAt { roomReadAt[seat] = at }
             let reading = SeatMeters(fiveHour: fh.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
                                      weekly: wk.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
                                      readAt: readAt)
             meters[seat] = reading
             retryAt[seat] = nil
-            if var mark = stops[seat], before < mark.at, readAt >= mark.at, let reset = reading.fullUntil(at: mark.at) {
-                mark.resetsAt = reset
-                stops[seat] = mark
-                PairFile<StopMark>(name: "stops.json").save(stops)
-            }
         case .rateLimited(let until):
             retryAt[seat] = until
         case .unreadable:
@@ -1671,7 +1698,8 @@ final class Store: ObservableObject {
             guard switchTask == nil, let seat = f.hold?.seat else { return }
             stopped(on: seat, now: now)
             // Which of Claude's two signals set it off (model, section 4), for the diagnostics file.
-            let trigger = (stops[seat].map { $0.until > now } ?? false) ? "limitStop" : "wrapUp"
+            let trigger: String
+            if case .limitStop? = log.events.lastSignal(on: seat)?.event { trigger = "limitStop" } else { trigger = "wrapUp" }
             run(to: target, kind: .auto, trigger: trigger)
         }
     }
@@ -1692,7 +1720,7 @@ final class Store: ObservableObject {
     private func postWait(_ f: Facts, seat: Identity?, resumesAt: Date?) {
         guard f.waitingChats > 0, f.rows.compactMap(\.identity).count > 1, !waitPosted else { return }
         waitPosted = true
-        let when = resumesAt.map { " at \(ClockText.time($0))" } ?? ""
+        let when = resumesAt.map { " at \(ClockText.time($0, now: World.now()))" } ?? ""
         let name = seat.flatMap { names[$0] } ?? "a seat"
         World.claude.notify(title: "Every seat is out", body: "Chats resume when \(name) resets\(when).")
     }
@@ -2364,7 +2392,6 @@ enum StatusReport {
         var log = LogReader()
         log.poll()
         let meters = PairFile<SeatMeters>(name: "meters.json").load()
-        let stops = PairFile<StopMark>(name: "stops.json").load()
         let installed = World.claude.installed
         var f = Facts()
         f.rows = AccountStore.load().inMenuOrder
@@ -2373,14 +2400,14 @@ enum StatusReport {
         f.log = log.events
         f.saved = Dictionary(f.rows.compactMap { r in r.identity.flatMap { s in SavedLogins.savedAt(s).map { (s, $0) } } }, uniquingKeysWith: max)
         f.meters = meters
-        f.stops = stops.merging(Store.newStops(log.events, stops: stops, meters: meters)) { _, b in b }
         f.failedTargets = PairFile<Date>(name: "failed-targets.json").load()
         f.switching = SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "parked until Claude opens" : $0.undoWhenClosed ? "undo waits for Claude to quit" : "in progress") }
         f.trusted = World.claude.trusted
         let settings = AppSettings.load()
         f.autoChosen = settings.autoSwitch
         f.order = settings.switchOrder
-        f.waitingChats = f.hold == nil ? 0 : log.events.stoppedChats.byLimit.count
+        // The chats a wait stopped live in the running app, not on disk: this report shows none.
+        f.waitingChats = 0
         return f
     }
 
@@ -2405,7 +2432,7 @@ enum StatusReport {
         out += "Accessibility: \(f.trusted ? "granted" : "not granted")\n"
         for (i, seat) in seats.enumerated() {
             var line = "\(i + 1). \(seat.name): \(Diagnostics.stateName(seat.state))"
-            if case .out(let until?) = seat.state { line += " until \(ClockText.time(until))" }
+            if case .out(let until?) = seat.state { line += " until \(ClockText.time(until, now: now))" }
             if case .switching(let step) = seat.state { line += " (\(step))" }
             if let read = seat.meters.readText(at: now) { line += ", meters \(read)" }
             out += line + "\n"
@@ -2415,7 +2442,7 @@ enum StatusReport {
         case .none: decision = "nothing to do"
         case .switchTo(let t): decision = "switch to \(label(t))"
         case .resumeInPlace: decision = "resume the stopped chats in place"
-        case .wait(let s, let at): decision = "wait" + (s.map { " for \(label($0))" } ?? "") + (at.map { " to reset at \(ClockText.time($0))" } ?? "")
+        case .wait(let s, let at): decision = "wait" + (s.map { " for \(label($0))" } ?? "") + (at.map { " to reset at \(ClockText.time($0, now: now))" } ?? "")
         }
         out += "Decision: \(decision)\n"
         return out

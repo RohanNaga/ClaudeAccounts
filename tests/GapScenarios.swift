@@ -24,7 +24,6 @@ private enum Spec {
     static let settle: TimeInterval = 60
     static let confirmWait: TimeInterval = 3 * 60
     static let setUpConfirmWait: TimeInterval = 10 * 60
-    static let outWithoutReset: TimeInterval = 5 * 3600
     /// How late past a deadline the app may act: its confirm loop looks once a second, its tick every few.
     static let slack: TimeInterval = 10
 }
@@ -287,24 +286,24 @@ let gapScenarios: [Scenario] = [
         h.check(Limits.confirmWait == Spec.confirmWait, "confirmWait is 3 min: \(Limits.confirmWait) s")
     },
 
-    // 13. Section 4: a settled stop whose reading has no reset ahead keeps the seat out for 5 h.
-    Scenario(pair: "(In use settled, limit stop with no reset ahead)", model: "4 and 5 outWithoutReset: out for 5 h from the stop, then the waiting chat resumes in place") { h in
+    // 13. Section 4: out is only ever read. A settled stop on a seat that reads with room leaves the
+    // seat as it reads: no guessed reset, no switch, nothing typed into the refused chat. Once the
+    // seat reads out, the same stop switches.
+    Scenario(pair: "(In use settled, limit stop while the seat reads with room)", model: "4: out only on a current reading at or over 100 with its own reset; a stop alone marks nothing") { h in
         await h.standard()
-        let start = h.now
-        h.usage.set(A, fiveHour: 50, resetsAt: nil)
-        for s in [B, C] { h.usage.set(s, fiveHour: 100, resetsAt: start.addingTimeInterval(8 * 3600)) }
+        h.usage.set(A, fiveHour: 50, resetsAt: h.now.addingTimeInterval(4 * 3600))
         await h.pass(ClaudeTiming.meterEvery + 5)
-        h.claude.logLimitStop("local_one")
-        let stop = h.now
-        await h.pass(60)
-        h.check(h.noticeHas("Every seat is out"), "setup: every seat is out, so the chat waits: \(h.notice)")
-        await h.pass(Spec.outWithoutReset - 60 - 5 * 60)
-        h.check(!h.resumed("local_one") && h.claude.actions.isEmpty, "Alpha is still out 4 h 55 min after the stop: typed \(h.claude.sent), \(h.claude.actions)")
-        await h.run(until: { h.resumed("local_one") }, limit: 30 * 60)
-        let after = gap(stop, h.resumed("local_one") ? h.now : nil)
-        h.check(after.map { $0 >= Spec.outWithoutReset && $0 <= Spec.outWithoutReset + ClaudeTiming.meterEvery + ClaudeTiming.meterAfterReset } == true,
-                "the chat resumes once the 5 h are up, not before: \(after.map { "\(Int($0 / 60)) min" } ?? "never") after the stop")
-        h.check(h.claude.at("quit").isEmpty && h.claude.held == A, "in place, on Alpha: \(h.claude.actions)")
+        h.claude.logLimitStop("local_one", seatReadsFull: false)
+        await h.pass(30 * 60)
+        h.check(h.state("Alpha") == .inUse && h.claude.actions.isEmpty, "Alpha stays In use, no switch: \(String(describing: h.state("Alpha"))), \(h.claude.actions)")
+        h.check(h.claude.sent.isEmpty, "nothing typed into the refused chat: \(h.claude.sent)")
+        h.check(!h.noticeHas("out"), "no line calls a seat out: \(h.notice)")
+        // The seat then reads full: now it is out of a named limit with that limit's reset.
+        h.usage.set(A, fiveHour: 100, resetsAt: h.now.addingTimeInterval(3 * 3600))
+        await h.run(until: { h.claude.held == B }, limit: 2 * ClaudeTiming.meterEvery)
+        h.check(h.claude.held == B, "once Alpha reads out after the stop, the automatic switch moves to Beta: \(String(describing: h.claude.held)), \(h.notice)")
+        await h.run(until: { h.resumed("local_one") }, limit: 300)
+        h.check(h.resumed("local_one"), "the stopped chat gets one resume on Beta: \(h.claude.sent)")
     },
 
     // 14. Section 7, sleep then wake: an expired confirm first checks the log.
@@ -389,7 +388,9 @@ let gapScenarios: [Scenario] = [
         await h.run(until: { h.claude.at("launch").count >= 2 && !h.switchInFlight && h.claude.held != nil }, limit: 300)
         h.check(h.claude.held == A && h.claude.chats(in: A).contains("local_one"), "setup: the switch to Beta was undone, back on Alpha with the chat: \(String(describing: h.claude.held)), \(h.claude.actions)")
         await h.run(until: { h.resumed("local_one") }, limit: Spec.coolDown)
-        h.check(h.claude.notifications.contains { $0.hasPrefix("Every seat is out") }, "the undone switch's chat waits, and the wait is posted: \(h.claude.notifications)")
+        // Beta reads with room through its cool-down, so no line may claim every seat is out.
+        h.check(!h.claude.notifications.contains { $0.hasPrefix("Every seat is out") } && !h.noticeHas("Every seat is out"),
+                "the undone switch's chat waits, with no claim that every seat is out while Beta reads with room: \(h.claude.notifications), \(h.notice)")
         h.check(h.resumed("local_one") && h.claude.held == A, "it resumes in place once Alpha resets, before Beta's cool-down ends: typed \(h.claude.sent), holds \(String(describing: h.claude.held)), \(h.claude.actions)")
         h.check(h.claude.at("launch").count == 2, "no second switch, only the switch's launch and the undo's: \(h.claude.actions)")
     },

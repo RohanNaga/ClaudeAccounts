@@ -44,7 +44,20 @@ func logLine(_ date: Date, _ id: Identity) -> String {
     return "\(f.string(from: date)) [info] \(ClaudeLog.identity) accountId=\(id.account) orgId=\(id.org)"
 }
 
-enum Scenario { case spread, allOut, noAccessibility, stale }
+/// A Claude log line at `date`, in Claude's own stamp.
+func logAt(_ date: Date, _ body: String) -> String {
+    let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = ClaudeLog.timeFormat
+    return "\(f.string(from: date)) [info] \(body)"
+}
+
+/// Claude stopped `chat` for a usage limit at `date`.
+func limitStop(_ date: Date, _ chat: String) -> String {
+    logAt(date, "\(ClaudeLog.cycle)\(chat)\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit")
+}
+
+/// `upgrade` is the first minutes after installing over the previous build: the seat in use has
+/// room, Claude stopped one of its chats hours ago, and most seats are not read yet.
+enum Scenario { case spread, allOut, noAccessibility, stale, upgrade }
 
 /// A desktop-like backdrop that differs from the panel in both appearances.
 let backdrop = Color(red: 0.45, green: 0.52, blue: 0.60)
@@ -75,13 +88,22 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
     case .allOut:
         f.meters[baseRows[0].seat] = m(100, at(16, 40), 41, thursday9, read: fresh)
         f.meters[baseRows[1].seat] = m(100, at(16, 10), 61, thursday9, read: fresh)
-        f.stops[baseRows[1].seat] = StopMark(at: now.addingTimeInterval(-6 * 60), resetsAt: at(16, 10))
+        f.log.read(limitStop(now.addingTimeInterval(-6 * 60), "local_build"))   // read full after the stop
         f.meters[baseRows[2].seat] = m(100, at(15, 20), 33, thursday9, read: fresh)
         f.meters[baseRows[3].seat] = m(100, at(17, 0), 48, thursday9, read: fresh)
         f.meters[baseRows[4].seat] = m(100, at(17, 30), 57, thursday9, read: fresh)
         f.meters[baseRows[5].seat] = m(100, at(15, 50), 70, thursday9, read: fresh)
         f.meters[baseRows[7].seat] = m(64, at(18, 45), 100, thursday9, read: fresh)
         f.waitingChats = 2
+    case .upgrade:
+        // Claude held Alpha · Labs from 10:39, stopped a chat there at 10:41, moved on at 10:42 and
+        // came back at 1 PM; its meters read 40% and 6%. Beta reads out until Thursday; the rest
+        // are not read yet.
+        f.log = ClaudeEvents()
+        f.log.read([logLine(at(10, 39), baseRows[1].seat), limitStop(at(10, 41), "local_build"),
+                    logLine(at(10, 42), baseRows[0].seat), logLine(at(13, 0), baseRows[1].seat)].joined(separator: "\n"))
+        f.meters[baseRows[1].seat] = m(40, at(15, 40), 6, at(22, 0, dayOffset: 6), read: fresh)
+        f.meters[baseRows[3].seat] = m(31, at(16, 30), 100, thursday9, read: fresh)
     }
     return f
 }
@@ -254,6 +276,7 @@ enum RenderMenu {
         render(Screen(visible: nil) { Shot(facts(.allOut, order: .topToBottom), visible: 900) }, dark: false,
                to: "\(out)/notice-waiting-light.png")
         both("stale-states", Screen(visible: nil) { Shot(facts(.stale, order: .topToBottom), visible: 900) })
+        both("upgrade-not-read-yet", Screen(visible: nil) { Shot(facts(.upgrade, order: .topToBottom), visible: 900) })
         render(Screen(visible: nil) { Shot(facts(.noAccessibility, order: .topToBottom), visible: 900) }, dark: false,
                to: "\(out)/notice-accessibility-light.png")
         both("overflow-24-seats-900pt", Screen(visible: 900) { Shot(overflowFacts(), visible: 900, header: MenuHeader(updatedAt: now)) })

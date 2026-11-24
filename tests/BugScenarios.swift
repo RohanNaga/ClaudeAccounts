@@ -4,7 +4,94 @@ import SwiftUI
 // Scenarios for named bugs, written from the model like the rest and kept with them. Each one is
 // red on the commit that had its bug and green once it was fixed.
 
+/// The rows Alpha, Beta and Gamma with saved logins, chats local_one and local_two in Alpha's
+/// folder, and Claude holding Alpha settled, with no app running yet.
+@MainActor private func upgradeStart(_ h: Harness) async {
+    try? h.rows([("Alpha", A), ("Beta", B), ("Gamma", C)])
+    for (n, seat) in [("Beta", B), ("Gamma", C), ("Alpha", A)] { try? await h.savedLogin(n, seat) }
+    for chat in ["local_one", "local_two"] {
+        h.claude.addChat(chat, in: A, lastActivity: h.clock.now())
+        h.claude.screens[chat] = ChatScreen(busy: false, composer: true, draft: false)
+    }
+    h.claudeHoldsSettled()
+}
+
 let bugScenarios: [Scenario] = [
+    // Bug: on the first launch over build 10, a usage stop from hours earlier became a five-hour
+    // "out" on the seat in use, which read 40%; the notice said every seat was out while the others
+    // were not read yet, and once they read the app switched away and typed "resume" (638ae63).
+    Scenario(pair: "(First launch over the previous build, an old usage stop, the seat in use has room, the others answer with a wait)",
+             model: "4: out only on a reading; a stop from an earlier hold marks nothing; 11: the notice says only what is known") { h in
+        await upgradeStart(h)
+        // Claude stopped local_one on Alpha for a limit its meters don't show, two hours ago.
+        h.claude.logLimitStop("local_one", seatReadsFull: false)
+        h.clock.advance(2 * 3600)
+        // The person came back to Alpha: Claude reopened on it, and a turn ended there.
+        h.claude.stop(); h.claude.start()
+        h.clock.advance(ClaudeTiming.settle + 5)
+        h.claude.logTurnEnded("local_two")
+        h.usage.set(A, fiveHour: 40, weekly: 6, resetsAt: h.clock.now().addingTimeInterval(160 * 60))
+        for s in [B, C] {
+            h.usage.set(s, fiveHour: 20, resetsAt: h.clock.now().addingTimeInterval(3 * 3600))
+            h.usage.busy(s, until: h.clock.now().addingTimeInterval(4 * 60))
+        }
+        h.make(); await h.tick(); await h.settle()
+        h.check(h.state("Alpha") == .inUse && h.meterText("Alpha") == nil, "Alpha In use with a fresh reading: \(String(describing: h.state("Alpha"))), \(String(describing: h.meterText("Alpha")))")
+        h.check(h.meterText("Beta") == "not read yet" && h.state("Beta") == .ready, "Beta is not read yet, and not out: \(String(describing: h.meterText("Beta"))), \(String(describing: h.state("Beta")))")
+        h.check(!h.noticeHas("out"), "no line calls any seat out: \(h.notice)")
+        await h.run(until: { !h.claude.actions.isEmpty }, limit: 20 * 60)
+        h.check(h.claude.actions.isEmpty && h.claude.held == A, "no automatic switch away from a seat with room: \(h.claude.actions), holds \(String(describing: h.claude.held))")
+        h.check(h.claude.sent.isEmpty && h.claude.notifications.isEmpty, "nothing typed and nothing posted: \(h.claude.sent), \(h.claude.notifications)")
+        h.check(h.meterText("Beta") == nil && h.meterText("Gamma") == nil, "Beta and Gamma read once the service's wait ends: \(String(describing: h.meterText("Beta"))), \(String(describing: h.meterText("Gamma")))")
+        h.check(!h.noticeHas("out") && h.state("Alpha") == .inUse, "still no out claim, Alpha In use: \(h.notice)")
+    },
+    // Bug: the first launch over build 10 dropped its readings and asked every seat at once, so the
+    // seats it had just read came back with a wait and showed "Not read yet" (638ae63).
+    Scenario(pair: "(First launch over the previous build, its readings on disk)",
+             model: "5: the previous build's readings carry over with their age; a seat read within meterEvery is not asked again at once") { h in
+        await upgradeStart(h)
+        let readAt = h.clock.now().addingTimeInterval(-30)
+        let reset = h.clock.now().addingTimeInterval(3 * 3600)
+        var cache: [String: [String: Any]] = [:]
+        for (i, pct) in [40.0, 20.0, 100.0].enumerated() {
+            cache["row\(i)"] = ["polledAt": readAt.timeIntervalSinceReferenceDate, "readAt": readAt.timeIntervalSinceReferenceDate,
+                                "fiveHour": ["utilization": pct, "pct": Int(pct), "resetsAt": reset.timeIntervalSinceReferenceDate],
+                                "weekly": ["utilization": 6.0, "pct": 6]]
+        }
+        let file = h.claude.stateDir.appendingPathComponent("usage-cache.json")
+        try? JSONSerialization.data(withJSONObject: cache).write(to: file)
+        for s in [A, B, C] { h.usage.set(s, fiveHour: 20, resetsAt: reset) }
+        h.make()
+        h.check(["Alpha", "Beta", "Gamma"].allSatisfy { h.meterText($0) == nil }, "every seat shows the previous build's reading, fresh: \(["Alpha", "Beta", "Gamma"].map { String(describing: h.meterText($0)) })")
+        h.check(h.state("Gamma") == .out, "Gamma's carried reading at 100 reads out until its own reset: \(String(describing: h.state("Gamma")))")
+        await h.tick(); await h.pass(60)
+        h.check(h.usage.reads.isEmpty, "no seat read 30 s ago is asked again within the minute: \(h.usage.reads)")
+        await h.pass(ClaudeTiming.meterEvery)
+        h.check(Set(h.usage.reads) == Set([A, B, C].map(\.tag)), "each seat is read again on its schedule: \(h.usage.reads)")
+        h.check(FileManager.default.fileExists(atPath: file.path), "the previous build's file stays, for a return to it")
+    },
+    // Bug: with the seat in use read out and one other seat not read yet, the notice said every seat
+    // was out (638ae63).
+    Scenario(pair: "(In use settled, limit stop, another seat not read yet)",
+             model: "4 and 11: a wait claims every seat is out only when every other seat reads out or needs sign-in") { h in
+        // The usage service keeps Beta waiting for 20 min from the start, so Beta is never read before then.
+        h.usage.busy(B, until: h.clock.now().addingTimeInterval(20 * 60))
+        await h.standard()
+        let reset = h.clock.now().addingTimeInterval(2 * 3600)
+        h.usage.set(C, fiveHour: 100, resetsAt: reset)
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        h.check(h.meterText("Beta") == "not read yet", "setup: Beta not read yet: \(String(describing: h.meterText("Beta")))")
+        h.claude.logLimitStop("local_one")
+        await h.pass(120)
+        h.check(h.state("Alpha") == .inUse && h.claude.actions.isEmpty, "setup: Alpha reads out, nothing switched yet: \(h.claude.actions)")
+        h.check(!h.noticeHas("Every seat is out") && !h.claude.notifications.contains { $0.hasPrefix("Every seat is out") },
+                "no claim that every seat is out while Beta is not read yet: \(h.notice), \(h.claude.notifications)")
+        await h.run(until: { h.claude.held == B }, limit: 25 * 60)
+        h.check(h.claude.held == B, "once Beta reads with room, the automatic switch moves there: \(String(describing: h.claude.held)), \(h.notice)")
+        await h.run(until: { h.resumed("local_one") }, limit: 300)
+        h.check(h.resumed("local_one"), "the stopped chat gets one resume on Beta: \(h.claude.sent)")
+    },
+
     Scenario(pair: "(Rollback, the person declines the quit)", model: "an undo that can't quit Claude waits for Claude to close, then undoes") { h in
         await h.standard()
         h.claude.stale = [B]

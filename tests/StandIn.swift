@@ -280,9 +280,16 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         log("\(ClaudeLog.identity) \(ClaudeLog.accountField)\(s.account) \(ClaudeLog.orgField)\(s.org)") }
     func logRefused(_ s: StandSeat) { log("[auth] \(ClaudeLog.refusal) cacheKey=\(s.account):\(s.org) \(ClaudeLog.orgField)\(s.org)") }
     func logTurnEnded(_ chat: String) { log("\(ClaudeLog.healthyCycle)\(chat) (12s, hadFirstResponse=true)") }
-    func logLimitStop(_ chat: String) {
+    /// Claude stops `chat` for usage. Claude does so when the seat it holds is out, so by default
+    /// that seat reads full from now: a meter the scenario set full stays as set, and any other
+    /// reads a 5-hour meter at 100 resetting in 2 h. `seatReadsFull: false` is a stop for a limit
+    /// the seat's meters don't show: the meters stay as they were.
+    func logLimitStop(_ chat: String, seatReadsFull: Bool = true) {
+        if seatReadsFull, let seat = held { usage?.readsFull(seat, resetsAt: clock.now().addingTimeInterval(2 * 3600)) }
         log("\(ClaudeLog.cycle)\(chat)\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit")
     }
+    /// The meters a stop makes read full (set by the harness).
+    var usage: StandInUsage?
 
     // MARK: Claude running
 
@@ -424,11 +431,24 @@ final class StandInUsage: UsageReader, @unchecked Sendable {
         }
     }
     func fail(_ seat: StandSeat) { lock.withLock { meters[seat.tag] = .unreadable } }
+    /// `seat` reads full: unchanged if a meter is already at 100, else its 5-hour meter at 100.
+    func readsFull(_ seat: StandSeat, resetsAt: Date) {
+        let full: Bool = lock.withLock {
+            guard case .ok(let fh, let wk)? = meters[seat.tag] else { return false }
+            return [fh, wk].contains { ($0?.utilization ?? 0) >= 100 }
+        }
+        if !full { set(seat, fiveHour: 100, resetsAt: resetsAt) }
+    }
+    /// The usage service answers `seat` with a wait until `until`, as it does when asked again
+    /// within a minute; after that, the meter set for it.
+    func busy(_ seat: StandSeat, until: Date) { lock.withLock { waits[seat.tag] = until } }
+    private var waits: [String: Date] = [:]
     func state(for acct: AccountRecord) async -> AccountState {
         lock.withLock {
             let tag = "\(acct.accountUuid ?? "?")/\(acct.orgUuid ?? "?")"
             reads.append(tag)
             if let clock { readTimes.append((tag, clock.now())) }
+            if let until = waits[tag], let now = clock?.now(), now < until { return .rateLimited(until: until) }
             return meters[tag] ?? .unreadable
         }
     }
