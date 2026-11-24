@@ -1,7 +1,7 @@
 // Tests for app/Rules.swift: the auto-switch rule, reading Claude's log, the quit watch,
 // organization matching, labels, meters, settings and the resume step. Run with ./test.sh; it needs only swiftc, like the app.
 
-import Foundation
+import AppKit
 
 @main
 struct RulesTests {
@@ -23,6 +23,7 @@ struct RulesTests {
         meters()
         settings()
         resume()
+        notices()
         print(failures == 0 ? "All \(count) checks passed." : "\(failures) of \(count) checks failed.")
         exit(failures == 0 ? 0 : 1)
     }
@@ -187,6 +188,81 @@ struct RulesTests {
     }
 
     // MARK: Meters
+
+    // MARK: Lines for holding still
+
+    /// The brake, the seat in use reading out with no stop, and chats waiting on another seat: each
+    /// line is true as written, names a time on another day with its day, and fits the notice's one
+    /// line with the longest seat names in the fixtures (scripts/render-menu.swift's README rows).
+    static func notices() {
+        let uuid = { (n: Int) in String(format: "%08x-0000-4000-8000-%012x", n, n) }
+        let rows = [("Northwind Labs", 1), ("Northwind Research", 2)].map { org, n in
+            AccountRecord(id: "r\(n)", name: "Work", color: "", configDir: "/nonexistent", keychainService: "none", email: nil,
+                          accountUuid: uuid(1), orgName: org, orgUuid: uuid(100 + n))
+        }.labelled()
+        let (labs, research) = (rows[0].seat, rows[1].seat)
+        // 11:55 PM, so the brake ends after midnight.
+        let now = Calendar.current.date(from: DateComponents(year: 2026, month: 11, day: 24, hour: 23, minute: 55))!
+        let stamp = { (d: Date) in
+            let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = ClaudeLog.timeFormat
+            return f.string(from: d)
+        }
+        let held = "\(stamp(now.addingTimeInterval(-7200))) [info] \(ClaudeLog.identity) accountId=\(labs.account) orgId=\(labs.org)"
+        let stop = "\(stamp(now.addingTimeInterval(-300))) [info] \(ClaudeLog.cycle)local_a\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit"
+        func facts(labsFull: Bool, stopped: Bool) -> Facts {
+            var f = Facts()
+            f.rows = rows
+            f.claude = ClaudeFacts(installed: true, running: true, missing: [])
+            f.trusted = true
+            f.log.read(stopped ? held + "\n" + stop : held)
+            for s in [labs, research] { f.saved[s] = now.addingTimeInterval(-86400) }
+            let reset = now.addingTimeInterval(3 * 3600)
+            f.meters[labs] = SeatMeters(fiveHour: MeterReading(percent: labsFull ? 100 : 40, resetsAt: reset), readAt: now.addingTimeInterval(-60))
+            f.meters[research] = SeatMeters(fiveHour: MeterReading(percent: 10, resetsAt: reset), readAt: now.addingTimeInterval(-60))
+            return f
+        }
+
+        var braked = facts(labsFull: true, stopped: true)
+        braked.lastAutoSwitch = now.addingTimeInterval(-60)
+        let brake = AppState.notice(braked, now: now)
+        let ends = now.addingTimeInterval(Limits.autoSwitchSpacing - 60)
+        let day = ends.formatted(.dateTime.weekday(.abbreviated))
+        check(AutoSwitch.decide(braked, now: now) == .brake(to: research, at: ends), "a switch inside the spacing waits for its end")
+        check(brake?.text == "Switching to Work · Northwind Research at \(ClockText.time(ends, now: now)).", "the brake says where and when: \(brake?.text ?? "none")")
+        check(brake?.text.contains(day) == true, "a brake that ends after midnight names the day: \(brake?.text ?? "none")")
+        check(brake?.detail == "Work · Northwind Labs is out. Switching to Work · Northwind Research at \(ClockText.time(ends, now: now)): automatic switches are at least 15 minutes apart.",
+              "its full sentence: \(brake?.detail ?? "none")")
+        braked.lastAutoSwitch = now.addingTimeInterval(-Limits.autoSwitchSpacing)
+        check(AutoSwitch.decide(braked, now: now) == .switchTo(research), "once the spacing ends, the switch")
+
+        // A switch by hand to a seat that reads out: a stop Claude logged there before it never counts.
+        var chosen = facts(labsFull: true, stopped: true)
+        check(AutoSwitch.decide(chosen, now: now) == .switchTo(research), "setup: a stop on the full seat in use switches")
+        chosen.lastHandSwitch = now.addingTimeInterval(-120)
+        check(AutoSwitch.decide(chosen, now: now) == .none, "after a switch by hand, an earlier stop never moves Claude off the seat")
+
+        let full = AppState.notice(facts(labsFull: true, stopped: false), now: now)
+        check(full?.text == "In use reads 100%. It switches when Claude stops a chat.", "the seat in use reads out and no stop counts: \(full?.text ?? "none")")
+        check(full?.detail == "Work · Northwind Labs reads 100%. It switches when Claude next stops a chat there for its limit.", "its full sentence: \(full?.detail ?? "none")")
+        var off = facts(labsFull: true, stopped: false)
+        off.autoChosen = false
+        check(AppState.notice(off, now: now) == nil, "with Auto-Switch off, no line says it switches")
+
+        var elsewhere = facts(labsFull: false, stopped: false)
+        elsewhere.waiting = [research: 2]
+        let waits = AppState.notice(elsewhere, now: now)
+        check(waits?.text == "2 chats wait until Claude is on Work · Northwind Research.", "chats that wait on another seat are shown: \(waits?.text ?? "none")")
+        check(AutoSwitch.decide(elsewhere, now: now) == .none, "and never acted on from this seat")
+        elsewhere.waiting = [research: 1]
+        check(AppState.notice(elsewhere, now: now)?.text == "1 chat waits until Claude is on Work · Northwind Research.", "one chat")
+
+        // The notice is the panel's width less its padding and the line's own: 330 - 2 x 6 - 2 x 10.
+        let font = NSFont.preferredFont(forTextStyle: .caption1)
+        for line in [brake?.text, full?.text, waits?.text].compactMap({ $0 }) {
+            let width = (line as NSString).size(withAttributes: [.font: font]).width
+            check(width <= 298, "\"\(line)\" fits one line: \(Int(width)) of 298 pt")
+        }
+    }
 
     static func meters() {
         func body(_ json: String) -> [String: Any] {

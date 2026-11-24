@@ -75,6 +75,13 @@ Switch, Set Up and the automatic switch all run one procedure. Each step is
 written to a journal before it runs, so an interrupted switch can be finished
 or undone. The menu's one notice line says which step is running.
 
+**Switch** works on every seat that is signed in, whatever it reads: out on
+either meter, not read yet, stale, skipped after a failed automatic switch, in
+the 15 minutes after an automatic switch, and with Auto-Switch off. Only a
+seat that needs signing in shows **Set Up** instead. The automatic switch
+never moves Claude off a seat you chose for anything from before your choice:
+a chat Claude stopped earlier, or chats that were waiting, no longer count.
+
 1. **Quit.** The app asks Claude to quit and watches its process and windows
    ("Quitting Claude…"). If a chat is mid-reply, Claude asks first. A switch you
    started waits for your answer. **Cancel** ends it with "Switch cancelled."
@@ -111,13 +118,25 @@ The automatic switch runs only when a chat is really stopped and the seat in
 use is truly out. A seat is out only when a reading from the last 15 minutes
 shows its 5-hour or weekly meter at 100 percent, until that meter's own reset.
 Claude must have stayed on the seat for a minute and stopped a chat there for a
-usage limit, after the seat's last reading with room. A turn that ends normally
-never counts. When the seat in use reads 100 percent and no chat is stopped,
-nothing is quit: the row shows the full meter, and the switch comes when
-Claude stops a chat. A stop on a seat that reads with room never starts a
+usage limit, after the seat's last reading with room. The usage service can
+still report room for a few minutes after a real limit, so a stop also counts
+when the seat's first full reading comes within 15 minutes of it and no turn
+ended normally on the seat in between. A turn that ends normally never counts.
+When the seat in use reads 100 percent and no chat is stopped, nothing is
+quit: the row shows the full meter, the notice says "In use reads 100%. It
+switches when Claude stops a chat.", and the switch comes when Claude stops a
+chat. A stop on a seat that reads with room never starts a
 switch either: Claude can stop a chat for a limit the seat's meters don't show,
 and the seat then stays as it reads. After an automatic switch, the next one
-waits at least 15 minutes, and a chat stopped meanwhile waits too.
+waits at least 15 minutes, and a chat stopped meanwhile waits too. The notice
+says when, as in "Switching to Research at 3:25 PM.", and a relaunch of the
+app keeps the wait.
+
+A stopped chat waits on the seat Claude stopped it on. If Claude moves to
+another seat without the app, for example when you sign in to another
+account inside Claude, the notice says "1 chat waits until Claude is on Labs."
+Nothing is typed into the chat or switched because of it until Claude is on
+that seat again. A switch by hand ends the wait.
 
 It goes down the menu from the seat in use, wrapping round to the top, and
 picks the first seat that is ready, has a reading from the last 15 minutes, and
@@ -132,7 +151,8 @@ still hasn't quit after 3 minutes, it cancels and changes nothing.
 
 When every other seat reads out or still needs setting up, it stays put, and
 the notice says which seat resets first. With more than one seat, one
-notification says so too, once per wait. A seat not read yet is never counted
+notification says so too, once per wait, across a relaunch of the app and
+Auto-Switch turned off and on. A seat not read yet is never counted
 as out: the app reads it, then decides. If the usage service stops answering
 during a wait, the notice stays as it was until a new reading ends the wait.
 

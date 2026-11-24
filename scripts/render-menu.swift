@@ -59,7 +59,9 @@ func limitStop(_ date: Date, _ chat: String) -> String {
 /// room, Claude stopped one of its chats hours ago, and most seats are not read yet. `fullNoStop`
 /// is the seat in use reading 100 after a turn that ended normally, with no chat stopped.
 /// `staleWait` is `allOut` 20 minutes later, with every reading stale while the usage service stalls.
-enum Scenario { case spread, allOut, noAccessibility, stale, upgrade, fullNoStop, staleWait }
+/// `brake` is the seat in use out with a chat stopped, 5 minutes after an automatic switch.
+/// `waitsElsewhere` is Claude on Labs with room while a chat waits on Research, where Claude stopped it.
+enum Scenario { case spread, allOut, noAccessibility, stale, upgrade, fullNoStop, staleWait, brake, waitsElsewhere }
 
 /// A desktop-like backdrop that differs from the panel in both appearances.
 let backdrop = Color(red: 0.45, green: 0.52, blue: 0.60)
@@ -74,7 +76,7 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
     let fresh = now.addingTimeInterval(-2 * 60)
     for r in baseRows where r.id != "r7" { f.saved[r.seat] = at(9, 0, dayOffset: -2) }   // Home was never signed in
     switch s {
-    case .spread, .noAccessibility, .stale, .fullNoStop:
+    case .spread, .noAccessibility, .stale, .fullNoStop, .brake, .waitsElsewhere:
         f.meters[baseRows[0].seat] = m(22, at(16, 40), 41, thursday9, read: now.addingTimeInterval(-42 * 60)) // stale
         f.meters[baseRows[1].seat] = m(64, at(16, 10), 38, thursday9, read: fresh)                         // in use
         f.meters[baseRows[2].seat] = m(8, at(18, 15), 15, thursday9, read: fresh)
@@ -87,6 +89,12 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
             f.meters[baseRows[1].seat] = m(64, at(16, 10), 38, thursday9, read: now.addingTimeInterval(-42 * 60))
             f.meters[baseRows[5].seat] = nil
         }
+        if s == .brake {
+            f.log.read(limitStop(now.addingTimeInterval(-3 * 60), "local_build"))
+            f.meters[baseRows[1].seat] = m(100, at(16, 10), 38, thursday9, read: fresh)
+            f.lastAutoSwitch = now.addingTimeInterval(-5 * 60)
+        }
+        if s == .waitsElsewhere { f.waiting = [baseRows[2].seat: 1] }
         if s == .fullNoStop {
             f.log.read(logAt(at(13, 50), "\(ClaudeLog.healthyCycle)local_build (12s, hadFirstResponse=true)"))
             f.meters[baseRows[1].seat] = m(100, at(16, 10), 38, thursday9, read: fresh)
@@ -100,7 +108,7 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
         f.meters[baseRows[4].seat] = m(100, at(17, 30), 57, thursday9, read: fresh)
         f.meters[baseRows[5].seat] = m(100, at(15, 50), 70, thursday9, read: fresh)
         f.meters[baseRows[7].seat] = m(64, at(18, 45), 100, thursday9, read: fresh)
-        f.waitingChats = 2
+        f.waiting = [baseRows[1].seat: 2]
         if s == .staleWait { for seat in f.meters.keys { f.meters[seat]?.readAt = now.addingTimeInterval(-20 * 60) } }
     case .upgrade:
         // Claude held Alpha · Labs from 10:39, stopped a chat there at 10:41, moved on at 10:42 and
@@ -291,6 +299,8 @@ enum RenderMenu {
             Shot(facts(.staleWait, order: .topToBottom), visible: 900, header: MenuHeader(updatedAt: now.addingTimeInterval(-20 * 60)),
                  waitingOn: (baseRows[2].seat, at(15, 20)))
         })
+        both("notice-brake", Screen(visible: nil) { Shot(facts(.brake, order: .topToBottom), visible: 900) })
+        both("notice-waits-elsewhere", Screen(visible: nil) { Shot(facts(.waitsElsewhere, order: .topToBottom), visible: 900) })
         render(Screen(visible: nil) { Shot(facts(.noAccessibility, order: .topToBottom), visible: 900) }, dark: false,
                to: "\(out)/notice-accessibility-light.png")
         both("overflow-24-seats-900pt", Screen(visible: 900) { Shot(overflowFacts(), visible: 900, header: MenuHeader(updatedAt: now)) })
