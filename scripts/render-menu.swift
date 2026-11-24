@@ -56,8 +56,10 @@ func limitStop(_ date: Date, _ chat: String) -> String {
 }
 
 /// `upgrade` is the first minutes after installing over the previous build: the seat in use has
-/// room, Claude stopped one of its chats hours ago, and most seats are not read yet.
-enum Scenario { case spread, allOut, noAccessibility, stale, upgrade }
+/// room, Claude stopped one of its chats hours ago, and most seats are not read yet. `fullNoStop`
+/// is the seat in use reading 100 after a turn that ended normally, with no chat stopped.
+/// `staleWait` is `allOut` 20 minutes later, with every reading stale while the usage service stalls.
+enum Scenario { case spread, allOut, noAccessibility, stale, upgrade, fullNoStop, staleWait }
 
 /// A desktop-like backdrop that differs from the panel in both appearances.
 let backdrop = Color(red: 0.45, green: 0.52, blue: 0.60)
@@ -72,7 +74,7 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
     let fresh = now.addingTimeInterval(-2 * 60)
     for r in baseRows where r.id != "r7" { f.saved[r.seat] = at(9, 0, dayOffset: -2) }   // Home was never signed in
     switch s {
-    case .spread, .noAccessibility, .stale:
+    case .spread, .noAccessibility, .stale, .fullNoStop:
         f.meters[baseRows[0].seat] = m(22, at(16, 40), 41, thursday9, read: now.addingTimeInterval(-42 * 60)) // stale
         f.meters[baseRows[1].seat] = m(64, at(16, 10), 38, thursday9, read: fresh)                         // in use
         f.meters[baseRows[2].seat] = m(8, at(18, 15), 15, thursday9, read: fresh)
@@ -85,7 +87,11 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
             f.meters[baseRows[1].seat] = m(64, at(16, 10), 38, thursday9, read: now.addingTimeInterval(-42 * 60))
             f.meters[baseRows[5].seat] = nil
         }
-    case .allOut:
+        if s == .fullNoStop {
+            f.log.read(logAt(at(13, 50), "\(ClaudeLog.healthyCycle)local_build (12s, hadFirstResponse=true)"))
+            f.meters[baseRows[1].seat] = m(100, at(16, 10), 38, thursday9, read: fresh)
+        }
+    case .allOut, .staleWait:
         f.meters[baseRows[0].seat] = m(100, at(16, 40), 41, thursday9, read: fresh)
         f.meters[baseRows[1].seat] = m(100, at(16, 10), 61, thursday9, read: fresh)
         f.log.read(limitStop(now.addingTimeInterval(-6 * 60), "local_build"))   // read full after the stop
@@ -95,6 +101,7 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
         f.meters[baseRows[5].seat] = m(100, at(15, 50), 70, thursday9, read: fresh)
         f.meters[baseRows[7].seat] = m(64, at(18, 45), 100, thursday9, read: fresh)
         f.waitingChats = 2
+        if s == .staleWait { for seat in f.meters.keys { f.meters[seat]?.readAt = now.addingTimeInterval(-20 * 60) } }
     case .upgrade:
         // Claude held Alpha · Labs from 10:39, stopped a chat there at 10:41, moved on at 10:42 and
         // came back at 1 PM; its meters read 40% and 6%. Beta reads out until Thursday; the rest
@@ -208,9 +215,9 @@ struct Shot: View {
 
     /// `expanded` names the rows opened to both meters.
     init(_ f: Facts, visible: CGFloat, header: MenuHeader = MenuHeader(updatedAt: now.addingTimeInterval(-120)),
-         expanded: [String] = []) {
+         expanded: [String] = [], waitingOn: (seat: Identity?, resumesAt: Date?)? = nil) {
         seats = Seats.build(f, now: now)
-        notice = AppState.notice(f, now: now)
+        notice = AppState.notice(f, now: now, waitingOn: waitingOn)
         self.visible = visible
         self.header = header
         looks = MenuLooks(colors: resolvedColors(f.rows.map { ($0.seat.account, $0.color) }),
@@ -322,6 +329,12 @@ enum RenderMenu {
                to: "\(out)/notice-waiting-light.png")
         both("stale-states", Screen(visible: nil) { Shot(facts(.stale, order: .topToBottom), visible: 900) })
         both("upgrade-not-read-yet", Screen(visible: nil) { Shot(facts(.upgrade, order: .topToBottom), visible: 900) })
+        both("in-use-full-no-stop", Screen(visible: nil) { Shot(facts(.fullNoStop, order: .topToBottom), visible: 900) })
+        // The Store keeps telling a wait it posted, Research's reset first, while the readings are stale.
+        both("notice-waiting-stale", Screen(visible: nil) {
+            Shot(facts(.staleWait, order: .topToBottom), visible: 900, header: MenuHeader(updatedAt: now.addingTimeInterval(-20 * 60)),
+                 waitingOn: (baseRows[2].seat, at(15, 20)))
+        })
         render(Screen(visible: nil) { Shot(facts(.noAccessibility, order: .topToBottom), visible: 900) }, dark: false,
                to: "\(out)/notice-accessibility-light.png")
         both("overflow-24-seats-900pt", Screen(visible: 900) { Shot(overflowFacts(), visible: 900, header: MenuHeader(updatedAt: now)) })

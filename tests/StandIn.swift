@@ -280,11 +280,12 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         log("\(ClaudeLog.identity) \(ClaudeLog.accountField)\(s.account) \(ClaudeLog.orgField)\(s.org)") }
     func logRefused(_ s: StandSeat) { log("[auth] \(ClaudeLog.refusal) cacheKey=\(s.account):\(s.org) \(ClaudeLog.orgField)\(s.org)") }
     func logTurnEnded(_ chat: String) { log("\(ClaudeLog.healthyCycle)\(chat) (12s, hadFirstResponse=true)") }
-    /// Claude stops `chat` for usage. Claude does so when the seat it holds is out, so by default
-    /// that seat reads full from now: a meter the scenario set full stays as set, and any other
-    /// reads a 5-hour meter at 100 resetting in 2 h. `seatReadsFull: false` is a stop for a limit
-    /// the seat's meters don't show: the meters stay as they were.
-    func logLimitStop(_ chat: String, seatReadsFull: Bool = true) {
+    /// Claude stops `chat` for usage. Each scenario states what the seat it holds reads from then:
+    /// Claude also stops chats for limits the meters don't show (Rohan's 10:41 stop came at 44%
+    /// and 6%), so a stop says nothing about the meters by itself. `seatReadsFull: true` makes that
+    /// seat read full from now: a meter the scenario set full stays as set, and any other reads a
+    /// 5-hour meter at 100 resetting in 2 h. `false` leaves the meters as they were.
+    func logLimitStop(_ chat: String, seatReadsFull: Bool) {
         if seatReadsFull, let seat = held { usage?.readsFull(seat, resetsAt: clock.now().addingTimeInterval(2 * 3600)) }
         log("\(ClaudeLog.cycle)\(chat)\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit")
     }

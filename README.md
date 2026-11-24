@@ -107,13 +107,17 @@ Each switch leaves a folder in `backups` with the files from before it and
 
 ## Automatic switching
 
-The automatic switch runs only when the seat in use is truly out. A seat is out
-only when a reading from the last 15 minutes shows its 5-hour or weekly meter
-at 100 percent, until that meter's own reset. Claude must have stayed on the
-seat for a minute and stopped a chat for usage or ended a turn there. The
-meters alone never start a switch, and neither does a stop alone: Claude can
-stop a chat for a limit the seat's meters don't show, and the seat then stays
-as it reads.
+The automatic switch runs only when a chat is really stopped and the seat in
+use is truly out. A seat is out only when a reading from the last 15 minutes
+shows its 5-hour or weekly meter at 100 percent, until that meter's own reset.
+Claude must have stayed on the seat for a minute and stopped a chat there for a
+usage limit, after the seat's last reading with room. A turn that ends normally
+never counts. When the seat in use reads 100 percent and no chat is stopped,
+nothing is quit: the row shows the full meter, and the switch comes when
+Claude stops a chat. A stop on a seat that reads with room never starts a
+switch either: Claude can stop a chat for a limit the seat's meters don't show,
+and the seat then stays as it reads. After an automatic switch, the next one
+waits at least 15 minutes, and a chat stopped meanwhile waits too.
 
 It goes down the menu from the seat in use, wrapping round to the top, and
 picks the first seat that is ready, has a reading from the last 15 minutes, and
@@ -128,8 +132,9 @@ still hasn't quit after 3 minutes, it cancels and changes nothing.
 
 When every other seat reads out or still needs setting up, it stays put, and
 the notice says which seat resets first. With more than one seat, one
-notification says so too. A seat not read yet is never counted as out: the
-app reads it, then decides.
+notification says so too, once per wait. A seat not read yet is never counted
+as out: the app reads it, then decides. If the usage service stops answering
+during a wait, the notice stays as it was until a new reading ends the wait.
 
 It pauses itself, with one line in the menu saying why:
 
@@ -153,7 +158,7 @@ succeeded or failed, and every seat being out.
 ## After the switch
 
 Once Claude confirms the new seat, each moved chat that was stopped by the
-limit, wrapped up its turn, or was cut off by the quit gets one new message,
+limit or was cut off by the quit gets one new message,
 "resume". The app opens the chat with a `claude://code/continue` link, checks
 through Accessibility that Claude's window shows that chat, puts "resume" in
 its message box and presses Send, once. It skips a chat that is running, a
@@ -179,10 +184,9 @@ folder.
   sign in once more.
 - **Typing "resume" depends on Claude's window and on Accessibility.** If
   either fails, the app names the chats that need a message.
-- **A chat that wrapped up may have been finished.** It still gets one
-  "resume", which costs one short reply.
-- **Usage credits.** A meter at 100 percent with credits still available can
-  count as out after a turn ends, so the switch can come early.
+- **Usage credits.** A seat at 100 percent with credits still available reads
+  out on its row and is never a target, though Claude would still serve it. On
+  the seat in use nothing switches, since Claude keeps going and stops no chat.
 - **A crash of the Mac itself mid-switch.** The journal finishes or undoes the
   switch at the next launch.
 

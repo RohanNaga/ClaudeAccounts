@@ -519,7 +519,7 @@ let autoFaultScenarios: [Scenario] = [
 
 /// Claude stops Alpha's chat for usage after the hold settled, and the automatic switch starts.
 @MainActor func startAuto(_ h: Harness) async {
-    h.claude.logLimitStop("local_one")
+    h.claude.logLimitStop("local_one", seatReadsFull: true)
     await h.run(until: { h.switchInFlight }, limit: 600)
     h.check(h.switchInFlight, "the limit stop starts the automatic switch (4): \(h.claude.actions), \(h.notice)")
 }

@@ -81,7 +81,7 @@ let bugScenarios: [Scenario] = [
         h.usage.set(C, fiveHour: 100, resetsAt: reset)
         await h.pass(ClaudeTiming.meterEvery + 5)
         h.check(h.meterText("Beta") == "not read yet", "setup: Beta not read yet: \(String(describing: h.meterText("Beta")))")
-        h.claude.logLimitStop("local_one")
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.pass(120)
         h.check(h.state("Alpha") == .inUse && h.claude.actions.isEmpty, "setup: Alpha reads out, nothing switched yet: \(h.claude.actions)")
         h.check(!h.noticeHas("Every seat is out") && !h.claude.notifications.contains { $0.hasPrefix("Every seat is out") },
@@ -90,6 +90,97 @@ let bugScenarios: [Scenario] = [
         h.check(h.claude.held == B, "once Beta reads with room, the automatic switch moves there: \(String(describing: h.claude.held)), \(h.notice)")
         await h.run(until: { h.resumed("local_one") }, limit: 300)
         h.check(h.resumed("local_one"), "the stopped chat gets one resume on Beta: \(h.claude.sent)")
+    },
+
+    // Bug: a turn that ended normally counted as a stop. Half an hour later the seat read 100 (use
+    // of the same account elsewhere), and the app quit Claude and switched with no chat stopped
+    // (3f5a7cbe and every build before it).
+    Scenario(pair: "(In use settled, an ordinary turn ends, the seat reads 100 half an hour later, no chat stopped)",
+             model: "4: only a chat Claude stopped for a limit after the seat last read with room starts a switch; a full meter alone quits nothing, and the switch comes once Claude stops a chat") { h in
+        await h.standard()
+        h.claude.logTurnEnded("local_one")
+        await h.pass(30 * 60)
+        h.usage.set(A, fiveHour: 100, resetsAt: h.now.addingTimeInterval(3 * 3600))
+        await h.pass(2 * ClaudeTiming.meterEvery)
+        h.check(h.seat("Alpha")?.meters.fuller?.percent == 100 && h.meterText("Alpha") == nil,
+                "setup: Alpha's fresh reading is 100: \(String(describing: h.seat("Alpha")?.meters.fuller))")
+        h.check(h.claude.actions.isEmpty && h.claude.held == A, "Claude is not quit and stays on Alpha: \(h.claude.actions), holds \(String(describing: h.claude.held))")
+        h.check(h.state("Alpha") == .inUse, "Alpha stays In use, its row showing the full meter: \(String(describing: h.state("Alpha")))")
+        h.check(h.claude.sent.isEmpty && h.claude.notifications.isEmpty && !h.noticeHas("out"),
+                "nothing typed, posted or said: typed \(h.claude.sent), posted \(h.claude.notifications), notice \(h.notice)")
+        // The person sends a message; Claude stops the chat for the limit.
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        await h.run(until: { h.claude.held == B && !h.switchInFlight }, limit: 5 * 60)
+        h.check(h.claude.held == B, "once Claude stops the chat, the automatic switch moves to Beta: \(String(describing: h.claude.held)), \(h.claude.actions)")
+        await h.run(until: { h.resumed("local_one") }, limit: 300)
+        h.check(h.claude.sent == ["local_one resume"], "the stopped chat gets one resume on Beta: \(h.claude.sent)")
+    },
+    // Bug: when the usage service stalled past the 15 min freshness during a real wait, the wait's
+    // line disappeared and "Every seat is out" was posted a second time once reads came back (3f5a7cbe).
+    Scenario(pair: "(Every seat out, the usage service stalls past freshness)",
+             model: "7 and 11: one notification per wait; its line stays while the readings are stale, until a fresh reading ends the wait") { h in
+        await h.standard()
+        let reset = h.now.addingTimeInterval(4 * 3600)
+        for s in [B, C] { h.usage.set(s, fiveHour: 100, resetsAt: reset) }
+        await h.pass(ClaudeTiming.meterEvery + 5)
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        await h.pass(5 * 60)
+        let posted = { h.claude.notifications.filter { $0.hasPrefix("Every seat is out") }.count }
+        h.check(h.noticeHas("Every seat is out. Chats resume") && posted() == 1, "setup: the wait is told once: \(h.notice), \(h.claude.notifications)")
+        for s in [A, B, C] { h.usage.busy(s, until: h.now.addingTimeInterval(40 * 60)) }
+        var staleSeen = false, lineLost: [String]? = nil
+        await h.run(until: {
+            if h.meterText("Alpha") != nil { staleSeen = true }
+            if lineLost == nil, !h.noticeHas("Every seat is out. Chats resume") { lineLost = h.notice }
+            return false
+        }, limit: 50 * 60)
+        h.check(staleSeen, "setup: Alpha's reading went stale during the stall: \(String(describing: h.meterText("Alpha")))")
+        h.check(lineLost == nil, "the wait's line stays through the stall: lost as \(String(describing: lineLost))")
+        h.check(posted() == 1, "\"Every seat is out\" is posted once for the whole wait: \(h.claude.notifications)")
+        h.check(h.claude.actions.isEmpty && h.claude.sent.isEmpty, "nothing quit or typed: \(h.claude.actions), typed \(h.claude.sent)")
+        // A fresh reading ends the wait: Beta has room again.
+        h.usage.set(B, fiveHour: 20, resetsAt: reset)
+        await h.run(until: { h.claude.held == B && !h.switchInFlight && h.resumed("local_one") }, limit: 15 * 60)
+        h.check(h.claude.held == B && h.claude.sent == ["local_one resume"], "once Beta reads with room the wait ends in a switch and one resume: holds \(String(describing: h.claude.held)), typed \(h.claude.sent)")
+        h.check(posted() == 1, "still one wait notification: \(h.claude.notifications)")
+    },
+    // Bug: a stop in a hold's first minute was resumed once while the seat read with room, so
+    // "resume" was typed into a chat Claude had just refused (3f5a7cbe and before).
+    Scenario(pair: "(Claude reopens on the seat in use and stops a chat in its first minute, the seat reads with room)",
+             model: "4 and 7: a stop before the hold settles counts against no seat; nothing is typed into a chat Claude refused while the seat reads with room") { h in
+        await h.standard()
+        h.usage.set(A, fiveHour: 40, resetsAt: h.now.addingTimeInterval(3 * 3600))
+        h.claude.stop(); h.claude.start()
+        h.clock.advance(10)
+        h.claude.logLimitStop("local_one", seatReadsFull: false)
+        await h.pass(15 * 60)
+        h.check(h.claude.sent.isEmpty && !h.claude.actions.contains { $0.hasPrefix("open ") },
+                "nothing opened or typed while Alpha reads with room: typed \(h.claude.sent), \(h.claude.actions)")
+        h.check(h.claude.actions.isEmpty && h.claude.held == A && h.state("Alpha") == .inUse, "Alpha stays In use, nothing quit: \(h.claude.actions)")
+        h.check(h.claude.notifications.isEmpty && !h.noticeHas("out"), "nothing posted or said: \(h.claude.notifications), \(h.notice)")
+    },
+    // Hardening: the only brake on automatic switches was the failed-target cool-down, so switches
+    // that succeeded could follow each other as fast as seats read out (3f5a7cbe).
+    Scenario(pair: "(Automatic switch, the new seat runs out minutes later)",
+             model: "4: the next automatic switch waits autoSwitchSpacing (15 min) after one that didn't fail; the chats wait meanwhile") { h in
+        await h.standard()
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        await h.run(until: { h.claude.held == B && !h.switchInFlight && h.resumed("local_one") }, limit: 10 * 60)
+        guard let first = h.claude.at("quit").first else { h.check(false, "setup: the first switch ran: \(h.claude.actions)"); return }
+        h.check(h.claude.held == B, "setup: the first switch moved to Beta: \(String(describing: h.claude.held))")
+        await h.pass(2 * 60)
+        h.claude.screens["local_one"]?.busy = false
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        let quits = h.quits
+        await h.run(until: { h.quits > quits }, limit: 30 * 60)
+        let second = h.claude.at("quit").dropFirst(quits).first
+        h.check(second.map { $0 >= first.addingTimeInterval(Limits.autoSwitchSpacing - 5) } ?? false,
+                "no second automatic switch within 15 min of the first: second quit \(second.map { "\(Int($0.timeIntervalSince(first))) s" } ?? "never") after the first")
+        h.check(second.map { $0 <= first.addingTimeInterval(Limits.autoSwitchSpacing + 30) } ?? false,
+                "and it comes once the 15 min are up: second quit \(second.map { "\(Int($0.timeIntervalSince(first))) s" } ?? "never") after the first")
+        await h.run(until: { h.claude.held == C && !h.switchInFlight }, limit: 10 * 60)
+        h.check(h.claude.held == C, "the second switch moves to Gamma: \(String(describing: h.claude.held)), \(h.claude.actions)")
+        h.check(Limits.autoSwitchSpacing == 15 * 60, "autoSwitchSpacing is 15 min: \(Limits.autoSwitchSpacing)")
     },
 
     Scenario(pair: "(Rollback, the person declines the quit)", model: "an undo that can't quit Claude waits for Claude to close, then undoes") { h in
@@ -131,7 +222,7 @@ let bugScenarios: [Scenario] = [
         defer { window.close() }
         do { try World.install(window, clock: h.clock) } catch { h.check(false, "setup: the world refused the chat window: \(error)"); return }
         await h.standard(chat: "local_target", onScreen: false)
-        h.claude.logLimitStop("local_target")
+        h.claude.logLimitStop("local_target", seatReadsFull: true)
         await h.run(until: { h.claude.held == B }, limit: 600)
         h.check(h.claude.held == B, "the automatic switch went to Beta: holds \(String(describing: h.claude.held)), \(h.notice)")
         await h.run(until: { !window.sent.isEmpty || h.noticeHas("Couldn't resume") }, limit: ClaudeTiming.settle + 35 * 60)
