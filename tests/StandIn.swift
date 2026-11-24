@@ -134,6 +134,11 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// Claude was busy, looks like this. `.infinity`: never listed (a prompt on another Space).
     var promptListedAfter: TimeInterval = 0
     private var promptOpenedAt: Date?
+    /// For this long after the prompt opens, each look through Accessibility times out and returns
+    /// nothing, as while Claude is busy; the first such look takes 2.1 s of real time, past the 2 s
+    /// cap the app once had on each call.
+    var accessibilitySlowFor: TimeInterval = 0
+    private var slowLookTaken = false
     /// Set Up: who the person signs in as once Claude asks (nil: nobody signs in).
     var signsInAs: StandSeat?
     /// Every notification the app posted, as "<title>: <body>".
@@ -401,6 +406,13 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// Claude's window, and its prompt once Accessibility lists it.
     func quitPromptSurvey(in owners: [pid_t]) -> QuitSurvey {
         guard trustedAX else { return QuitSurvey() }
+        let timesOut: (Bool, Bool) = lock.withLock {
+            guard promptOpen, let opened = promptOpenedAt, clock.now().timeIntervalSince(opened) < accessibilitySlowFor else { return (false, false) }
+            defer { slowLookTaken = true }
+            return (true, !slowLookTaken)
+        }
+        if timesOut.1 { usleep(2_100_000) }
+        if timesOut.0 { return QuitSurvey() }
         return lock.withLock {
             guard pid != nil else { return QuitSurvey() }
             var seen = QuitSurvey(windows: ["AXWindow/AXStandardWindow"])
@@ -419,6 +431,12 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         if title == ClaudeUI.quitAnyway && !quitAnywayLands { return true }
         if title == ClaudeUI.cancel { lock.withLock { promptOpen = false } } else { stop() }
         return true
+    }
+    /// The person presses a button on Claude's open prompt themselves, whether Accessibility lists it or not.
+    func personAnswers(_ title: String) {
+        guard lock.withLock({ promptOpen }) else { return }
+        did("person pressed \(title)")
+        if title == ClaudeUI.cancel { lock.withLock { promptOpen = false } } else { stop() }
     }
     func exposeWebContent(of owners: [pid_t]) {}
     /// Without Accessibility, Claude's window cannot be read at all.

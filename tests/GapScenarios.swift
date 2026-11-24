@@ -164,6 +164,8 @@ let gapScenarios: [Scenario] = [
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { !h.claude.at("quit").isEmpty }, limit: 300)
         let asked = h.claude.at("quit").first
+        await h.pass(30)
+        h.check(h.notice.first == "Switching to Beta… Answered Claude's prompt with \(ClaudeUI.quitAnyway)…", "while the press doesn't land, the line says it was pressed: \(h.seen)")
         await h.run(until: { !h.claude.at("pressed \(ClaudeUI.cancel)").isEmpty }, limit: 600)
         let cancelled = h.claude.at("pressed \(ClaudeUI.cancel)").first
         guard let asked else { h.check(false, "setup: the automatic switch asked Claude to quit: \(h.claude.actions)"); return }
@@ -191,6 +193,8 @@ let gapScenarios: [Scenario] = [
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { h.claude.at("quit").count > quits }, limit: 5 * 60)
         h.check(h.claude.at("quit").count == quits + 1, "Auto-Switch off and on lifts the pause: \(h.claude.actions.suffix(4))")
+        await h.run(until: { !h.switchInFlight }, limit: 5 * 60)
+        await h.handSwitchWorks("Gamma", C)
     },
 
     // 7. Sections 3 and 7: a stale meter is not an automatic target.
