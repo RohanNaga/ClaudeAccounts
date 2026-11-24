@@ -299,9 +299,9 @@ uninstall, remove your rows, quit the app, and delete it and the
 The title bar and one notice line stay in place, and the rows scroll. The menu
 is never taller than the screen, and it opens on the seat in use.
 
-- A ready or out seat is one line: its name, the fuller meter with its percent,
-  "Out" with its reset time when out, and **Switch**. Click the name to see both
-  meters.
+- A ready seat is one line: its name, the fuller meter with its percent, and
+  **Switch**. An out seat says "Out" with its reset time in place of the meter.
+  Click the name to see both meters.
 - The seat in use shows both meters with their resets. When it is out, it also
   says "Out" with its reset time beside **In use**.
 - **Next** marks the seat the automatic switch would go to.

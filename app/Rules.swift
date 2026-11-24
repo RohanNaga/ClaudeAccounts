@@ -319,8 +319,10 @@ struct AppSettings: Codable, Equatable {
     }
 
     /// Forget what the menu kept for seats and accounts no longer in it, so one added again
-    /// starts as a new one does.
+    /// starts as a new one does. No seats is a read of accounts.json that failed or found none, so
+    /// it forgets nothing.
     mutating func keepMenuState(for seats: [Identity]) {
+        guard !seats.isEmpty else { return }
         expanded.formIntersection(seats)
         collapsed.formIntersection(seats.map(\.account))
     }

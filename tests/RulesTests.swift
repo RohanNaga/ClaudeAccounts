@@ -337,6 +337,9 @@ struct RulesTests {
         var menu = AppSettings()
         menu.setShowsMeters(of: kept, true); menu.setShowsMeters(of: gone, true)
         menu.setShowsOrganizations(of: "acct", false); menu.setShowsOrganizations(of: "left", false)
+        menu.keepMenuState(for: [])
+        check(menu.expanded == [kept, gone] && menu.collapsed == ["acct", "left"],
+              "a read of accounts.json that failed or found no seats forgets nothing: \(menu.expanded), \(menu.collapsed)")
         menu.keepMenuState(for: [kept, Identity(account: "acct", org: "personal")])
         check(menu.expanded == [kept] && menu.collapsed == ["acct"],
               "a seat or account no longer in the menu is forgotten, the rest kept: \(menu.expanded), \(menu.collapsed)")

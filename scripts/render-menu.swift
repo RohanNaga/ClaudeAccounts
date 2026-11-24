@@ -405,6 +405,11 @@ enum RenderMenu {
         })
         both("in-use-out-longest-name", Screen(visible: nil) { Shot(longestNameFacts(), visible: 900) })
         both("in-use-out-folded", Screen(visible: nil) { Shot(longestNameFacts(), visible: 900, folded: ["Work"]) })
+        // Two seats, the smallest menu, where an out row's name has the least room.
+        func twoFacts(_ f0: Facts) -> Facts { var f = f0; let keep = [ninePeople[0], ninePeople[6]]; f.rows = keep; f.saved = Set(keep.map(\.seat)); return f }
+        both("two-collapsed", Screen(visible: nil) { Shot(twoFacts(nineFacts()), visible: 900) })
+        both("two-expanded", Screen(visible: nil) { Shot(twoFacts(nineFacts()), visible: 900, expanded: ["Personal"]) })
+        both("two-both-out-expanded", Screen(visible: nil) { Shot(twoFacts(readsFull(readsFull(nineFacts(), personal2), ninePeople[0].seat)), visible: 900, expanded: ["Personal"]) })
         both("nine-overflow-900pt-expanded", Screen(visible: 900) {
             Shot(nineFacts(extra: true), visible: 900, header: MenuHeader(updatedAt: now),
                  expanded: ["Personal", "Work · RapidEye", "Support · Individual", "School", "Sam Work · Individual"])

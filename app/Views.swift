@@ -723,7 +723,8 @@ struct SeatRow: View {
 
     /// What the row says between its name and its button. A meter's text sits before its bar, so
     /// every bar ends at the button and the bars line up down the menu whatever the text's width.
-    /// A reading that isn't fresh says its age in place of its percent.
+    /// A reading that isn't fresh says its age in place of its percent. An out row has no bar: "Out"
+    /// and its reset already say it, and the name keeps the room.
     @ViewBuilder private var status: some View {
         switch seat.state {
         case .inUse:
@@ -737,7 +738,6 @@ struct SeatRow: View {
         case .out(let resetsAt):
             Text(outLabel(resetsAt, now: now))
                 .font(.caption).fontWeight(.semibold).lineLimit(1).fixedSize()
-            MeterBar(meter: seat.meters.fuller, stale: stale).frame(width: 40)
         case .ready:
             if let fuller = seat.meters.fuller, !stale {
                 Text("\(Int(fuller.percent.rounded()))%").font(.caption).monospacedDigit().fontWeight(.semibold).fixedSize()
