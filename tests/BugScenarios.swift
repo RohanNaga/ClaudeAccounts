@@ -337,7 +337,7 @@ final class ChatWindow: ClaudeWorld, @unchecked Sendable {
     func windowIDs(_ owners: [pid_t]) -> Set<Int> { standIn.windowIDs(owners) }
     func requestQuit(_ pid: pid_t) async { await standIn.requestQuit(pid) }
     func launch() async { await standIn.launch() }
-    func quitPromptOpen(in owners: [pid_t]) -> Bool { standIn.quitPromptOpen(in: owners) }
+    func quitPromptSurvey(in owners: [pid_t]) -> QuitSurvey { standIn.quitPromptSurvey(in: owners) }
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool { standIn.pressQuitPrompt(title, in: owners) }
     func idleSeconds() -> TimeInterval { standIn.idleSeconds() }
     func notify(title: String, body: String) { standIn.notify(title: title, body: body) }

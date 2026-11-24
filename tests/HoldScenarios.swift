@@ -87,7 +87,7 @@ let holdScenarios: [Scenario] = [
         let unreleased = "{\"waiting\":{\"local_one\":{\"seat\":{\"account\":\"\(A.account)\",\"org\":\"\(A.org)\"},\"since\":\(t - 86400)}},\"resumed\":{},\"told\":{}}"
         for (i, file) in [build10, unreleased].enumerated() {
             try? Data(file.utf8).write(to: dir.appendingPathComponent("auto-switch.json"))
-            // Build 11's stops.json; a switch-memory.json that is corrupt, then one from another hold.
+            // Build 11's stops.json; a switch-memory.json that is corrupt, then one d4390a7 wrote with a wait.
             try? Data("{\"\(A.account)_\(A.org)\":{\"at\":\(t - 3600)}}".utf8).write(to: dir.appendingPathComponent("stops.json"))
             let memory = i == 0 ? "{\"wait\":{\"hold\"" : "{\"wait\":{\"hold\":\"another hold\",\"fullSince\":\(t - 600)},\"handHold\":7,\"later\":true}"
             try? Data(memory.utf8).write(to: dir.appendingPathComponent("switch-memory.json"))
@@ -98,7 +98,7 @@ let holdScenarios: [Scenario] = [
                     "launch \(i + 1): nothing quit, typed or posted: \(h.seen)")
             h.check(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("stops.json").path), "launch \(i + 1): stops.json is gone")
         }
-        h.check(h.store.facts().wait?.hold != h.store.facts().hold?.key, "a wait from another hold is not this one's: \(String(describing: h.store.facts().wait))")
+        h.check(h.store.facts().wait == nil, "a wait on file is never read: \(String(describing: h.store.facts().wait))")
         h.usage.set(A, fiveHour: 30, resetsAt: h.now.addingTimeInterval(3 * 3600))
         await h.pass(ClaudeTiming.meterEvery + 5)
         h.claude.logLimitStop("local_one", seatReadsFull: true)
@@ -107,13 +107,13 @@ let holdScenarios: [Scenario] = [
     },
 
     Scenario(pair: "(switch-memory.json with one field unreadable)",
-             model: "each field reads on its own: a bad told wait never costs the spacing (review C7)") { h in
+             model: "a field an earlier build wrote never costs the spacing (review C7)") { h in
         await h.standard()
         let t = h.now.timeIntervalSinceReferenceDate
         let json = "{\"lastAutoSwitch\":\(t - 60),\"wait\":\"not a wait\",\"handHold\":\"a hold\"}"
         try? Data(json.utf8).write(to: Paths.stateDir.appendingPathComponent("switch-memory.json"))
         let loaded = SwitchMemory.load()
-        h.check(loaded.lastAutoSwitch != nil && loaded.handHold == "a hold" && loaded.wait == nil, "the readable fields stay: \(loaded)")
+        h.check(loaded.lastAutoSwitch != nil, "the spacing stays: \(loaded)")
         h.make(); await h.tick(); await h.settle()
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.pass(5 * 60)

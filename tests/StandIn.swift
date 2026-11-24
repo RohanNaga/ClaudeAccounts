@@ -127,8 +127,13 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var refuseAfter: TimeInterval = 12
     /// Claude names the seat it holds in a line the app has not seen: the Named shape is missing.
     var namedLineChanged = false
-    /// Claude's quit prompt has no Quit anyway button: Accessibility finds no prompt, only a new window.
+    /// False: Claude's quit prompt shows only Wait for Claude and Cancel, as Accessibility reads it.
     var promptHasQuitButton = true
+    /// Accessibility lists the open prompt only this long after it opened; until then the app sees
+    /// only a new window. A prompt not yet listed, or an Accessibility call that timed out while
+    /// Claude was busy, looks like this. `.infinity`: never listed (a prompt on another Space).
+    var promptListedAfter: TimeInterval = 0
+    private var promptOpenedAt: Date?
     /// Set Up: who the person signs in as once Claude asks (nil: nobody signs in).
     var signsInAs: StandSeat?
     /// Every notification the app posted, as "<title>: <body>".
@@ -369,7 +374,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         case .quits: stop()
         case .ignores: break
         case .promptThenQuit, .promptCancelled, .promptUnanswered:
-            lock.withLock { promptOpen = true }
+            lock.withLock { promptOpen = true; promptOpenedAt = clock.now() }
             if quitBehaviour == .promptThenQuit { clock.after(5) { [weak self] in self?.stop() } }
             if quitBehaviour == .promptCancelled { clock.after(5) { [weak self] in self?.lock.withLock { self?.promptOpen = false } } }
         }
@@ -392,10 +397,22 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var opened: [Date] { lock.withLock { timeline.filter { $0.what.hasPrefix("open ") }.map(\.at) } }
 
     var trusted: Bool { trustedAX }
-    func quitPromptOpen(in owners: [pid_t]) -> Bool { lock.withLock { promptOpen && promptHasQuitButton } }
+    /// Claude's window, and its prompt once Accessibility lists it.
+    func quitPromptSurvey(in owners: [pid_t]) -> QuitSurvey {
+        guard trustedAX else { return QuitSurvey() }
+        return lock.withLock {
+            guard pid != nil else { return QuitSurvey() }
+            var seen = QuitSurvey(windows: ["AXWindow/AXStandardWindow"])
+            guard promptListed else { return seen }
+            seen.windows.append("AXWindow/AXDialog")
+            seen.prompts = [promptHasQuitButton ? ["Wait for Claude", ClaudeUI.quitAnyway, ClaudeUI.cancel] : ["Wait for Claude", ClaudeUI.cancel]]
+            return seen
+        }
+    }
+    private var promptListed: Bool { promptOpen && (promptOpenedAt.map { clock.now().timeIntervalSince($0) >= promptListedAfter } ?? false) }
     /// Quit anyway quits Claude (unless `quitAnywayLands` is off); Cancel closes the prompt and leaves Claude running.
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool {
-        guard trustedAX, lock.withLock({ promptOpen }) else { return false }
+        guard trustedAX, lock.withLock({ promptListed }) else { return false }
         if title == ClaudeUI.quitAnyway && !promptHasQuitButton { return false }
         did("pressed \(title)")
         if title == ClaudeUI.quitAnyway && !quitAnywayLands { return true }

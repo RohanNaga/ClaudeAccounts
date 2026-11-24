@@ -10,9 +10,6 @@ import Foundation
 /// other button can be pressed by mistake.
 enum QuitPrompt {
     static let quitAnyway = ClaudeUI.quitAnyway
-    /// How long a new window of Claude's may go without showing a Quit anyway button before the
-    /// switch stops trying to answer it and leaves the answer to a person.
-    static let findTimeout: TimeInterval = 20
 
     /// Asked without the system prompt, so an unattended run never opens a dialog itself.
     static var trusted: Bool {
@@ -25,8 +22,26 @@ enum QuitPrompt {
     }
 
     /// Claude's quit prompt is open. False without Accessibility access.
-    static func isOpen(in owners: [pid_t]) -> Bool {
-        trusted && owners.contains { !prompts(of: application($0)).isEmpty }
+    static func isOpen(in owners: [pid_t]) -> Bool { survey(in: owners).quitAnyway }
+
+    /// What Accessibility shows of Claude's windows now: each window's role and subrole, and the
+    /// button titles on each alert or sheet. Empty without Accessibility access, or when Claude
+    /// doesn't answer within the messaging timeout; the caller looks again.
+    static func survey(in owners: [pid_t]) -> QuitSurvey {
+        guard trusted else { return QuitSurvey() }
+        var seen = QuitSurvey()
+        for pid in owners {
+            for window in attribute(application(pid), kAXWindowsAttribute) as? [AXUIElement] ?? [] {
+                let subrole = attribute(window, kAXSubroleAttribute) as? String
+                seen.windows.append("\(attribute(window, kAXRoleAttribute) as? String ?? "?")/\(subrole ?? "?")")
+                if subrole == kAXDialogSubrole { seen.prompts.append(buttons(in: window, depth: 0)) }
+                for sheet in (attribute(window, kAXChildrenAttribute) as? [AXUIElement] ?? []) where attribute(sheet, kAXRoleAttribute) as? String == kAXSheetRole {
+                    seen.windows.append(kAXSheetRole)
+                    seen.prompts.append(buttons(in: sheet, depth: 0))
+                }
+            }
+        }
+        return seen
     }
 
     /// Press the button titled `title` on Claude's quit prompt; true when the press was sent.
@@ -63,6 +78,17 @@ enum QuitPrompt {
             let children = attribute(window, kAXChildrenAttribute) as? [AXUIElement] ?? []
             return children.filter { attribute($0, kAXRoleAttribute) as? String == kAXSheetRole }
         }
+    }
+
+    /// The titles of the buttons within three levels of `element`.
+    private static func buttons(in element: AXUIElement, depth: Int) -> [String] {
+        var titles: [String] = []
+        if attribute(element, kAXRoleAttribute) as? String == kAXButtonRole, let title = attribute(element, kAXTitleAttribute) as? String {
+            titles.append(title)
+        }
+        guard depth < 3 else { return titles }
+        for child in attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? [] { titles += buttons(in: child, depth: depth + 1) }
+        return titles
     }
 
     private static func button(_ title: String, in element: AXUIElement, depth: Int) -> AXUIElement? {

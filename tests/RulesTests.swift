@@ -215,7 +215,8 @@ struct RulesTests {
             f.rows = rows
             f.claude = ClaudeFacts(installed: true, running: true, missing: [])
             f.trusted = true
-            f.log.read(stopped ? held + "\n" + stop : held)
+            f.log.read(held, readAt: now.addingTimeInterval(-7200))
+            if stopped { f.log.read(stop, readAt: now.addingTimeInterval(-300), arrived: true) }
             for s in [labs, research] { f.saved[s] = now.addingTimeInterval(-86400) }
             let reset = now.addingTimeInterval(3 * 3600)
             f.meters[labs] = SeatMeters(fiveHour: MeterReading(percent: labsFull ? 100 : 40, resetsAt: reset), readAt: now.addingTimeInterval(-60))
@@ -241,19 +242,31 @@ struct RulesTests {
         var reopened = facts(labsFull: true, stopped: true)
         check(AutoSwitch.decide(reopened, now: now) == .switchTo(research), "setup: a stop on the full seat in use switches")
         let again = "\(stamp(now.addingTimeInterval(-120))) [info] \(ClaudeLog.appStart) }\n\(stamp(now.addingTimeInterval(-110))) [info] \(ClaudeLog.identity) accountId=\(labs.account) orgId=\(labs.org)"
-        reopened.log.read(again)
+        reopened.log.read(again, readAt: now.addingTimeInterval(-110), arrived: true)
         check(AutoSwitch.decide(reopened, now: now) == .none, "once Claude reopens on the seat, an earlier stop never moves it")
         // A turn that ends normally after the stop, in any chat on the seat, shows Claude served past it.
         var served = facts(labsFull: true, stopped: true)
-        served.log.read("\(stamp(now.addingTimeInterval(-290))) [info] \(ClaudeLog.healthyCycle)local_b (12s, hadFirstResponse=true)")
+        served.log.read("\(stamp(now.addingTimeInterval(-290))) [info] \(ClaudeLog.healthyCycle)local_b (12s, hadFirstResponse=true)",
+                        readAt: now.addingTimeInterval(-290), arrived: true)
         check(AutoSwitch.decide(served, now: now) == .none, "a normal turn on the seat after the stop vetoes it")
         // A stop more than 15 minutes before the seat began reading 100 is not this seat running out.
         var early = facts(labsFull: true, stopped: false)
-        early.log.read("\(stamp(now.addingTimeInterval(-3000))) [info] \(ClaudeLog.cycle)local_a\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit")
+        early.log.read("\(stamp(now.addingTimeInterval(-3000))) [info] \(ClaudeLog.cycle)local_a\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit",
+                       readAt: now.addingTimeInterval(-3000), arrived: true)
         early.meters[labs]?.since = now.addingTimeInterval(-3000 + Limits.stopBeforeFull + 60)
         check(AutoSwitch.decide(early, now: now) == .none, "a stop more than 15 minutes before the seat began reading 100 does not count")
         early.meters[labs]?.since = now.addingTimeInterval(-3000 + Limits.stopBeforeFull - 60)
         check(AutoSwitch.decide(early, now: now) == .switchTo(research), "one up to 15 minutes before it does")
+        // A stop already in the log when the app first read it never counts, however its printed
+        // time reads: only a stop the app saw arrive, timed by the app's own clock.
+        var atLaunch = facts(labsFull: true, stopped: false)
+        atLaunch.log = ClaudeEvents()
+        atLaunch.log.read(held + "\n" + stop, readAt: now.addingTimeInterval(-7200))
+        check(AutoSwitch.decide(atLaunch, now: now) == .none && AutoSwitch.stoppedNow(atLaunch, now: now).isEmpty,
+              "a stop found in the first read of the log never counts")
+        atLaunch.log.read("\(stamp(now.addingTimeInterval(3 * 3600))) [info] \(ClaudeLog.cycle)local_b\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit",
+                          readAt: now.addingTimeInterval(-60), arrived: true)
+        check(AutoSwitch.decide(atLaunch, now: now) == .switchTo(research), "a stop seen arriving counts by when it arrived, whatever time it prints")
 
         let full = AppState.notice(facts(labsFull: true, stopped: false), now: now)
         check(full?.text == "In use reads 100%. It switches when Claude stops a chat.", "the seat in use reads out and no stop counts: \(full?.text ?? "none")")
@@ -267,11 +280,14 @@ struct RulesTests {
         waiting.meters[research] = SeatMeters(fiveHour: MeterReading(percent: 100, resetsAt: now.addingTimeInterval(3600)), readAt: now.addingTimeInterval(-60))
         check(AutoSwitch.decide(waiting, now: now) == .wait(seat: research, resumesAt: now.addingTimeInterval(3600)), "setup: every seat is out")
         check(AppState.notice(waiting, now: now) == nil, "an untold wait shows no line yet")
-        waiting.wait = AutoSwitch.wait(waiting, now: now)
+        waiting.wait = AutoSwitch.Wait(hold: waiting.hold!.key, stops: AutoSwitch.stoppedNow(waiting, now: now))
         check(AppState.notice(waiting, now: now) == nil, "a wait acted on but not told shows no line")
         waiting.wait?.told = true
         let told = AppState.notice(waiting, now: now)
         check(told?.text == "Every seat is out. Chats resume at \(ClockText.time(now.addingTimeInterval(3600), now: now)).", "the told wait: \(told?.text ?? "none")")
+        var served2 = waiting
+        served2.log.read("\(stamp(now.addingTimeInterval(-30))) [info] \(ClaudeLog.healthyCycle)local_a (12s, hadFirstResponse=true)", readAt: now.addingTimeInterval(-30), arrived: true)
+        check(AppState.notice(served2, now: now) == nil, "a told wait whose chat ran again says nothing")
         waiting.wait?.hold = "another hold"
         check(AppState.notice(waiting, now: now) == nil, "a wait told in another hold says nothing")
 
@@ -280,7 +296,7 @@ struct RulesTests {
 
         // The notice is the panel's width less its padding and the line's own: 330 - 2 x 6 - 2 x 10.
         let font = NSFont.preferredFont(forTextStyle: .caption1)
-        for line in [brake?.text, full?.text, told?.text, failed].compactMap({ $0 }) {
+        for line in [brake?.text, full?.text, told?.text, failed, QuitWatch.answerPrompt].compactMap({ $0 }) {
             let width = (line as NSString).size(withAttributes: [.font: font]).width
             check(width <= 298, "\"\(line)\" fits one line: \(Int(width)) of 298 pt")
         }
