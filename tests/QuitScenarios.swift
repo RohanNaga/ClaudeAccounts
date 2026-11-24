@@ -111,6 +111,7 @@ let quitScenarios: [Scenario] = [
         h.check(h.claude.notifications == ["Didn't switch to Beta: \(why) \(AutoSwitch.afterQuitFailure)"], "one notification says the same: \(h.claude.notifications)")
         await h.stopsAgain(for: 40)
         h.check(h.quits == 1 && h.claude.notifications.count == 1 && h.claude.held == A, "one quit request in 40 min, no retry to Gamma: \(h.seen)")
+        h.check(h.nextRow == nil, "no seat is marked Next while it won't switch by itself: \(String(describing: h.nextRow))")
         await h.handSwitchWorks("Gamma", C)
     },
 ]

@@ -61,7 +61,8 @@ func limitStop(_ date: Date, _ chat: String) -> String {
 /// `staleWait` is `allOut` 20 minutes later, with every reading stale while the usage service stalls.
 /// `brake` is the seat in use out with a chat stopped, 5 minutes after an automatic switch.
 /// `switchFailed` is the seat in use at 100 after an automatic switch to Research failed and reopened Claude.
-enum Scenario { case spread, allOut, noAccessibility, stale, upgrade, fullNoStop, staleWait, brake, switchFailed }
+/// `answerPrompt` is an automatic switch to Research waiting on Claude's quit prompt it can't press.
+enum Scenario { case spread, allOut, noAccessibility, stale, upgrade, fullNoStop, staleWait, brake, switchFailed, answerPrompt }
 
 /// A desktop-like backdrop that differs from the panel in both appearances.
 let backdrop = Color(red: 0.45, green: 0.52, blue: 0.60)
@@ -70,13 +71,13 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
     var f = Facts()
     f.rows = baseRows
     f.claude = ClaudeFacts(installed: true, running: true, missing: [])
-    f.log.read(logLine(at(13, 0), baseRows[1].seat))   // Claude holds Alpha · Labs since 1 PM
+    f.log.read(logLine(at(13, 0), baseRows[1].seat), readAt: at(13, 0))   // Claude holds Alpha · Labs since 1 PM
     f.trusted = s != .noAccessibility
     f.order = order
     let fresh = now.addingTimeInterval(-2 * 60)
-    for r in baseRows where r.id != "r7" { f.saved[r.seat] = at(9, 0, dayOffset: -2) }   // Home was never signed in
+    f.saved = Set(baseRows.filter { $0.id != "r7" }.map(\.seat))   // Home was never signed in
     switch s {
-    case .spread, .noAccessibility, .stale, .fullNoStop, .brake, .switchFailed:
+    case .spread, .noAccessibility, .stale, .fullNoStop, .brake, .switchFailed, .answerPrompt:
         f.meters[baseRows[0].seat] = m(22, at(16, 40), 41, thursday9, read: now.addingTimeInterval(-42 * 60)) // stale
         f.meters[baseRows[1].seat] = m(64, at(16, 10), 38, thursday9, read: fresh)                         // in use
         f.meters[baseRows[2].seat] = m(8, at(18, 15), 15, thursday9, read: fresh)
@@ -90,19 +91,20 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
             f.meters[baseRows[5].seat] = nil
         }
         if s == .brake {
-            f.log.read(limitStop(now.addingTimeInterval(-3 * 60), "local_build"))
+            f.log.read(limitStop(now.addingTimeInterval(-3 * 60), "local_build"), readAt: now.addingTimeInterval(-3 * 60), arrived: true)
             f.meters[baseRows[1].seat] = m(100, at(16, 10), 38, thursday9, read: fresh)
             f.lastAutoSwitch = now.addingTimeInterval(-5 * 60)
         }
+        if s == .answerPrompt { f.switching = SwitchFacts(target: baseRows[2].seat, step: QuitWatch.answerPrompt) }
         if s == .switchFailed { f.failedTargets[baseRows[2].seat] = now.addingTimeInterval(-60) }
         if s == .fullNoStop || s == .switchFailed {
-            f.log.read(logAt(at(13, 50), "\(ClaudeLog.healthyCycle)local_build (12s, hadFirstResponse=true)"))
+            f.log.read(logAt(at(13, 50), "\(ClaudeLog.healthyCycle)local_build (12s, hadFirstResponse=true)"), readAt: at(13, 50), arrived: true)
             f.meters[baseRows[1].seat] = m(100, at(16, 10), 38, thursday9, read: fresh)
         }
     case .allOut, .staleWait:
         f.meters[baseRows[0].seat] = m(100, at(16, 40), 41, thursday9, read: fresh)
         f.meters[baseRows[1].seat] = m(100, at(16, 10), 61, thursday9, read: fresh)
-        f.log.read(limitStop(now.addingTimeInterval(-6 * 60), "local_build"))   // read full after the stop
+        f.log.read(limitStop(now.addingTimeInterval(-6 * 60), "local_build"), readAt: now.addingTimeInterval(-6 * 60), arrived: true)   // read full after the stop
         f.meters[baseRows[2].seat] = m(100, at(15, 20), 33, thursday9, read: fresh)
         f.meters[baseRows[3].seat] = m(100, at(17, 0), 48, thursday9, read: fresh)
         f.meters[baseRows[4].seat] = m(100, at(17, 30), 57, thursday9, read: fresh)
@@ -110,14 +112,15 @@ func facts(_ s: Scenario, order: SwitchOrder) -> Facts {
         f.meters[baseRows[7].seat] = m(64, at(18, 45), 100, thursday9, read: fresh)
         if s == .staleWait { for seat in f.meters.keys { f.meters[seat]?.readAt = now.addingTimeInterval(-20 * 60) } }
         // The Store told this wait when every seat read out.
-        f.wait = AutoSwitch.Wait(hold: f.log.hold?.key ?? "", fullSince: f.meters[baseRows[1].seat]?.runSince ?? now, told: true)
+        f.wait = AutoSwitch.Wait(hold: f.log.hold?.key ?? "", stops: f.log.hold.map { f.log.limitStops(in: $0) } ?? [:], told: true)
     case .upgrade:
         // Claude held Alpha · Labs from 10:39, stopped a chat there at 10:41, moved on at 10:42 and
         // came back at 1 PM; its meters read 40% and 6%. Beta reads out until Thursday; the rest
         // are not read yet.
         f.log = ClaudeEvents()
         f.log.read([logLine(at(10, 39), baseRows[1].seat), limitStop(at(10, 41), "local_build"),
-                    logLine(at(10, 42), baseRows[0].seat), logLine(at(13, 0), baseRows[1].seat)].joined(separator: "\n"))
+                    logLine(at(10, 42), baseRows[0].seat), logLine(at(13, 0), baseRows[1].seat)].joined(separator: "\n"),
+                   readAt: now.addingTimeInterval(-2 * 60))
         f.meters[baseRows[1].seat] = m(40, at(15, 40), 6, at(22, 0, dayOffset: 6), read: fresh)
         f.meters[baseRows[3].seat] = m(31, at(16, 30), 100, thursday9, read: fresh)
     }
@@ -135,7 +138,7 @@ func overflowFacts() -> Facts {
     var f = facts(.noAccessibility, order: .topToBottom)
     f.rows = (extra(before, 20) + baseRows + extra(after, 40)).labelled()
     for (i, r) in f.rows.enumerated() where f.meters[r.seat] == nil && r.id != "r7" {
-        f.saved[r.seat] = at(9, 0, dayOffset: -2)
+        f.saved.insert(r.seat)
         let p = Double((i * 37) % 90)
         f.meters[r.seat] = m(p, at(17, 0), p / 2, thursday9, read: now.addingTimeInterval(-120))
     }
@@ -157,10 +160,10 @@ func readmeFacts() -> Facts {
     var f = Facts()
     f.rows = rows
     f.claude = ClaudeFacts(installed: true, running: true, missing: [])
-    f.log.read(logLine(at(13, 0), rows[0].seat))
+    f.log.read(logLine(at(13, 0), rows[0].seat), readAt: at(13, 0))
     f.trusted = true
     let fresh = now.addingTimeInterval(-2 * 60)
-    for r in rows where r.id != "r3" { f.saved[r.seat] = at(9, 0, dayOffset: -2) }   // Northwind Research is still to set up
+    for r in rows where r.id != "r3" { f.saved.insert(r.seat) }   // Northwind Research is still to set up
     f.meters[rows[0].seat] = m(42, at(16, 23), 61, at(14, 25, dayOffset: 3), read: fresh)
     f.meters[rows[1].seat] = m(30, at(17, 10), 22, thursday9, read: fresh)
     f.meters[rows[3].seat] = m(35, at(18, 0), 100, at(10, 0, dayOffset: 2), read: fresh)
@@ -304,6 +307,14 @@ enum RenderMenu {
         both("notice-switch-failed", Screen(visible: nil) {
             Shot(facts(.switchFailed, order: .topToBottom), visible: 900, failure: "Didn't switch to Alpha · Research. \(AutoSwitch.afterFailureShort)",
                  failureDetail: "Didn't switch to Alpha · Research: Alpha · Research didn't open in time. Back on Alpha · Labs. \(AutoSwitch.afterFailure)")
+        })
+        // While an automatic switch waits on Claude's quit prompt it can't press.
+        both("notice-answer-prompt", Screen(visible: nil) { Shot(facts(.answerPrompt, order: .topToBottom), visible: 900) })
+        // The line an automatic switch that couldn't get Claude to quit leaves, as the Store sets it.
+        both("notice-quit-failed", Screen(visible: nil) {
+            Shot({ var f = facts(.switchFailed, order: .topToBottom); f.pausedHold = f.hold?.key; return f }(), visible: 900,
+                 failure: "Didn't switch to Alpha · Research. \(AutoSwitch.afterFailureShort)",
+                 failureDetail: "Didn't switch to Alpha · Research: Claude didn't quit, so nothing changed. Its prompt is still open: Cancel keeps Claude as it is. \(AutoSwitch.afterQuitFailure)")
         })
         render(Screen(visible: nil) { Shot(facts(.noAccessibility, order: .topToBottom), visible: 900) }, dark: false,
                to: "\(out)/notice-accessibility-light.png")

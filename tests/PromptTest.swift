@@ -38,11 +38,11 @@ struct PromptTest {
 
         guard lines.wait(for: "ready", timeout: 10) else { return "the fixture window never came up" }
         // The window is up and holds a Cancel button, but no alert is open yet.
-        guard poll(timeout: 2, { !QuitPrompt.isOpen(in: [pid]) }) else { return "saw a prompt before one was open" }
+        guard poll(timeout: 2, { !QuitPrompt.survey(in: [pid]).quitAnyway }) else { return "saw a prompt before one was open" }
         if QuitPrompt.press("Cancel", in: [pid]) { return "pressed a Cancel button outside the prompt" }
 
         input.fileHandleForWriting.write(Data("show\n".utf8))
-        guard poll(timeout: 10, { QuitPrompt.isOpen(in: [pid]) }) else { return "never saw the open prompt" }
+        guard poll(timeout: 10, { QuitPrompt.survey(in: [pid]).quitAnyway }) else { return "never saw the open prompt" }
         // A sheet is listed before its buttons finish sliding in; the app retries the same way.
         guard poll(timeout: 5, { QuitPrompt.press(QuitPrompt.quitAnyway, in: [pid]) }) else { return "could not press Quit anyway" }
         guard let answer = lines.next(prefix: "pressed: ", timeout: 10) else { return "the fixture never reported an answer" }
@@ -65,7 +65,7 @@ struct PromptTest {
         input.fileHandleForWriting.write(Data("show\n".utf8))
         // Once the fixture says the alert is up, it must not count as the quit prompt.
         guard lines.wait(for: "alert shown", timeout: 10) else { return "the fixture never showed its alert" }
-        if QuitPrompt.isOpen(in: [pid]) { return "took an unrelated alert for the quit prompt" }
+        if QuitPrompt.survey(in: [pid]).quitAnyway { return "took an unrelated alert for the quit prompt" }
         if QuitPrompt.press("Cancel", in: [pid]) { return "pressed Cancel on an unrelated alert" }
         return lines.all(prefix: "pressed: ").first.map { "the fixture saw \($0)" }
     }

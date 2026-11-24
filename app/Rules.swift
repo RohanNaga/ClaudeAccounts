@@ -1032,10 +1032,11 @@ enum AutoSwitch {
     }
 
     /// The seat the automatic switch would move to if the seat Claude holds ran out now; the
-    /// menu marks it Next. Nil while automatic switching is off or Claude holds no seat.
+    /// menu marks it Next. Nil while automatic switching is off or paused on this hold, or Claude
+    /// holds no seat.
     static func next(_ f: Facts, now: Date) -> Identity? {
-        guard status(f) == .on, f.switching == nil, let seat = f.hold?.seat else { return nil }
-        return target(from: seat, f, now: now)
+        guard status(f) == .on, f.switching == nil, let hold = f.hold, f.pausedHold != hold.key else { return nil }
+        return target(from: hold.seat, f, now: now)
     }
 
     /// While the last automatic switch is less than `Limits.autoSwitchSpacing` old: when the next

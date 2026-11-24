@@ -21,9 +21,6 @@ enum QuitPrompt {
         _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
     }
 
-    /// Claude's quit prompt is open. False without Accessibility access.
-    static func isOpen(in owners: [pid_t]) -> Bool { survey(in: owners).quitAnyway }
-
     /// What Accessibility shows of Claude's windows now: each window's role and subrole, and the
     /// button titles on each alert or sheet. Empty without Accessibility access, or when Claude
     /// doesn't answer within the messaging timeout; the caller looks again.
