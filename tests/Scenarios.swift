@@ -674,8 +674,12 @@ let scenarios: [Scenario] = [
         h.claude.promptHasQuitButton = false
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { h.quits > 0 && !h.switchInFlight }, limit: 1800)
-        // Spec 11: the automatic switch's failure holds the one notice over the pause, as a manual one's does.
-        h.check(h.notice == ["Claude didn't quit, so nothing changed."], "the failed quit holds the notice: \(h.notice)")
+        // Spec 11: the automatic switch's failure holds the one notice over the pause, as a manual one's does:
+        // what didn't happen and what still works, with the cause and the open prompt on hover.
+        h.check(h.notice == ["Didn't switch to Beta. Switch by hand.",
+                             "Didn't switch to Beta: Claude's quit prompt has no Quit anyway button, so nothing changed. Its prompt is still open: Cancel keeps Claude as it is. \(AutoSwitch.afterQuitFailure)"],
+                "the failed quit holds the notice: \(h.notice)")
+        h.check(h.quits == 1 && h.claude.notifications.count == 1, "one quit request, one notification: \(h.seen)")
         h.store.closeNotice()
         await h.tick()
         h.check(h.noticeHas(pausedLine), "a prompt without its button pauses automatic switching, in one line, once the failure is closed: \(h.notice)")

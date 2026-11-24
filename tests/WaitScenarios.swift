@@ -102,29 +102,29 @@ let waitScenarios: [Scenario] = [
     },
 
     Scenario(pair: "(Every seat out and a chat waits, the app relaunches, then Auto-Switch goes off and on)",
-             model: "a wait is posted once, however often the app starts or Auto-Switch turns on") { h in
+             model: "a wait lives only in the running app: after a relaunch the stop from before never counts, the wait is not told again, and only Claude's next stop switches") { h in
         await h.everySeatOutAndAChatWaits()
-        let told = h.notice
         h.make(); await h.tick(); await h.settle()
         await h.pass(10 * 60)
-        h.check(h.notice == told, "after a relaunch the wait line stays: \(h.notice), was \(told)")
+        h.check(!h.noticeHas("Every seat is out") && h.waitPosts == 1, "after a relaunch no wait line, and nothing posted again: \(h.seen)")
         h.store.setAutoSwitch(false)
         await h.pass(2 * 60)
-        h.check(!h.noticeHas("Every seat is out"), "with Auto-Switch off, no line says chats resume: \(h.notice)")
         h.store.setAutoSwitch(true)
         await h.pass(5 * 60)
-        h.check(h.notice == told, "turned back on, the wait line is back: \(h.notice)")
-        h.check(h.waitPosts == 1, "one wait notification across the relaunch and off and on: \(h.claude.notifications)")
-        h.check(h.claude.actions.isEmpty && h.claude.sent.isEmpty, "nothing quit or typed meanwhile: \(h.claude.actions), \(h.claude.sent)")
-        // Beta reads with room: the wait ends with a switch, and the chat resumes once.
+        h.check(!h.noticeHas("Every seat is out") && h.waitPosts == 1, "off and on, still no wait line or second post: \(h.seen)")
+        // Beta reads with room: the stop from before the relaunch never switches, and the line says what would.
         h.usage.set(B, fiveHour: 10, resetsAt: h.now.addingTimeInterval(4 * 3600))
+        await h.pass(ClaudeTiming.meterEvery + 30)
+        h.check(h.claude.actions.isEmpty && h.claude.sent.isEmpty, "nothing quit or typed for the old stop: \(h.seen)")
+        h.check(h.notice.first == fullNoStop && h.nextRow == "Beta", "the line says it switches when Claude stops a chat, Beta Next: \(h.seen)")
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { h.claude.held == B && !h.switchInFlight && h.resumed("local_one") }, limit: 10 * 60)
         h.check(h.state("Beta") == .inUse && h.resumes("local_one") == 1 && h.waitPosts == 1,
-                "switched to Beta, \"resume\" typed once, still one wait posted: \(h.claude.actions), \(h.claude.sent), \(h.claude.notifications)")
+                "Claude's next stop switches to Beta, \"resume\" typed once, one wait posted in all: \(h.seen)")
     },
 
     Scenario(pair: "(Automatic switch, the new seat runs out minutes later, the app relaunches inside the spacing)",
-             model: "the next automatic switch waits 15 minutes, says when, and a relaunch keeps the wait") { h in
+             model: "the next automatic switch waits 15 minutes and says when; a relaunch keeps the spacing, and only a stop seen after it counts") { h in
         await h.standard()
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { h.claude.held == B && !h.switchInFlight && h.resumed("local_one") }, limit: 10 * 60)
@@ -141,7 +141,11 @@ let waitScenarios: [Scenario] = [
                 "its full sentence names Beta and the spacing: \(h.notice)")
         h.check(h.state("Beta") == .inUse && h.nextRow == "Gamma" && h.quits == 1, "Beta In use, Gamma Next, one quit so far: \(h.claude.actions)")
         h.make(); await h.tick(); await h.settle()
-        h.check(h.notice.first.map(lines.contains) ?? false, "after a relaunch the line stays: \(h.notice)")
+        await h.pass(ClaudeTiming.settle + 5)
+        h.check(!h.noticeHas("Switching to Gamma") && h.quits == 1, "after a relaunch the stop from before never counts: \(h.seen)")
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        await h.pass(2 * 60)
+        h.check(h.notice.first.map(lines.contains) ?? false, "Claude's stop after the relaunch waits out the same spacing: \(h.seen)")
         await h.run(until: { h.quits > 1 }, limit: 20 * 60)
         let second = h.claude.at("quit").dropFirst().first
         h.check(second.map { $0 >= first.addingTimeInterval(Limits.autoSwitchSpacing - 10) } ?? false,

@@ -157,7 +157,7 @@ let gapScenarios: [Scenario] = [
     },
 
     // 6. Section 5: quitWait 3 min on an automatic switch.
-    Scenario(pair: "(Automatic switch, quit prompt never answered)", model: "5: quitWait 3 min for an automatic switch: cancel the prompt and stop; nothing changed") { h in
+    Scenario(pair: "(Automatic switch, quit prompt never answered)", model: "5: quitWait 3 min for an automatic switch: cancel the prompt and stop; nothing changed; automatic switching pauses on that hold until a hand switch or Auto-Switch off and on") { h in
         await h.standard()
         h.claude.quitBehaviour = .promptUnanswered
         h.claude.quitAnywayLands = false
@@ -176,10 +176,21 @@ let gapScenarios: [Scenario] = [
         await h.pass(10 * 60)
         h.check(h.claude.at("quit").count == quits && h.claude.at("launch").isEmpty, "and stops: no further quit request, no launch: \(h.claude.actions.suffix(6))")
         h.check(h.claude.held == A && h.claude.signInOnDisk() == A && h.claude.chats(in: A).contains("local_one"), "nothing changed: Claude on Alpha with its chat")
-        // Stopped until a new signal: the next limit stop starts a switch again.
+        h.check(quits == 1 && h.claude.notifications.count == 1, "one quit request, one notification: \(h.seen)")
+        h.check(h.notice.first == "Didn't switch to Beta. Switch by hand."
+                && h.notice.last == "Didn't switch to Beta: Claude didn't quit, so nothing changed. \(AutoSwitch.afterQuitFailure)",
+                "the line says what didn't happen and what still works: \(h.notice)")
+        // Claude stays on its hold, so the app never asks it to quit again by itself, whatever it stops.
+        for _ in 0..<4 {
+            h.claude.logLimitStop("local_one", seatReadsFull: true)
+            await h.pass(10 * 60)
+        }
+        h.check(h.claude.at("quit").count == quits && h.claude.notifications.count == 1, "no second quit or notification in 40 min of stops: \(h.seen)")
+        // Turning Auto-Switch off and on lifts the pause: the next stop asks Claude to quit again.
+        h.store.setAutoSwitch(false); h.store.setAutoSwitch(true)
         h.claude.logLimitStop("local_one", seatReadsFull: true)
-        await h.run(until: { h.claude.at("quit").count > quits }, limit: 300)
-        h.check(h.claude.at("quit").count > quits, "a new limit stop asks Claude to quit again: \(h.claude.actions.suffix(4))")
+        await h.run(until: { h.claude.at("quit").count > quits }, limit: 5 * 60)
+        h.check(h.claude.at("quit").count == quits + 1, "Auto-Switch off and on lifts the pause: \(h.claude.actions.suffix(4))")
     },
 
     // 7. Sections 3 and 7: a stale meter is not an automatic target.
@@ -430,7 +441,7 @@ let gapScenarios: [Scenario] = [
         h.claude.promptHasQuitButton = false
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { h.quits > 0 && !h.switchInFlight }, limit: 600)
-        h.check(h.notice == ["Claude didn't quit, so nothing changed."] && h.claude.held == A && h.claude.chats(in: A).contains("local_one"),
+        h.check(h.notice.first == "Didn't switch to Beta. Switch by hand." && h.claude.held == A && h.claude.chats(in: A).contains("local_one"),
                 "setup: the switch gave up and the chat waits on Alpha: \(h.notice), \(h.claude.actions)")
         let usage = h.usage
         h.clock.after(resetA.timeIntervalSince(h.now) - 5) { usage.set(A, fiveHour: 0, resetsAt: resetA.addingTimeInterval(5 * 3600)) }
