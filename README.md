@@ -113,8 +113,8 @@ shows its 5-hour or weekly meter at 100 percent, until that meter's own reset.
 Claude must have stayed on the seat for a minute and stopped a chat there for a
 usage limit, after the seat's last reading with room. A turn that ends normally
 never counts. When the seat in use reads 100 percent and no chat is stopped,
-nothing is quit: the row shows the full meter, and the switch comes when
-Claude stops a chat. A stop on a seat that reads with room never starts a
+nothing is quit: the row says "Out" with that meter's reset beside **In use**,
+and the switch comes when Claude stops a chat. A stop on a seat that reads with room never starts a
 switch either: Claude can stop a chat for a limit the seat's meters don't show,
 and the seat then stays as it reads. After an automatic switch, the next one
 waits at least 15 minutes, and a chat stopped meanwhile waits too.
@@ -236,7 +236,8 @@ is never taller than the screen, and it opens on the seat in use.
 - A ready or out seat is one line: its name, the fuller meter with its percent,
   "Out" with its reset time when out, and **Switch**. Click the name to see both
   meters.
-- The seat in use shows both meters with their resets.
+- The seat in use shows both meters with their resets. When it is out, it also
+  says "Out" with its reset time beside **In use**.
 - **Next** marks the seat the automatic switch would go to.
 - An account in several organizations, like a personal plan and a team, is one
   card with a row per organization. Its own personal organization shows as

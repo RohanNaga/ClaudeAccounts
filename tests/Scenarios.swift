@@ -874,6 +874,47 @@ let scenarios: [Scenario] = [
         await h.run(until: { h.hasChevron("Gamma") }, limit: 600)
         h.menuShowsOpened(["Delta · Labs"], "Gamma, added again and read, starts closed")
     },
+    Scenario(pair: "(Menu, the seat in use reads full with no chat stopped)", model: "3 and 10: the row in use says Out with its full meter's reset beside In use, from a fresh reading only; folded, its account says the same") { h in
+        let labs = StandSeat(1, org: 0)
+        let all = [("Alpha", A), ("Alpha", labs), ("Beta", B)]
+        try? h.rows(all, orgNames: ["Team", "Labs", "Team"])
+        // Alpha · Team's login is saved last, so Claude opens on it.
+        for (n, seat) in [("Alpha", labs), ("Beta", B), ("Alpha", A)] { try? await h.savedLogin(n, seat) }
+        for seat in [A, labs, B] { h.usage.set(seat, fiveHour: 20, resetsAt: h.now.addingTimeInterval(3 * 3600)) }
+        h.claude.addChat("local_one", in: A, lastActivity: h.now)
+        h.claudeHoldsSettled(); h.make(); await h.tick(); await h.settle()
+        await h.openMenu()
+        h.check(h.state("Alpha · Team") == .inUse && !h.drawnTexts.contains { $0.hasPrefix("Out") },
+                "setup: Alpha · Team in use with room, nothing out: \(String(describing: h.state("Alpha · Team"))), \(h.drawnTexts)")
+
+        let reset = h.now.addingTimeInterval(2 * 3600)
+        h.usage.set(A, fiveHour: 100, resetsAt: reset)
+        await h.pass(2 * ClaudeTiming.meterEvery)
+        let today = "Out · \(shortReset(reset, now: h.now, dayOnly: true) ?? "?")"
+        h.check(h.state("Alpha · Team") == .inUse && h.claude.actions.isEmpty, "Alpha · Team stays in use, Claude untouched: \(String(describing: h.state("Alpha · Team"))), \(h.claude.actions)")
+        h.check(h.drawnBeforeInUse(today), "the row says \(today) beside In use: \(h.drawnTexts)")
+        h.check(h.drawnTexts.contains { $0.hasPrefix("In use, out, resets ") }, "VoiceOver reads the row as in use and out: \(h.drawnTexts)")
+
+        h.pressAccount("Alpha · Team")
+        h.check(h.drawnBeforeInUse(today) && !h.drawnTexts.contains { $0.hasPrefix("In use, out") },
+                "folded, the account says \(today) beside In use: \(h.drawnTexts)")
+        h.pressAccount("Alpha · Team")
+
+        // A full weekly meter says its own reset, on another day, not the 5-hour meter's.
+        h.usage.set(A, fiveHour: 40, weekly: 100, resetsAt: reset)
+        await h.pass(2 * ClaudeTiming.meterEvery)
+        let weekly = h.seat("Alpha · Team")?.meters.weekly?.resetsAt
+        let later = "Out · \(weekly.flatMap { shortReset($0, now: h.now, dayOnly: true) } ?? "?")"
+        h.check(weekly.map { !Calendar.current.isDate($0, inSameDayAs: h.now) } == true && h.drawnBeforeInUse(later) && !h.drawnTexts.contains(today),
+                "the weekly meter's reset, a later day, shows as \(later): \(h.drawnTexts)")
+
+        // The usage service stalls past freshness: a stale reading says its age and nothing out.
+        h.usage.busy(A, until: h.now.addingTimeInterval(2 * Limits.freshness))
+        await h.pass(Limits.freshness + ClaudeTiming.meterEvery)
+        h.check(h.meterText("Alpha · Team") != nil, "setup: Alpha · Team's reading is stale: \(String(describing: h.meterText("Alpha · Team")))")
+        h.check(!h.drawnTexts.contains { $0.hasPrefix("Out") } && h.drawnTexts.contains { $0.hasPrefix("Read ") } && h.drawnTexts.contains("In use"),
+                "a stale reading shows its age and In use, nothing out: \(h.drawnTexts)")
+    },
     // Section 6 steps, section 8 invariants and section 9 cases.
     Scenario(pair: "(Switch step 2, quit prompt cancelled)", model: "\"Switch cancelled\", nothing changed") { h in
         await h.standard()

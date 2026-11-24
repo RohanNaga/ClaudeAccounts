@@ -217,6 +217,26 @@ struct MeterLine: View {
     }
 }
 
+/// An out seat's one-line label: "Out · 4:10 PM" today, "Out · Thu" on a later day.
+func outLabel(_ resetsAt: Date?, now: Date) -> String {
+    shortReset(resetsAt, now: now, dayOnly: true).map { "Out · \($0)" } ?? "Out"
+}
+
+/// The seat in use's mark: its badge, and before it the Out label every out seat shows while its
+/// fresh reading has a full meter whose reset is ahead. Claude holds a seat that reads full until
+/// it stops a chat, so the row says so itself; a stale reading adds nothing.
+struct InUseMark: View {
+    let meters: SeatMeters
+    let now: Date
+
+    var body: some View {
+        if let until = meters.fullUntil(at: now) {
+            Text(outLabel(until, now: now)).font(.caption).fontWeight(.semibold).lineLimit(1).fixedSize()
+        }
+        Badge(text: "In use")
+    }
+}
+
 /// The capsule on the row in use.
 struct Badge: View {
     let text: String
@@ -534,7 +554,7 @@ struct AccountCard: View {
                     SeatRow(seat: seats[0], title: seats[0].name, inCard: false, busy: busy,
                             looks: looks, actions: actions, now: now)
                 } else {
-                    accountName(inUse: inUse)
+                    accountName
                     if !MenuLayout.isFolded(seats, folded: looks.folded) {
                         ForEach(seats) { seat in
                             Divider().frame(height: MenuLayout.hairline).padding(.leading, 10)
@@ -547,7 +567,7 @@ struct AccountCard: View {
         }
     }
 
-    private func accountName(inUse: Bool) -> some View {
+    private var accountName: some View {
         let first = seats[0], account = first.id.account
         let folded = MenuLayout.isFolded(seats, folded: looks.folded)
         return HStack(spacing: 8) {
@@ -573,7 +593,7 @@ struct AccountCard: View {
                 .accessibilityValue(folded ? "Organizations hidden" : "Organizations shown")
                 .accessibilityAddTraits(.isHeader)
                 // Folded away, the account in use still says so.
-                if folded && inUse { Badge(text: "In use") }
+                if folded, let seat = seats.first(where: { $0.state == .inUse }) { InUseMark(meters: seat.meters, now: now) }
                 menu
             }
         }
@@ -708,14 +728,14 @@ struct SeatRow: View {
         switch seat.state {
         case .inUse:
             if let age = readAge(seat.meters, now: now) { quiet(age) }
-            Badge(text: "In use")
+            InUseMark(meters: seat.meters, now: now)
         case .switching:
             ProgressView().controlSize(.mini)
             quiet("Switching")
         case .needsSignIn:
             quiet("Sign in once")
         case .out(let resetsAt):
-            Text(shortReset(resetsAt, now: now, dayOnly: true).map { "Out · \($0)" } ?? "Out")
+            Text(outLabel(resetsAt, now: now))
                 .font(.caption).fontWeight(.semibold).lineLimit(1).fixedSize()
             MeterBar(meter: seat.meters.fuller, stale: stale).frame(width: 40)
         case .ready:
@@ -760,7 +780,7 @@ struct SeatRow: View {
         let meter = seat.meters.fuller.map { "\(Int($0.percent.rounded())) percent used" }
         let state: String
         switch seat.state {
-        case .inUse: state = "In use"
+        case .inUse: state = "In use" + (seat.meters.fullUntil(at: now).map { ", out" + (shortReset($0, now: now).map { ", resets \($0)" } ?? "") } ?? "")
         case .switching: state = "Switching"
         case .needsSignIn: state = "Needs sign-in"
         case .out(let at): state = "Out" + (shortReset(at, now: now).map { ", resets \($0)" } ?? "")

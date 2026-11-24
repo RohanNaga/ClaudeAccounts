@@ -204,6 +204,26 @@ func nineFacts(extra: Bool = false) -> Facts {
     return f
 }
 
+/// `f` with `seat` reading 100 on its 5-hour meter (resetting 4:10 PM) or its weekly one (Thursday)
+/// on a fresh reading, and no chat stopped.
+func readsFull(_ f: Facts, _ seat: Identity, weekly: Bool = false) -> Facts {
+    var f = f
+    let old = f.meters[seat]
+    f.meters[seat] = weekly ? m(old?.fiveHour?.percent ?? 40, at(16, 10), 100, thursday9, read: now.addingTimeInterval(-2 * 60))
+                            : m(100, at(16, 10), old?.weekly?.percent ?? 40, thursday9, read: now.addingTimeInterval(-2 * 60))
+    return f
+}
+
+/// The README's seats with the longest seat name in the fixtures, Work · Northwind Research, set up,
+/// in use from 1:30 PM, and reading full.
+func longestNameFacts() -> Facts {
+    var f = readmeFacts()
+    let seat = f.rows[2].seat
+    f.saved[seat] = at(9, 0, dayOffset: -2)
+    f.log.read(logLine(at(13, 30), seat))
+    return readsFull(f, seat)
+}
+
 // MARK: - Drawing
 
 struct Shot: View {
@@ -213,14 +233,15 @@ struct Shot: View {
     let header: MenuHeader
     let looks: MenuLooks
 
-    /// `expanded` names the rows opened to both meters.
+    /// `expanded` names the rows opened to both meters; `folded`, the accounts whose organizations are hidden.
     init(_ f: Facts, visible: CGFloat, header: MenuHeader = MenuHeader(updatedAt: now.addingTimeInterval(-120)),
-         expanded: [String] = [], waitingOn: (seat: Identity?, resumesAt: Date?)? = nil) {
+         expanded: [String] = [], folded: [String] = [], waitingOn: (seat: Identity?, resumesAt: Date?)? = nil) {
         seats = Seats.build(f, now: now)
         notice = AppState.notice(f, now: now, waitingOn: waitingOn)
         self.visible = visible
         self.header = header
         looks = MenuLooks(colors: resolvedColors(f.rows.map { ($0.seat.account, $0.color) }),
+                          folded: Set(seats.filter { folded.contains($0.accountName) }.map(\.id.account)),
                           expanded: Set(seats.filter { expanded.contains($0.name) }.map(\.id)))
     }
 
@@ -348,6 +369,16 @@ enum RenderMenu {
                 both("nine-\(Int(v))pt-\(state)", Screen(visible: v) { Shot(nineFacts(), visible: v, expanded: rows) })
             }
         }
+        // The seat in use reads full with no chat stopped: its row says Out beside In use.
+        let personal2 = ninePeople[6].seat
+        for v: CGFloat in [900, 1400] {
+            both("nine-\(Int(v))pt-in-use-out", Screen(visible: v) { Shot(readsFull(nineFacts(), personal2), visible: v) })
+        }
+        both("nine-900pt-in-use-out-weekly", Screen(visible: 900) {
+            Shot(readsFull(nineFacts(), personal2, weekly: true), visible: 900, expanded: ["Personal", "Sam Work · Individual"])
+        })
+        both("in-use-out-longest-name", Screen(visible: nil) { Shot(longestNameFacts(), visible: 900) })
+        both("in-use-out-folded", Screen(visible: nil) { Shot(longestNameFacts(), visible: 900, folded: ["Work"]) })
         both("nine-overflow-900pt-expanded", Screen(visible: 900) {
             Shot(nineFacts(extra: true), visible: 900, header: MenuHeader(updatedAt: now),
                  expanded: ["Personal", "Work · RapidEye", "Support · Individual", "School", "Sam Work · Individual"])

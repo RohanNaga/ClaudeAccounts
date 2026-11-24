@@ -129,6 +129,32 @@ enum ShownState: Equatable { case switching, inUse, needsSignIn, out, ready }
         func scrollView(_ v: NSView) -> NSScrollView? { (v as? NSScrollView) ?? v.subviews.lazy.compactMap(scrollView).first }
         return (scrollView(host)?.documentView?.frame.height, expected)
     }
+    /// The open menu's text as VoiceOver reads it, in drawing order: every label and value SwiftUI
+    /// publishes for what it drew. Empty with the menu closed.
+    var drawnTexts: [String] {
+        guard let host = menuHost, host.window != nil else { return [] }
+        // SwiftUI builds its accessibility tree only once an assistive app asks for it, by setting
+        // this attribute on the app, as VoiceOver does.
+        _ = NSApplication.shared.perform(NSSelectorFromString("accessibilitySetValue:forAttribute:"), with: NSNumber(value: true),
+                                         with: "AXEnhancedUserInterface")
+        host.layoutSubtreeIfNeeded()
+        // SwiftUI's elements answer NSAccessibility's informal protocol, not a Swift type.
+        func ask(_ o: NSObject, _ name: String) -> Any? {
+            o.responds(to: NSSelectorFromString(name)) ? o.perform(NSSelectorFromString(name))?.takeUnretainedValue() : nil
+        }
+        func texts(_ e: Any) -> [String] {
+            guard let o = e as? NSObject else { return [] }
+            let own = ["accessibilityLabel", "accessibilityValue", "accessibilityTitle"]
+                .compactMap { ask(o, $0) as? String }.filter { !$0.isEmpty }
+            return own + ((ask(o, "accessibilityChildren") as? [Any]) ?? []).flatMap(texts)
+        }
+        return texts(host)
+    }
+    /// The open menu draws `text` right before an In use badge.
+    func drawnBeforeInUse(_ text: String) -> Bool {
+        let drawn = drawnTexts
+        return drawn.indices.dropLast().contains { drawn[$0] == text && drawn[$0 + 1] == "In use" }
+    }
     /// The open menu draws `rows`, and no other row, opened to both meters.
     func menuShowsOpened(_ rows: Set<String>, _ what: String) {
         let h = cardHeights(opened: rows)
