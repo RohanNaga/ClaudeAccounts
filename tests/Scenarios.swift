@@ -63,6 +63,9 @@ struct Scenario {
         checks += 1
         if !ok { failures.append(what) }
     }
+    /// Why this scenario could not run here, such as a real window it needs while the screen is locked.
+    private(set) var skipped: String?
+    func skip(_ why: String) { skipped = why }
 
     /// Writes the person's rows (F9), one per seat, in menu order.
     /// Rows listed in `noOrg` are old rows saved before organizations were kept (13a.4).
@@ -898,7 +901,7 @@ let scenarios: [Scenario] = [
 enum ScenarioRun {
     @MainActor static func main() async {
         setvbuf(stdout, nil, _IOLBF, 0)
-        var passed = 0, failed = 0, pending = 0
+        var passed = 0, failed = 0, pending = 0, skipped = 0
         // One pair by its exact name (each.sh), else every pair whose name contains the argument.
         let only = CommandLine.arguments.dropFirst().first
         let all = scenarios + bugScenarios + faultScenarios + gapScenarios + waitScenarios + holdScenarios + arrivalScenarios + quitScenarios
@@ -908,11 +911,12 @@ enum ScenarioRun {
             guard let body = s.body else { print("PEND \(s.pair): \(s.model)"); pending += 1; continue }
             guard let h = try? Harness() else { print("FAIL \(s.pair): the stand-in could not be installed"); failed += 1; continue }
             await body(h)
-            if h.failures.isEmpty { print("ok   \(s.pair) (\(h.checks) checks)"); passed += 1 }
+            if h.failures.isEmpty, let why = h.skipped { print("SKIP \(s.pair): \(why)"); skipped += 1 }
+            else if h.failures.isEmpty { print("ok   \(s.pair) (\(h.checks) checks)"); passed += 1 }
             else { print("FAIL \(s.pair): model says \(s.model)"); h.failures.forEach { print("       - \($0)") }; failed += 1 }
             h.cleanUp()
         }
-        print("Scenarios: \(passed) passed, \(failed) failed, \(pending) pending")
+        print("Scenarios: \(passed) passed, \(failed) failed, \(pending) pending, \(skipped) skipped")
         exit(failed + pending == 0 ? 0 : 1)
     }
 }

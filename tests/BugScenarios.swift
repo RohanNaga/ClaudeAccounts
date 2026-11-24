@@ -218,6 +218,7 @@ let bugScenarios: [Scenario] = [
     // Bug: the resume waited for a Send button that Claude shows only once the box holds text (fixed in cec0e4a).
     Scenario(pair: "(Resume, composer with no Send button)", model: "6.7: each moved chat stopped for usage and idle gets one \"resume\", typed through Accessibility") { h in
         guard AXIsProcessTrusted() else { h.check(false, "setup: this process needs Accessibility access to read the chat window"); return }
+        guard ProcessInfo.processInfo.environment["CHAT_FIXTURE"] != nil else { h.skip("no chat window fixture: test.sh gives none while the screen is locked"); return }
         guard let window = ChatWindow(h.claude) else { h.check(false, "setup: the chat window fixture did not start (CHAT_FIXTURE=<prompt-fixture binary>)"); return }
         defer { window.close() }
         do { try World.install(window, clock: h.clock) } catch { h.check(false, "setup: the world refused the chat window: \(error)"); return }
