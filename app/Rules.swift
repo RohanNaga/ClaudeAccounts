@@ -544,9 +544,11 @@ enum ComposerRule {
 // One seat is one Claude account in one organization, keyed by the pair (Identity). Every state
 // the menu shows comes from `seatState` and `AppState`, which read the facts below fresh and
 // store no guesses. The only stored memories are facts: saved logins, meter readings, a target
-// whose switch failed, and the switch journal. A seat is out only on a reading: a stop in Claude's
-// log never marks a seat out by itself, because Claude may stop a chat for a limit the seat's
-// meters don't show, and a guessed reset would keep a seat with room out for hours.
+// whose switch failed, the switch journal, and the three marks in `SwitchMemory`. A seat is out
+// only on a reading: a stop in Claude's log never marks a seat out by itself, because Claude may
+// stop a chat for a limit the seat's meters don't show, and a guessed reset would keep a seat with
+// room out for hours. The automatic switch acts only on Claude's current hold of the seat in use
+// and current readings, so nothing from before Claude last opened on that seat ever counts.
 
 /// Every time and length the model waits on, each with its reason.
 enum Limits {
@@ -569,10 +571,9 @@ enum Limits {
     /// seat that read with room when it was chosen rarely runs out sooner; if it does, its chats
     /// wait out the rest.
     static let autoSwitchSpacing: TimeInterval = 15 * 60
-    /// The usage service can report room for a few minutes after Claude really stopped a chat for
-    /// a limit. A stop still counts when the seat's first full reading after it comes this soon and
-    /// no turn ended normally on the seat in between: a turn that ended proves Claude served past it.
-    static let stopSeenFull: TimeInterval = 15 * 60
+    /// A limit stop counts against the seat in use when the seat began reading 100 no later than
+    /// this after it: the usage service can show room for a few minutes after a real stop.
+    static let stopBeforeFull: TimeInterval = 15 * 60
     /// An unattended switch that can't get Claude to quit this long cancels and stops. A manual
     /// switch has no limit: the person answers Claude's prompt.
     static let autoQuitWait: TimeInterval = 3 * 60
@@ -601,19 +602,12 @@ struct SeatMeters: Equatable, Codable {
     /// Set when the Mac wakes: the reading stays on the row but is no longer fresh, so it can't
     /// choose or rule out an automatic target until the next reading replaces it.
     var wokeSince: Date?
-    /// On a reading that shows a full meter: when the seat last read with room before it.
-    var roomBefore: Date?
-    /// On a reading that shows a full meter: when the seat first read full since it last read with
-    /// room. A reading from an earlier build has none, and counts as its own first.
-    var fullSince: Date?
+    /// When the seat began reading the way this reading does, full or with room: the first of its
+    /// readings in a row that all did. A reading from an earlier build has none, and is its own first.
+    var since: Date?
 
-    /// When the seat last read with room: this reading if it has room, else the last one that did.
-    /// A stop Claude logged before it was not this seat running out.
-    var roomReadAt: Date? { showsFull ? roomBefore : readAt }
-
-    /// When the seat first read full in its current run of full readings, or nil while it reads
-    /// with room.
-    var firstFullAt: Date? { showsFull ? fullSince ?? readAt : nil }
+    /// When this run of readings, full or with room, began.
+    var runSince: Date? { since ?? readAt }
 
     /// The fuller of the two meters: the one a compact row and the menu bar show.
     var fuller: MeterReading? { [fiveHour, weekly].compactMap { $0 }.max { $0.percent < $1.percent } }
@@ -637,9 +631,11 @@ struct SeatMeters: Equatable, Codable {
     }
 
     /// A fresh reading with a full meter whose reset is still ahead: out until that reset.
-    func fullUntil(at now: Date) -> Date? {
-        guard isFresh(at: now) else { return nil }
-        return [fiveHour, weekly].compactMap { $0 }
+    func fullUntil(at now: Date) -> Date? { isFresh(at: now) ? fullResets(after: now) : nil }
+
+    /// The latest reset still ahead of this reading's full meters, fresh or not.
+    func fullResets(after now: Date) -> Date? {
+        [fiveHour, weekly].compactMap { $0 }
             .filter { $0.percent >= Limits.full }
             .compactMap { m in m.resetsAt.flatMap { $0 > now ? $0 : nil } }.max()
     }
@@ -666,11 +662,16 @@ struct StampedEvent: Equatable {
     var settled: Bool { held != nil && heldFor >= Limits.settle }
 }
 
-/// Claude holds a seat from the time its log names that pair; a refusal of the pair starts the
-/// hold over.
+/// Claude holds a seat from the line in its log that names that pair: Claude opened on it, or was
+/// switched to it. A refusal of the pair starts the hold over, and Claude closing ends it. `start`
+/// is that line's place among the events. `key` names the hold by its seat and the line's printed
+/// time, the same however the time is read, so a hold read again after the app relaunches is the
+/// same hold.
 struct Hold: Equatable {
     let seat: Identity
     let since: Date
+    var start = 0
+    var key = ""
     func settled(at now: Date) -> Bool { now.timeIntervalSince(since) >= Limits.settle }
 }
 
@@ -680,16 +681,32 @@ struct ClaudeEvents {
     private(set) var hold: Hold?
     private(set) var refusedAt: [Identity: Date] = [:]
 
-    mutating func read(_ text: String) {
-        for line in text.split(separator: "\n") {
-            guard let at = Self.time(line), let event = Self.event(line, held: hold?.seat) else { continue }
+    /// Reads `text`, lines from a log file last written at `written`. Claude prints its local time
+    /// with no zone, and a running Claude keeps printing in the zone it started in. Each time is
+    /// read in the Mac's zone and moved by the whole quarter hours between the file's last write
+    /// and its last line's printed time, so a log Claude printed in another zone (it started before
+    /// the Mac moved) still reads as the true time.
+    mutating func read(_ text: String, written: Date? = nil) {
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.timeZone = NSTimeZone.default
+        format.dateFormat = ClaudeLog.timeFormat
+        let lines = text.split(separator: "\n")
+        let printed = { (line: Substring) in format.date(from: String(line.prefix(19))) }
+        let shift = written.flatMap { w in lines.reversed().lazy.compactMap(printed).first.map {
+            (w.timeIntervalSince($0) / 900).rounded() * 900
+        } } ?? 0
+        for line in lines {
+            guard let at = printed(line)?.addingTimeInterval(shift), let event = Self.event(line, held: hold?.seat) else { continue }
             events.append(StampedEvent(event: event, at: at, held: hold?.seat,
                                        heldFor: hold.map { at.timeIntervalSince($0.since) } ?? 0))
+            let start = events.count - 1
+            let begins = { (seat: Identity) in Hold(seat: seat, since: at, start: start, key: "\(seat.account) \(seat.org) \(line.prefix(19))") }
             switch event {
-            case .named(let seat): if hold?.seat != seat { hold = Hold(seat: seat, since: at) }
+            case .named(let seat): if hold?.seat != seat { hold = begins(seat) }
             case .refused(let seat):
                 refusedAt[seat] = at
-                if hold?.seat == seat { hold = Hold(seat: seat, since: at) }
+                if hold?.seat == seat { hold = begins(seat) }
             case .newRun, .signedOut: hold = nil
             case .turnEnded, .limitStop, .cutByQuit: break
             }
@@ -717,47 +734,22 @@ struct ClaudeEvents {
     /// is after it only from S+1 on.
     static func readAfter(_ logged: Date, readAt: Date) -> Bool { readAt >= logged.addingTimeInterval(1) }
 
-    /// Chats whose last word in the log is a usage stop on a settled hold of `seat`, that the seat's
-    /// readings show it ran out for: the chats Claude stopped for a limit there. A stop counts when
-    /// it was logged after `since`, the seat's last reading with room (with none on record, the
-    /// start of Claude's hold), or when `firstFullAt`, the seat's first full reading since, came
-    /// within `Limits.stopSeenFull` after it with no turn ended normally on the seat in between (a
-    /// reading with room just after a real stop can be the usage service lagging). A turn that
-    /// ended is never a stop, and a stop before the hold settled counts against no seat (Claude may
-    /// still be falling back from a refused sign-in). A stop logged before `notBefore`, the
-    /// person's last switch by hand, never counts. Unlike `stoppedChats`, a restart of Claude, or a
-    /// switch undone back to `seat`, does not clear them.
-    func stoppedByLimit(on seat: Identity, since: Date?, firstFullAt: Date?, notBefore: Date? = nil) -> Set<String> {
-        var last: [String: Int] = [:]
-        for (i, e) in events.enumerated() {
+    /// The chats Claude stopped for a limit in `hold` and has not served since, each with when it
+    /// was stopped: each chat whose last word in the hold is a usage stop logged once the hold had
+    /// settled, with no turn on the seat ended normally after it. A turn that ends normally shows
+    /// Claude still serves the seat, so it clears every stop before it. A stop before the hold
+    /// settled counts against no seat: Claude may still be falling back from a refused sign-in.
+    func limitStops(in hold: Hold) -> [String: Date] {
+        var stops: [String: Date] = [:]
+        for e in events.dropFirst(hold.start) {
             switch e.event {
-            case .limitStop(let c), .turnEnded(let c), .cutByQuit(let c): last[c] = i
+            case .limitStop(let c): stops[c] = e.settled ? e.at : nil
+            case .cutByQuit(let c): stops[c] = nil
+            case .turnEnded: stops = [:]
             default: break
             }
         }
-        return Set(last.compactMap { chat, i in
-            let e = events[i]
-            guard case .limitStop = e.event, e.held == seat, e.settled,
-                  !(notBefore.map { e.at < $0 } ?? false) else { return nil }
-            if !(since.map { Self.readAfter(e.at, readAt: $0) } ?? false) { return chat }
-            guard let full = firstFullAt, Self.readAfter(e.at, readAt: full),
-                  full.timeIntervalSince(e.at) <= Limits.stopSeenFull else { return nil }
-            let served = events[(i + 1)...].contains { later in
-                guard case .turnEnded = later.event else { return false }
-                return later.held == seat && later.settled && Self.readAfter(later.at, readAt: full)
-            }
-            return served ? nil : chat
-        })
-    }
-
-    /// When the log last said anything of `chat`: a turn that ended, a usage stop or a cut by quit.
-    func lastWord(of chat: String) -> Date? {
-        events.last { e in
-            switch e.event {
-            case .turnEnded(let c), .limitStop(let c), .cutByQuit(let c): return c == chat
-            default: return false
-            }
-        }?.at
+        return stops
     }
 
     /// Claude's last word that `seat` may be near its limit, logged on a settled hold of it: a usage
@@ -788,15 +780,6 @@ struct ClaudeEvents {
            ClaudeLog.limitTexts.contains(where: { line.contains($0) }) { return .limitStop(chat: c) }
         return nil
     }
-
-    static func time<S: StringProtocol>(_ line: S) -> Date? { timeFormat.date(from: String(line.prefix(19))) }
-
-    private static let timeFormat: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = ClaudeLog.timeFormat
-        return f
-    }()
 
     private static func field<S: StringProtocol>(_ line: S, _ key: String) -> String? {
         guard let r = line.range(of: key) else { return nil }
@@ -875,24 +858,15 @@ struct Facts {
     var autoChosen = true
     /// The person's order for the automatic switch.
     var order: SwitchOrder = .topToBottom
-    /// Chats in a wait, counted by the seat Claude stopped them on: Claude stopped them for a limit
-    /// there, the seat then read out, and they are not resumed yet. Only the seat Claude holds has
-    /// its chats acted on (`waitingChats`): they go with its switch, or are typed into in place once
-    /// a current reading of it has room again. A chat that waits on another seat stays as it is
-    /// until Claude is on that seat again, since only that seat's folder holds it. A stop on a seat
-    /// whose reading has room is never one: typing into it again would only meet the same refusal.
-    var waiting: [Identity: Int] = [:]
     /// When the last automatic switch that didn't fail began.
     var lastAutoSwitch: Date?
-    /// When the person's last switch by hand (Switch or Set Up) confirmed. Nothing Claude stopped
-    /// before it counts, and it ended every wait, so the automatic switch never moves Claude off a
-    /// seat the person chose for a stop or a wait from before their choice.
-    var lastHandSwitch: Date?
+    /// The hold the person's last switch by hand (Switch or Set Up) landed on.
+    var handHold: String?
+    /// The wait the app last acted on: its chats resume in place once, and it is told once.
+    var wait: AutoSwitch.Wait?
 
     /// The seat Claude holds, while it runs.
     var hold: Hold? { claude.running ? log.hold : nil }
-    /// The chats that wait on the seat Claude holds.
-    var waitingChats: Int { hold.map { waiting[$0.seat] ?? 0 } ?? 0 }
 }
 
 // MARK: One function: state of a seat
@@ -940,31 +914,66 @@ enum AutoSwitch {
         case brake(to: Identity, at: Date)
     }
 
-    /// The chats Claude stopped for a limit on the seat it holds, that its readings show it ran out
-    /// for (`ClaudeEvents.stoppedByLimit`).
-    static func stoppedByLimit(_ f: Facts) -> Set<String> {
-        guard let hold = f.hold else { return [] }
-        let m = f.meters[hold.seat]
-        return f.log.stoppedByLimit(on: hold.seat, since: m?.roomReadAt ?? hold.since, firstFullAt: m?.firstFullAt,
-                                    notBefore: f.lastHandSwitch)
+    /// A wait the app acts on: the hold it is in, when the seat in use began reading 100, and
+    /// whether "Every seat is out" was told for it.
+    struct Wait: Codable, Equatable {
+        var hold: String
+        var fullSince: Date
+        var told = false
+        func same(_ other: Wait?) -> Bool { other?.hold == hold && other?.fullSince == fullSince }
     }
 
-    /// The settled seat in use is done: its current reading is out (a full meter whose reset is
-    /// ahead), and a chat is really stopped there: Claude stopped one for a limit that the seat's
-    /// readings show it ran out for, or chats already wait on this seat. Neither alone is. Chats
-    /// that wait on another seat never count: Claude stopped nothing here. A meter at 100 with no chat
-    /// stopped quits nothing: the row shows the full meter, and the switch comes when Claude stops
-    /// a chat. A turn that ended normally is never a stop. A stop on a seat that reads with room
-    /// leaves the seat as it reads.
-    static func isDone(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
-        guard let hold = f.hold, hold.seat == seat, let m = f.meters[seat], m.isCurrent(at: now), m.fullUntil(at: now) != nil else { return false }
-        return f.waitingChats > 0 || !stoppedByLimit(f).isEmpty
+    /// What still works after an automatic switch that failed and reopened Claude on its seat: that
+    /// began a new hold, so the stop it was for no longer counts. The short form ends the notice's
+    /// one line; the full one ends its sentence on hover and the notification.
+    static let afterFailure = "Switch by hand, or it tries again when Claude next stops a chat."
+    static let afterFailureShort = "Switch by hand."
+
+    /// Whether a limit stop on the seat the person last switched to by hand moves Claude on. It
+    /// does: Claude refusing a chat there is its own word that the seat is out, whatever its meter
+    /// read when the person chose it. To keep Claude on the person's choice for the rest of that
+    /// hold instead, return `f.hold?.key != f.handHold`.
+    static func stopsMoveOnFromHandChoice(_ f: Facts) -> Bool { true }
+
+    /// The one rule for a chat stopped for the limit of the seat in use: its last word in Claude's
+    /// current hold is a limit stop Claude has not served past (`ClaudeEvents.limitStops`), logged
+    /// no more than `Limits.stopBeforeFull` before the seat began reading 100 at `fullSince`, and
+    /// before it read with room again at `roomSince`.
+    static func stopped(_ f: Facts, fullSince: Date, roomSince: Date? = nil) -> Set<String> {
+        guard let hold = f.hold, stopsMoveOnFromHandChoice(f) else { return [] }
+        return Set(f.log.limitStops(in: hold).filter { _, at in
+            at >= fullSince.addingTimeInterval(-Limits.stopBeforeFull) && (roomSince.map { at < $0 } ?? true)
+        }.keys)
     }
 
-    /// A current reading with room: the chats in a wait resume in place on it.
-    static func hasRoom(_ seat: Identity, _ f: Facts, now: Date) -> Bool {
-        guard let m = f.meters[seat], m.isCurrent(at: now) else { return false }
-        return !m.showsFull
+    /// While a current reading shows the seat in use out: when it began reading 100.
+    static func fullSince(_ f: Facts, now: Date) -> Date? {
+        guard let seat = f.hold?.seat, let m = f.meters[seat], m.isCurrent(at: now), m.fullUntil(at: now) != nil else { return nil }
+        return m.runSince
+    }
+
+    /// The chats stopped for the limit of the seat in use while a current reading shows it out. A
+    /// meter at 100 with no chat stopped quits nothing: the row shows the full meter, and the
+    /// switch comes when Claude stops a chat.
+    static func stoppedNow(_ f: Facts, now: Date) -> Set<String> {
+        fullSince(f, now: now).map { stopped(f, fullSince: $0) } ?? []
+    }
+
+    /// The seat in use is done: a current reading shows it out, and Claude stopped a chat for that.
+    static func isDone(_ f: Facts, now: Date) -> Bool { !stoppedNow(f, now: now).isEmpty }
+
+    /// The wait the seat in use is in, while it is done.
+    static func wait(_ f: Facts, now: Date) -> Wait? {
+        guard let hold = f.hold, let since = fullSince(f, now: now), isDone(f, now: now) else { return nil }
+        return Wait(hold: hold.key, fullSince: since)
+    }
+
+    /// The chats of the wait the app acted on in this hold, once a current reading of the seat in
+    /// use has room again: they resume in place. A chat Claude stopped after that reading is not one.
+    static func resumable(_ f: Facts, now: Date) -> Set<String> {
+        guard let hold = f.hold, let wait = f.wait, wait.hold == hold.key, let m = f.meters[hold.seat],
+              m.isCurrent(at: now), !m.showsFull, let roomSince = m.runSince else { return [] }
+        return stopped(f, fullSince: wait.fullSince, roomSince: roomSince)
     }
 
     /// The order the automatic switch tries the other seats in: down the menu from `from`,
@@ -1011,9 +1020,7 @@ enum AutoSwitch {
         let status = status(f)
         guard status.endsWaits, f.switching == nil, let hold = f.hold, hold.settled(at: now),
               f.rows.contains(where: { $0.identity == hold.seat }) else { return .none }
-        guard isDone(hold.seat, f, now: now) else {
-            return f.waitingChats > 0 && hasRoom(hold.seat, f, now: now) ? .resumeInPlace : .none
-        }
+        guard isDone(f, now: now) else { return resumable(f, now: now).isEmpty ? .none : .resumeInPlace }
         guard status == .on else { return .none }
         if let t = target(from: hold.seat, f, now: now) {
             return brakeEnds(f, now: now).map { .brake(to: t, at: $0) } ?? .switchTo(t)
@@ -1115,10 +1122,9 @@ enum FirstRun {
 enum AppState {
     /// The one notice: the most important of every line that applies (model, section 11).
     /// `failure` and `success` are the last switch's outcome; `finishing` is the line of a journal
-    /// that waits for Claude to open or to close. `waitingOn` is a wait already told: it stays told
-    /// while its readings go stale, until a fresh reading ends it; without one, the decision says.
-    static func notice(_ f: Facts, now: Date, failure: String? = nil, success: String? = nil, finishing: String? = nil,
-                       waitingOn: (seat: Identity?, resumesAt: Date?)? = nil) -> Notice? {
+    /// that waits for Claude to open or to close.
+    static func notice(_ f: Facts, now: Date, failure: String? = nil, failureDetail: String? = nil, success: String? = nil,
+                       finishing: String? = nil) -> Notice? {
         var all: [Notice] = []
         let labels = Dictionary(zip(f.rows.map(\.seat), Seats.names(f.rows)), uniquingKeysWith: { a, _ in a })
         let name = { (s: Identity?) in s.flatMap { labels[$0] } }
@@ -1126,13 +1132,16 @@ enum AppState {
             all.append(finishing.map { Notice(kind: .switching, text: $0) }
                        ?? Notice(kind: .switching, text: s.note ?? "Switching to \(name(s.target) ?? "a seat")… \(s.step)"))
         }
-        if let failure { all.append(Notice(kind: .failure, text: failure)) }
+        if let failure { all.append(Notice(kind: .failure, text: failure, detail: failureDetail)) }
         let status = AutoSwitch.status(f), decision = AutoSwitch.decide(f, now: now)
-        let decided: (seat: Identity?, resumesAt: Date?)?
-        if case .wait(let seat, let at) = decision, f.waitingChats > 0 { decided = (seat, at) } else { decided = nil }
-        // A wait told while the person had Auto-Switch on stays told, but says nothing while it is off:
-        // nothing resumes then.
-        if status.endsWaits, let (seat, at) = waitingOn ?? decided {
+        // A told wait stays told while its readings go stale, until the seat in use reads with room,
+        // Claude leaves the hold, or no chat is stopped for it any more. It says nothing while
+        // Auto-Switch is off: nothing resumes then.
+        if status.endsWaits, let wait = f.wait, wait.told, let hold = f.hold, wait.hold == hold.key,
+           let m = f.meters[hold.seat], m.showsFull, m.runSince == wait.fullSince,
+           !AutoSwitch.stopped(f, fullSince: wait.fullSince).isEmpty {
+            let (seat, at) = f.rows.compactMap(\.identity).compactMap { s in f.meters[s]?.fullResets(after: now).map { (s, $0) } }
+                .min { $0.1 < $1.1 } ?? (hold.seat, nil)
             let when = at.map { " at \(ClockText.time($0, now: now))" } ?? ""
             if f.rows.compactMap(\.identity).count == 1 {
                 all.append(Notice(kind: .waiting, text: "\(name(seat) ?? "Your seat") is out. Chats resume when it resets\(when)."))
@@ -1150,16 +1159,10 @@ enum AppState {
                               detail: "\(name(held) ?? "The seat in use") is out. Switching to \(name(to) ?? "the next seat") at \(when): automatic switches are at least \(Int(Limits.autoSwitchSpacing / 60)) minutes apart."))
         } else if status == .on, f.switching == nil, let hold = f.hold, hold.settled(at: now),
                   let m = f.meters[hold.seat], m.isCurrent(at: now), m.fullUntil(at: now) != nil,
-                  !AutoSwitch.isDone(hold.seat, f, now: now), AutoSwitch.target(from: hold.seat, f, now: now) != nil {
+                  !AutoSwitch.isDone(f, now: now), AutoSwitch.target(from: hold.seat, f, now: now) != nil {
             let percent = Int((m.fuller?.percent ?? Limits.full).rounded())
             all.append(Notice(kind: .waiting, text: "In use reads \(percent)%. It switches when Claude stops a chat.",
                               detail: "\(name(hold.seat) ?? "The seat in use") reads \(percent)%. It switches when Claude next stops a chat there for its limit."))
-        }
-        if status.endsWaits, let held = f.hold?.seat,
-           let (seat, n) = f.waiting.filter({ $0.key != held && $0.value > 0 }).max(by: { $0.value < $1.value }) {
-            let chats = n == 1 ? "1 chat waits" : "\(n) chats wait"
-            all.append(Notice(kind: .waiting, text: "\(chats) until Claude is on \(name(seat) ?? "its seat").",
-                              detail: "Claude stopped \(n == 1 ? "a chat" : "\(n) chats") on \(name(seat) ?? "another seat") for its limit. \(n == 1 ? "It waits" : "They wait") there until Claude is back on that seat."))
         }
         if !f.trusted {
             all.append(Notice(kind: .accessibility, text: "Allow Accessibility to switch on its own.",

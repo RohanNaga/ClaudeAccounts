@@ -191,9 +191,10 @@ struct RulesTests {
 
     // MARK: Lines for holding still
 
-    /// The brake, the seat in use reading out with no stop, and chats waiting on another seat: each
-    /// line is true as written, names a time on another day with its day, and fits the notice's one
-    /// line with the longest seat names in the fixtures (scripts/render-menu.swift's README rows).
+    /// The brake, the seat in use reading out with no stop, a told wait and a failed automatic
+    /// switch: each line is true as written, names a time on another day with its day, and fits the
+    /// notice's one line with the longest seat names in the fixtures (scripts/render-menu.swift's
+    /// README rows). A stop from before Claude's current hold never counts.
     static func notices() {
         let uuid = { (n: Int) in String(format: "%08x-0000-4000-8000-%012x", n, n) }
         let rows = [("Northwind Labs", 1), ("Northwind Research", 2)].map { org, n in
@@ -235,11 +236,24 @@ struct RulesTests {
         braked.lastAutoSwitch = now.addingTimeInterval(-Limits.autoSwitchSpacing)
         check(AutoSwitch.decide(braked, now: now) == .switchTo(research), "once the spacing ends, the switch")
 
-        // A switch by hand to a seat that reads out: a stop Claude logged there before it never counts.
-        var chosen = facts(labsFull: true, stopped: true)
-        check(AutoSwitch.decide(chosen, now: now) == .switchTo(research), "setup: a stop on the full seat in use switches")
-        chosen.lastHandSwitch = now.addingTimeInterval(-120)
-        check(AutoSwitch.decide(chosen, now: now) == .none, "after a switch by hand, an earlier stop never moves Claude off the seat")
+        // Claude reopened on the seat (by hand, by a switch, or by the person): a stop from the hold
+        // before never counts.
+        var reopened = facts(labsFull: true, stopped: true)
+        check(AutoSwitch.decide(reopened, now: now) == .switchTo(research), "setup: a stop on the full seat in use switches")
+        let again = "\(stamp(now.addingTimeInterval(-120))) [info] \(ClaudeLog.appStart) }\n\(stamp(now.addingTimeInterval(-110))) [info] \(ClaudeLog.identity) accountId=\(labs.account) orgId=\(labs.org)"
+        reopened.log.read(again)
+        check(AutoSwitch.decide(reopened, now: now) == .none, "once Claude reopens on the seat, an earlier stop never moves it")
+        // A turn that ends normally after the stop, in any chat on the seat, shows Claude served past it.
+        var served = facts(labsFull: true, stopped: true)
+        served.log.read("\(stamp(now.addingTimeInterval(-290))) [info] \(ClaudeLog.healthyCycle)local_b (12s, hadFirstResponse=true)")
+        check(AutoSwitch.decide(served, now: now) == .none, "a normal turn on the seat after the stop vetoes it")
+        // A stop more than 15 minutes before the seat began reading 100 is not this seat running out.
+        var early = facts(labsFull: true, stopped: false)
+        early.log.read("\(stamp(now.addingTimeInterval(-3000))) [info] \(ClaudeLog.cycle)local_a\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit")
+        early.meters[labs]?.since = now.addingTimeInterval(-3000 + Limits.stopBeforeFull + 60)
+        check(AutoSwitch.decide(early, now: now) == .none, "a stop more than 15 minutes before the seat began reading 100 does not count")
+        early.meters[labs]?.since = now.addingTimeInterval(-3000 + Limits.stopBeforeFull - 60)
+        check(AutoSwitch.decide(early, now: now) == .switchTo(research), "one up to 15 minutes before it does")
 
         let full = AppState.notice(facts(labsFull: true, stopped: false), now: now)
         check(full?.text == "In use reads 100%. It switches when Claude stops a chat.", "the seat in use reads out and no stop counts: \(full?.text ?? "none")")
@@ -248,17 +262,25 @@ struct RulesTests {
         off.autoChosen = false
         check(AppState.notice(off, now: now) == nil, "with Auto-Switch off, no line says it switches")
 
-        var elsewhere = facts(labsFull: false, stopped: false)
-        elsewhere.waiting = [research: 2]
-        let waits = AppState.notice(elsewhere, now: now)
-        check(waits?.text == "2 chats wait until Claude is on Work · Northwind Research.", "chats that wait on another seat are shown: \(waits?.text ?? "none")")
-        check(AutoSwitch.decide(elsewhere, now: now) == .none, "and never acted on from this seat")
-        elsewhere.waiting = [research: 1]
-        check(AppState.notice(elsewhere, now: now)?.text == "1 chat waits until Claude is on Work · Northwind Research.", "one chat")
+        // A told wait: the line shows only for the hold and the run of full readings it was told in.
+        var waiting = facts(labsFull: true, stopped: true)
+        waiting.meters[research] = SeatMeters(fiveHour: MeterReading(percent: 100, resetsAt: now.addingTimeInterval(3600)), readAt: now.addingTimeInterval(-60))
+        check(AutoSwitch.decide(waiting, now: now) == .wait(seat: research, resumesAt: now.addingTimeInterval(3600)), "setup: every seat is out")
+        check(AppState.notice(waiting, now: now) == nil, "an untold wait shows no line yet")
+        waiting.wait = AutoSwitch.wait(waiting, now: now)
+        check(AppState.notice(waiting, now: now) == nil, "a wait acted on but not told shows no line")
+        waiting.wait?.told = true
+        let told = AppState.notice(waiting, now: now)
+        check(told?.text == "Every seat is out. Chats resume at \(ClockText.time(now.addingTimeInterval(3600), now: now)).", "the told wait: \(told?.text ?? "none")")
+        waiting.wait?.hold = "another hold"
+        check(AppState.notice(waiting, now: now) == nil, "a wait told in another hold says nothing")
+
+        // A failed automatic switch that reopened Claude on its seat.
+        let failed = "Didn't switch to Work · Northwind Research. \(AutoSwitch.afterFailureShort)"
 
         // The notice is the panel's width less its padding and the line's own: 330 - 2 x 6 - 2 x 10.
         let font = NSFont.preferredFont(forTextStyle: .caption1)
-        for line in [brake?.text, full?.text, waits?.text].compactMap({ $0 }) {
+        for line in [brake?.text, full?.text, told?.text, failed].compactMap({ $0 }) {
             let width = (line as NSString).size(withAttributes: [.font: font]).width
             check(width <= 298, "\"\(line)\" fits one line: \(Int(width)) of 298 pt")
         }

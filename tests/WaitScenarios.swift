@@ -1,8 +1,8 @@
 import Foundation
 
-// Scenarios for the app holding still: a chat that waits on a seat Claude no longer holds, a wait
-// told once across a relaunch and Auto-Switch off and on, the spacing between automatic switches,
-// and a stop the usage service's first reading after it does not show yet. Each asserts what the
+// Scenarios for the app holding still: a sign-in inside Claude that ends a wait, a wait told once
+// across a relaunch and Auto-Switch off and on, the spacing between automatic switches, and a stop
+// the usage service's first reading after it does not show yet. Each asserts what the
 // person sees: the notice, the notifications, whether Claude was quit, what was typed, and which
 // seat is In use.
 
@@ -72,16 +72,14 @@ let waitScenarios: [Scenario] = [
                 "the automatic switch leaves Claude on the seat the person chose: held \(String(describing: h.claude.held)), \(h.claude.actions), \(h.notice)")
     },
 
-    Scenario(pair: "(A chat waits on Alpha, the person signs Claude into Beta, which reads 100 with no chat stopped)",
-             model: "a chat waits on the seat Claude stopped it on; it is shown, and acted on only once Claude is on that seat again") { h in
+    Scenario(pair: "(A chat waits on Alpha, the person signs Claude into Beta, which reads 100 with no chat stopped, then back into Alpha)",
+             model: "a sign-in inside Claude starts a new hold: the wait ends, nothing is quit from Beta, and back on Alpha the old stop never counts; only Claude's next stop switches (review B4)") { h in
         await h.everySeatOutAndAChatWaits()
         // The person signs Claude into Beta inside Claude. Beta reads with room for now.
         h.usage.set(B, fiveHour: 30, resetsAt: h.now.addingTimeInterval(4 * 3600))
         h.claude.signIn(B)
         await h.pass(ClaudeTiming.settle + ClaudeTiming.meterEvery + 30)
-        h.check(h.state("Beta") == .inUse, "Beta is In use: \(String(describing: h.state("Beta")))")
-        h.check(h.notice.first == "1 chat waits until Claude is on Alpha.",
-                "the notice says the chat waits on Alpha: \(h.notice)")
+        h.check(h.state("Beta") == .inUse && h.notice.isEmpty, "Beta is In use, and no line speaks of Alpha's chat: \(String(describing: h.state("Beta"))), \(h.notice)")
         h.check(h.claude.actions.isEmpty && h.claude.sent.isEmpty, "nothing quit or typed on Beta: \(h.claude.actions), \(h.claude.sent)")
         // Beta reads 100, and Claude stopped no chat on Beta. Gamma reads with room.
         h.usage.set(B, fiveHour: 100, resetsAt: h.now.addingTimeInterval(4 * 3600))
@@ -91,11 +89,14 @@ let waitScenarios: [Scenario] = [
                 "Claude is not quit from Beta, where it stopped no chat: \(h.claude.actions), held \(String(describing: h.claude.held)), \(h.claude.notifications)")
         h.check(h.state("Beta") == .inUse && h.nextRow == "Gamma", "Beta stays In use with Gamma Next: \(String(describing: h.state("Beta"))), \(String(describing: h.nextRow))")
         h.check(h.notice.first == fullNoStop, "the notice says why Beta stays: \(h.notice)")
-        h.check(h.waitPosts == 1, "the wait is posted once: \(h.claude.notifications)")
-        // The person signs Claude back into Alpha, still out: the chat's wait goes on from there.
+        // The person signs Claude back into Alpha, still out: the stop there is from an earlier hold.
         h.claude.signIn(A)
+        await h.pass(ClaudeTiming.settle + ClaudeTiming.meterEvery + 30)
+        h.check(h.claude.actions.isEmpty && h.claude.sent.isEmpty && h.notice.first == fullNoStop,
+                "back on Alpha, the old stop never counts: \(h.claude.actions), \(h.claude.sent), \(h.notice)")
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { h.claude.held == C && !h.switchInFlight && h.resumed("local_one") }, limit: 10 * 60)
-        h.check(h.claude.held == C && h.state("Gamma") == .inUse, "back on Alpha, the switch takes the chat to Gamma: held \(String(describing: h.claude.held)), \(h.claude.actions)")
+        h.check(h.claude.held == C && h.state("Gamma") == .inUse, "Claude's new stop on Alpha switches to Gamma: held \(String(describing: h.claude.held)), \(h.claude.actions)")
         h.check(h.resumes("local_one") == 1, "\"resume\" typed once: \(h.claude.sent)")
         h.check(h.quits == 1 && h.waitPosts == 1, "one quit, one wait posted: \(h.claude.actions), \(h.claude.notifications)")
     },

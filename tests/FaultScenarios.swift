@@ -423,18 +423,23 @@ let autoFaultScenarios: [Scenario] = [
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
     Scenario(pair: "(Automatic switch at confirm, a failed read)",
-             model: "6.6: the rollback marks Beta failedTarget and the decision runs again at once with the next target; 8 B: confirm that can't read the log rolls back") { h in
+             model: "6.6: the rollback marks Beta failedTarget; 8 B: confirm that can't read the log rolls back; Claude reopened on Alpha is a new hold, so nothing retries until Claude stops a chat again") { h in
         let lines = await autoStart(h)
         let strike = autoStrike(h, at: "confirm", .failedRead)
         await startAuto(h)
         defer { strike.restore() }
-        await h.run(until: { lines.note(h); return h.claude.held == C && !h.switchInFlight && SwitchJournal.load() == nil }, limit: 1800)
+        await h.run(until: { lines.note(h); return h.claude.held == A && h.launches == 2 && !h.switchInFlight && SwitchJournal.load() == nil }, limit: 1800)
         strike.restore()
         h.check(strike.fired, "the log was unreadable at the confirm")
-        checkEnds(h, [("Gamma", C)], chats: ["local_one"], lines: lines.seen)
+        checkEnds(h, [("Alpha", A)], chats: ["local_one"], lines: lines.seen)
         h.check(h.claude.chats(in: B).isEmpty, "nothing is left in Beta's folder")
-        await h.run(until: { h.resumed("local_one") }, limit: 600)
-        h.check(h.resumed("local_one"), "the stopped chat gets one resume on Gamma (6.7); typed \(h.claude.sent)")
+        let quits = h.quits
+        await h.pass(5 * 60)
+        h.check(h.quits == quits && h.claude.sent.isEmpty && h.notice.first == "Didn't switch to Beta. Switch by hand.",
+                "back on Alpha, nothing retries or is typed by itself, and the line says what works: \(h.claude.actions), typed \(h.claude.sent), \(h.notice)")
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        await h.run(until: { h.claude.held == C && !h.switchInFlight && h.resumed("local_one") }, limit: 900)
+        h.check(h.claude.held == C && h.claude.sent == ["local_one resume"], "Claude's next stop switches to Gamma, resumed once (6.7); typed \(h.claude.sent)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },

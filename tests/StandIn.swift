@@ -265,14 +265,18 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
 
     // MARK: Claude's log
 
-    private static let stamp: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = ClaudeLog.timeFormat; f.locale = Locale(identifier: "en_US_POSIX"); return f
-    }()
+    /// The zone Claude prints its log in: the Mac's, unless a scenario has Claude keep an older one.
+    var printZone: TimeZone?
 
+    /// Each line is printed in Claude's zone, and the file's last write is the clock's now, as on disk.
     func log(_ body: String) {
-        let line = "\(Self.stamp.string(from: clock.now())) [info] \(body)\n"
-        let h = try? FileHandle(forWritingTo: logDir.appendingPathComponent(ClaudeFiles.log))
+        let stamp = DateFormatter()
+        stamp.dateFormat = ClaudeLog.timeFormat; stamp.locale = Locale(identifier: "en_US_POSIX"); stamp.timeZone = printZone ?? .current
+        let line = "\(stamp.string(from: clock.now())) [info] \(body)\n"
+        let url = logDir.appendingPathComponent(ClaudeFiles.log)
+        let h = try? FileHandle(forWritingTo: url)
         _ = try? h?.seekToEnd(); try? h?.write(contentsOf: Data(line.utf8)); try? h?.close()
+        try? FileManager.default.setAttributes([.modificationDate: clock.now()], ofItemAtPath: url.path)
     }
 
     func logNamed(_ s: StandSeat) {
