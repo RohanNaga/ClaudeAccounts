@@ -8,7 +8,7 @@
 set -euo pipefail
 
 VERSION="0.3.0"
-BUILD="11"
+BUILD="12"
 ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 APP="$ROOT/Claude Accounts.app"
 BIN="$APP/Contents/MacOS/ClaudeAccounts"
