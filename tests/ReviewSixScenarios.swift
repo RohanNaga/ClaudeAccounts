@@ -38,14 +38,14 @@ import Foundation
 
 let reviewSixScenarios: [Scenario] = [
     Scenario(pair: "(Switching to Gamma waits out the spacing, then a hand Switch to Alpha that Claude never quits for)",
-             model: "review six G2a: the hand Switch's failure line stays; Claude stayed on its hold, so nothing asks it to quit again by itself") { h in
+             model: "review six G2a: the hand Switch's failure line stays and says automatic switching paused (review seven, finding 2); Claude stayed on its hold, so nothing asks it to quit again by itself") { h in
         guard await h.brakeOnBeta() else { h.check(false, "setup: no brake: \(h.seen)"); return }
         h.claude.quitBehaviour = .ignores
         let quits = h.quits
         h.click("Alpha")
         await h.run(until: { !h.switchInFlight }, limit: 5 * 60)
         let failed = h.notice
-        h.check(failed.first == "Claude didn't quit, so nothing changed.", "the hand Switch says why it failed: \(h.seen)")
+        h.check(failed.first == "Claude didn't quit, so nothing changed. It won't try again until Claude reopens or Auto-Switch is turned off and on.", "the hand Switch says why it failed, and that it won't try again by itself: \(h.seen)")
         await h.pass(10)
         h.check(h.notice == failed, "the failure line stays: was \(failed), now \(h.notice)")
         await h.pass(20 * 60)
@@ -53,13 +53,13 @@ let reviewSixScenarios: [Scenario] = [
     },
 
     Scenario(pair: "(Switching to Gamma waits out the spacing, then a hand Switch to Alpha whose prompt the person cancels)",
-             model: "review six G2b: Cancel means stay; the switch waiting out the spacing does not run") { h in
+             model: "review six G2b: Cancel means stay; the switch waiting out the spacing does not run, and the line says so (review seven, finding 2)") { h in
         guard await h.brakeOnBeta() else { h.check(false, "setup: no brake: \(h.seen)"); return }
         h.claude.quitBehaviour = .promptCancelled
         let quits = h.quits
         h.click("Alpha")
         await h.run(until: { !h.switchInFlight }, limit: 5 * 60)
-        h.check(h.noticeHas("Switch cancelled."), "the line says the switch was cancelled: \(h.seen)")
+        h.check(h.notice.first == "Switch cancelled. It won't try again until Claude reopens or Auto-Switch is turned off and on.", "the line says the switch was cancelled and won't try again by itself: \(h.seen)")
         await h.pass(20 * 60)
         h.check(h.quits == quits + 1 && h.claude.held == B, "after the person cancels, nothing asks Claude to quit again by itself: \(h.seen)")
         h.check(!h.claude.actions.contains("pressed \(ClaudeUI.quitAnyway)"), "and nothing presses Quit anyway: \(h.claude.actions)")

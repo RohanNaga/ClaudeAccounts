@@ -87,9 +87,9 @@ any other stop.
 1. **Quit.** The app asks Claude to quit and watches its process and windows
    ("Quitting Claude…"). If a chat is mid-reply, Claude asks first. A switch you
    started waits for your answer. **Cancel** ends it with "Switch cancelled."
-   and nothing changed. When a switch you started ends with Claude still on its
-   seat, cancelled or failed, the automatic switch doesn't ask Claude to quit
-   again until Claude reopens or Auto-Switch is turned off and on.
+   and nothing changed. When you cancel a switch you started, or Claude doesn't
+   quit for it, the automatic switch doesn't ask Claude to quit again until
+   Claude reopens or Auto-Switch is turned off and on, and the notice says so.
 2. **Back up and save.** It backs up Claude's cookie database and settings
    file. If Claude stayed on the current seat for a minute, by the app's clock
    or by Claude's own log, it saves that seat's login ("Saving <seat>…"). A login is written to a new file, checked,
@@ -111,8 +111,13 @@ the switch rolls back: Claude quits, the chats move back, the previous login is
 loaded, and Claude reopens. The notice says why and ends "Back on <seat>." If
 you close Claude during the wait, the notice reads "Open Claude to finish
 switching to <seat>." If the app or the Mac stops mid-switch, the next launch
-reads the journal. A switch stopped before its load step is undone, and one
-stopped after it is finished. Only one switch runs at a time.
+reads the journal. That recovery never quits a running Claude and never types.
+If Claude is open on the target, the switch is confirmed from its log. If it is
+open on any other seat, the switch ends there and the chats move back. If
+Claude is closed, a switch stopped before its load step is undone, one stopped
+after it is finished, and Claude is opened. The chats it was for are not
+resumed, and the notice and one notification say so, as in "Finished switching
+to Research. Chats were not resumed." Only one switch runs at a time.
 
 Each switch leaves a folder in `backups` with the files from before it and
 `switch.json` listing what moved. The last ten are kept.
@@ -246,7 +251,9 @@ are: the next launch types nothing.
   sign in once more, across relaunches, until you do. A refusal Claude logged
   while the app wasn't running marks no saved login, but while it is Claude's
   last word on that seat, the automatic switch never goes there. Its row still
-  shows Switch, and a switch you start runs at once.
+  shows Switch, and a switch you start runs at once. When the seat in use is
+  out and that seat is the only way on, the notice reads "Research last asked
+  for a new sign-in. Switch by hand to try it."
 - **Typing "resume" depends on Claude's window and on Accessibility.** If
   either fails, the app names the chats that need a message.
 - **Usage credits.** A seat at 100 percent with credits still available reads

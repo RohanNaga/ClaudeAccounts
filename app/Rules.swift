@@ -1009,7 +1009,8 @@ enum AutoSwitch {
     static let afterFailureShort = "Switch by hand."
     /// What still works after an automatic switch that failed with Claude still running on its seat:
     /// automatic switching pauses for the rest of that hold, so it never asks Claude to quit again.
-    static let afterQuitFailure = "Switch by hand. It won't try again until Claude reopens or Auto-Switch is turned off and on."
+    static let afterQuitFailure = "Switch by hand. \(pausedUntil)"
+    static let pausedUntil = "It won't try again until Claude reopens or Auto-Switch is turned off and on."
 
     /// The one rule for a chat stopped for the limit of the seat in use: its last word in Claude's
     /// current hold is a limit stop Claude has not served past (`ClaudeEvents.limitStops`), that the
@@ -1244,6 +1245,11 @@ enum AppState {
             let percent = Int((m.fuller?.percent ?? Limits.full).rounded())
             all.append(Notice(kind: .waiting, text: "In use reads \(percent)%. It switches when Claude stops a chat.",
                               detail: "\(name(hold.seat) ?? "The seat in use") reads \(percent)%. It switches when Claude next stops a chat there for its limit."))
+        } else if status == .on, f.switching == nil, let hold = f.hold, f.pausedHold != hold.key,
+                  AutoSwitch.isDone(f, now: now), AutoSwitch.target(from: hold.seat, f, now: now) == nil,
+                  let refused = AutoSwitch.order(from: hold.seat, f).first(where: { f.log.refusedLast.contains($0) && seatState($0, f, now: now) == .ready }) {
+            // A seat whose last word is a refusal is never switched to by itself (AutoSwitch.target).
+            all.append(Notice(kind: .waiting, text: "\(name(refused) ?? "A seat") last asked for a new sign-in. Switch by hand to try it."))
         }
         if !f.trusted {
             all.append(Notice(kind: .accessibility, text: "Allow Accessibility to switch on its own.",

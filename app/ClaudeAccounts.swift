@@ -719,6 +719,8 @@ struct SwitchOutcome: Equatable {
     var detail: String? = nil
     /// Claude didn't quit and its prompt was left open: the line holds only until Claude quits or reopens.
     var promptLeftOpen = false
+    /// The switch stopped at its quit: the person cancelled it, or Claude didn't quit.
+    var quitStopped = false
     /// The journal stays and waits on Claude: to open, to confirm the switch, or to close, to undo it.
     var parked = false
     /// The chats this switch set out to resume. One that did not confirm hands them back, so they
@@ -837,6 +839,8 @@ enum Switch {
         var resume: Set<String> = []
         /// Claude held its seat settled (`ClaudeEvents.holdSettledForSaving`): that login is saved once Claude quits.
         var fromSettled = false
+        /// Recovered from the journal: it never quits a running Claude and never types (nothing stored acts).
+        var recovered = false
         func name(_ id: Identity?) -> String { id.flatMap { names[$0] } ?? "another account" }
     }
 
@@ -899,14 +903,14 @@ enum Switch {
         case .declined:
             SwitchJournal.clear()
             unlock()
-            return SwitchOutcome(ok: false, text: "Switch cancelled.", resume: r.resume)
+            return SwitchOutcome(ok: false, text: "Switch cancelled.", quitStopped: true, resume: r.resume)
         case .failed:
             SwitchJournal.clear()
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
             unlock()
             let why = quit.promptWithoutButton ? "\(ClaudeShape.quitButton.why), so nothing changed." : "Claude didn't quit, so nothing changed."
             return SwitchOutcome(ok: false, text: why, detail: quit.promptLeftOpen ? "Its prompt is still open: Cancel keeps Claude as it is." : nil,
-                                 promptLeftOpen: quit.promptLeftOpen, resume: r.resume)
+                                 promptLeftOpen: quit.promptLeftOpen, quitStopped: true, resume: r.resume)
         }
         // The run that just ended names the chats that were working: cut by the quit, and for a
         // switch by hand, stopped for usage. An automatic switch takes only the chats it is for.
@@ -921,15 +925,19 @@ enum Switch {
     /// Finish or undo a switch the app was stopped in, from its journal (section 6, Recovery).
     /// Nil when there is none, or another process holds the lock. A parked journal waits for
     /// Claude to be opened again, and an undo that couldn't quit Claude waits for it to close.
+    /// Recovery only makes things consistent: it never quits a running Claude and types nothing.
+    /// A running Claude settles it by what it holds now: the target confirms it, and anything else
+    /// ends it as it stands. A closed Claude gets its files finished or put back, and is opened.
     static func recover(names: [Identity: String], progress: @escaping Progress,
                         switched: @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome? {
         guard var j = SwitchJournal.load() else { return nil }
-        let r = Request(kind: j.kind, to: j.to, names: names)
+        let r = Request(kind: j.kind, to: j.to, names: names, recovered: true)
         guard lock() else { return nil }
         if j.waiting(running: !ClaudeApp.pids().isEmpty), let line = j.waitLine(r.name(j.to)) {
             unlock()
             return SwitchOutcome(ok: false, text: line, parked: true)
         }
+        if !ClaudeApp.pids().isEmpty, j.step >= .load { j.step = .confirm }
         let outcome: SwitchOutcome
         if j.step < .load || j.undoWhenClosed {
             let back = await rollback(&j, r, progress: progress)
@@ -948,7 +956,7 @@ enum Switch {
         outcome.resume = Set(j.resume)
         let generation = SwitchLock.generation()
         let folder = ClaudeApp.folder(j.to)
-        let chats = outcome.ok && !outcome.parked
+        let chats = outcome.ok && !outcome.parked && !r.recovered
             ? ResumeRule.toResume(((try? ClaudeApp.openSessionRecords(in: folder)) ?? []).compactMap(ChatResume.chat),
                                   stoppedByLimit: Set(j.resume), cutByQuit: [])
             : []
@@ -1064,7 +1072,7 @@ enum Switch {
         guard !ClaudeApp.pids().isEmpty else { return true }
         j.reopened += 1
         try? await j.save()
-        guard j.reopened < 2 else { return false }
+        guard j.reopened < 2, !r.recovered else { return false }
         progress("Quitting Claude…")
         return await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress).outcome == .quit
     }
@@ -1139,9 +1147,25 @@ enum Switch {
     }
 
     private static func rolledBack(_ j: inout SwitchJournal, _ r: Request, _ why: String, progress: @escaping Progress) async -> SwitchOutcome {
+        if r.recovered, !ClaudeApp.pids().isEmpty { return endAsItStands(j, why) }
         let back = await rollback(&j, r, progress: progress)
         guard back.ok else { return back }
         return SwitchOutcome(ok: false, text: why, detail: j.from.map { "Back on \(r.name($0))." })
+    }
+
+    /// A recovered switch with Claude running, and not on the target, ends where Claude stands: the
+    /// chats go back to the seat they left, the journal goes, and nothing is quit.
+    private static func endAsItStands(_ j: SwitchJournal, _ why: String) -> SwitchOutcome {
+        moveBack(j)
+        SwitchJournal.clear()
+        return SwitchOutcome(ok: false, text: why)
+    }
+
+    private static func moveBack(_ j: SwitchJournal) {
+        let fm = FileManager.default
+        for m in j.moves.reversed() where fm.fileExists(atPath: m.to) && !fm.fileExists(atPath: m.from) {
+            try? fm.moveItem(atPath: m.to, toPath: m.from)
+        }
     }
 
     /// Undo: quit Claude, move the chats back, put back the files backed up after the quit, and
@@ -1158,6 +1182,7 @@ enum Switch {
             if running.isEmpty { await ClaudeApp.launch() } else if j.kind == .auto { ClaudeApp.cancelQuitPrompt(in: running) }
             return SwitchOutcome(ok: true, text: "Back on \(r.name(j.from)).")
         }
+        if r.recovered, !ClaudeApp.pids().isEmpty { return endAsItStands(j, "Didn't finish the switch to \(r.name(j.to)).") }
         progress("Going back to \(r.name(j.from))…")
         if !ClaudeApp.pids().isEmpty {
             guard await ClaudeApp.quit(unattended: r.kind == .auto, progress: progress).outcome == .quit else {
@@ -1166,10 +1191,8 @@ enum Switch {
                 return SwitchOutcome(ok: false, text: j.waitLine(r.name(j.to)) ?? "", parked: true)
             }
         }
+        moveBack(j)
         let fm = FileManager.default
-        for m in j.moves.reversed() where fm.fileExists(atPath: m.to) && !fm.fileExists(atPath: m.from) {
-            try? fm.moveItem(atPath: m.to, toPath: m.from)
-        }
         if let backup = j.backup.map(URL.init(fileURLWithPath:)) {
             if !fm.fileExists(atPath: backup.appendingPathComponent(ClaudeFiles.cookiesJournal).path) {
                 try? fm.removeItem(at: ClaudeApp.cookiesJournal)
@@ -2039,7 +2062,14 @@ final class Store: ObservableObject {
         start(journal.to, from: journal.from, fromHold: nil, byHand: journal.kind != .auto) { progress, switched in
             await Switch.recover(names: names, progress: progress, switched: switched)
                 ?? SwitchOutcome(ok: false, text: "", parked: true)
-        } then: { _ in }
+        } then: { outcome in
+            // Nothing stored types: the chats the switch was for stay as they are. The line stays
+            // and is posted once, since after a restart nobody may be looking.
+            guard !outcome.parked, !outcome.resume.isEmpty, let what = outcome.ok ? outcome.text : self.failure else { return }
+            self.success = nil
+            self.failure = "\(what) Chats were not resumed."
+            World.claude.notify(title: outcome.text, body: "Chats were not resumed.")
+        }
     }
 
     /// Run `body` as the switch in progress: its steps show on the target's row, and its outcome
@@ -2099,20 +2129,18 @@ final class Store: ObservableObject {
         Diagnostics.record(.switchEnded, ["state": Diagnostics.outcomeName(outcome),
                                           "to": target.flatMap { t in accounts.firstIndex { $0.seat == t } } ?? -1])
         // The person's own switch lands on a new hold, so nothing Claude stopped before it counts
-        // and the automatic switch never undoes it. One that ends with Claude still on its hold
-        // (cancelled, refused, failed) means stay: the automatic switch pauses on that hold, as
-        // after a failure of its own.
+        // and the automatic switch never undoes it. One stopped at its quit with Claude still on its
+        // hold (cancelled, or Claude didn't quit) means stay: the automatic switch pauses on that
+        // hold, as after a failure of its own, and the line says so. A refusal before any quit doesn't.
         let now = World.now()
-        if byHand {
-            let stayed = !outcome.ok && !outcome.parked && fromHold != nil && log.events.hold?.key == fromHold
-            pausedHold = stayed ? fromHold : nil
-        }
+        let paused = byHand && outcome.quitStopped && fromHold != nil && log.events.hold?.key == fromHold
+        if paused { pausedHold = fromHold }
         if outcome.parked {
             failure = nil
         } else if outcome.ok {
             if !outcome.text.isEmpty { success = (outcome.text, now + Self.successFor) }
         } else if !outcome.text.isEmpty {
-            failure = outcome.detail.map { "\(outcome.text) \($0)" } ?? outcome.text
+            failure = [outcome.text, outcome.detail, paused && settings.autoSwitch ? AutoSwitch.pausedUntil : nil].compactMap { $0 }.joined(separator: " ")
         }
         publish()
     }

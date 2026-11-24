@@ -73,7 +73,7 @@ APP_SOURCES=()
 for f in "$ROOT"/app/*.swift; do
   case "$(basename "$f")" in Main.swift|make-icon.swift|make-social.swift) ;; *) APP_SOURCES+=("$f") ;; esac
 done
-SCENARIO_FILES=("$ROOT/tests/StandIn.swift" "$ROOT/tests/SeatSurface.swift" "$ROOT/tests/Scenarios.swift" "$ROOT/tests/BugScenarios.swift" "$ROOT/tests/FaultScenarios.swift" "$ROOT/tests/GapScenarios.swift" "$ROOT/tests/WaitScenarios.swift" "$ROOT/tests/HoldScenarios.swift" "$ROOT/tests/ArrivalScenarios.swift" "$ROOT/tests/QuitScenarios.swift" "$ROOT/tests/ReviewFiveScenarios.swift" "$ROOT/tests/ReviewSixScenarios.swift")
+SCENARIO_FILES=("$ROOT/tests/StandIn.swift" "$ROOT/tests/SeatSurface.swift" "$ROOT/tests/Scenarios.swift" "$ROOT/tests/BugScenarios.swift" "$ROOT/tests/FaultScenarios.swift" "$ROOT/tests/GapScenarios.swift" "$ROOT/tests/WaitScenarios.swift" "$ROOT/tests/HoldScenarios.swift" "$ROOT/tests/ArrivalScenarios.swift" "$ROOT/tests/QuitScenarios.swift" "$ROOT/tests/ReviewFiveScenarios.swift" "$ROOT/tests/ReviewSixScenarios.swift" "$ROOT/tests/ReviewSevenScenarios.swift")
 swiftc -parse-as-library -module-cache-path "$OUT" -o "$OUT/scenarios" "${APP_SOURCES[@]}" "${SCENARIO_FILES[@]}"
 # The resume pair drives ChatComposer's own Accessibility code against the chat fixture; with the
 # screen locked it has no fixture and reports itself skipped.
