@@ -34,7 +34,7 @@ enum ShownState: Equatable { case switching, inUse, needsSignIn, out, ready }
     /// The notice's short line and its full sentence.
     var notice: [String] { [store?.notice?.text, store?.notice?.detail].compactMap { $0 } }
     var rowNames: [String] { store.seats.map(\.name) }
-    private func seat(_ row: String) -> Seat? { store.seats.first { $0.name == row } }
+    func seat(_ row: String) -> Seat? { store.seats.first { $0.name == row } }
     /// The meter's age as the row says it: "not read yet", "read N min ago", or nil while fresh.
     func meterText(_ row: String) -> String? { seat(row)?.meters.readText(at: clock.now()) }
     func rename(_ row: String, to name: String) { if let s = seat(row) { store.rename(s, to: name, organization: false) } else { check(false, "no row named \(row)") } }

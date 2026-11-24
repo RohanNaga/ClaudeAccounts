@@ -775,9 +775,9 @@ enum Switch {
         let to: Identity
         /// Each seat's row label; a pair with no row reads "another account".
         let names: [Identity: String]
-        /// Chats that wait for this switch: those the seat in use's out signal stopped (usage stops
-        /// and wrap-ups), kept by the Store from the decision through every failed try. A failed
-        /// read at the quit keeps them.
+        /// Chats that wait for this switch: those Claude stopped for a limit on the seat in use,
+        /// kept by the Store from the decision through every failed try. A failed read at the quit
+        /// keeps them.
         var resume: Set<String> = []
         func name(_ id: Identity?) -> String { id.flatMap { names[$0] } ?? "another account" }
     }
@@ -1401,8 +1401,6 @@ final class Store: ObservableObject {
     private var forced: Set<Identity> = []
     /// The hold whose login was saved, so each settled hold is saved once.
     private var savedHold: Hold?
-    /// When each seat was last read with room: turns that ended after it ended as the seat ran out.
-    private var roomReadAt: [Identity: Date] = [:]
     /// Chats resumed in place, each with when, so a wait resumes each stopped chat once.
     private var resumed: [String: Date] = [:]
     /// The chats the seat in use's out signal stopped, each with when it began to wait. They go
@@ -1424,9 +1422,13 @@ final class Store: ObservableObject {
     /// When the Mac last woke. Readings taken before it count as stale, and no automatic decision
     /// runs until every seat has been read since (model, section 7, sleep then wake).
     private var wokeAt: Date?
-    /// The wait that was already posted, by the time its out signal began, so each wait is
-    /// posted once.
-    private var waitPosted = false
+    /// The wait the person was told of, on the seat Claude held. It lasts until a switch starts,
+    /// the chats resume in place, no chat waits, Claude opens on another seat, or the person turns
+    /// Auto-Switch off. A reading gone stale ends none of these, so a wait is posted once and its
+    /// line stays while Claude holds that seat.
+    private var told: (held: Identity, seat: Identity?, resumesAt: Date?)?
+    /// When the last automatic switch that didn't fail began (Limits.autoSwitchSpacing).
+    private var lastAutoSwitch: Date?
     /// What the diagnostics file last recorded, so each publish logs only what changed.
     private var logged: Diagnostics.Snapshot?
 
@@ -1507,14 +1509,15 @@ final class Store: ObservableObject {
         f.autoChosen = settings.autoSwitch
         f.order = settings.switchOrder
         f.waitingChats = waitingChats(f).count
+        f.lastAutoSwitch = lastAutoSwitch
         return f
     }
 
-    /// Chats that wait for a seat with room: those the seat in use's running out stopped, through
-    /// any undone switch, and those a stop counted against no seat stopped, not resumed yet.
+    /// Chats in a wait: those Claude stopped for a limit on a seat that then read out, through any
+    /// undone switch, not resumed yet.
     private func waitingChats(_ f: Facts) -> Set<String> {
         guard f.hold != nil else { return [] }
-        return f.log.stoppedUncounted.union(waiting.keys).subtracting(resumed.keys)
+        return Set(waiting.keys).subtracting(resumed.keys)
     }
 
     /// Rebuild the rows and the notice from the facts.
@@ -1527,7 +1530,8 @@ final class Store: ObservableObject {
         for (kind, fields) in Diagnostics.changes(from: logged, to: snap) { Diagnostics.record(kind, fields) }
         logged = snap
         let waitLine = switchTask == nil ? SwitchJournal.load().flatMap { $0.waitLine(names[$0.to] ?? "a seat") } : nil
-        notice = AppState.notice(f, now: now, failure: failure, success: success?.text, finishing: waitLine)
+        notice = AppState.notice(f, now: now, failure: failure, success: success?.text, finishing: waitLine,
+                                 waitingOn: told.flatMap { f.hold?.seat == $0.held ? ($0.seat, $0.resumesAt) : nil })
     }
 
     var firstRun: Bool { accounts.isEmpty }
@@ -1647,10 +1651,10 @@ final class Store: ObservableObject {
     private func record(_ state: AccountState, for seat: Identity, at readAt: Date) {
         switch state {
         case .ok(let fh, let wk):
-            if let last = meters[seat], !last.showsFull, let at = last.readAt { roomReadAt[seat] = at }
-            let reading = SeatMeters(fiveHour: fh.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
+            var reading = SeatMeters(fiveHour: fh.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
                                      weekly: wk.map { MeterReading(percent: $0.utilization, resetsAt: $0.resetsAt) },
                                      readAt: readAt)
+            if reading.showsFull { reading.roomBefore = meters[seat]?.roomReadAt }
             meters[seat] = reading
             retryAt[seat] = nil
         case .rateLimited(let until):
@@ -1683,43 +1687,43 @@ final class Store: ObservableObject {
         let now = World.now()
         let f = facts(now: now)
         let decision = AutoSwitch.decide(f, now: now)
-        if case .wait = decision {} else { waitPosted = false }
+        // Claude closed, or reopening on the same seat, ends nothing: the chats still wait there.
+        if let t = told, !AutoSwitch.status(f).endsWaits || f.hold.map({ $0.seat != t.held || f.waitingChats == 0 }) ?? false { told = nil }
         switch decision {
         case .none:
             break
         case .wait(let seat, let at):
-            if let held = f.hold?.seat { stopped(on: held, now: now) }
-            postWait(facts(now: now), seat: seat, resumesAt: at)
+            guard let held = f.hold?.seat else { return }
+            stopped(f, now: now)
+            postWait(facts(now: now), held: held, seat: seat, resumesAt: at)
         case .resumeInPlace:
             guard let seat = f.hold?.seat else { return }
+            told = nil
             resumeInPlace(waitingChats(f), on: seat, now: now)
         case .switchTo(let target):
             // The switch runs on its own task; a failed target sends the decision round again.
-            guard switchTask == nil, let seat = f.hold?.seat else { return }
-            stopped(on: seat, now: now)
-            // Which of Claude's two signals set it off (model, section 4), for the diagnostics file.
-            let trigger: String
-            if case .limitStop? = log.events.lastSignal(on: seat)?.event { trigger = "limitStop" } else { trigger = "wrapUp" }
-            run(to: target, kind: .auto, trigger: trigger)
+            guard switchTask == nil else { return }
+            told = nil
+            stopped(f, now: now)
+            lastAutoSwitch = now
+            run(to: target, kind: .auto, trigger: "limitStop")
         }
     }
 
-    /// The seat in use is done: the chats its out signal stopped begin to wait, those Claude
-    /// stopped for usage on it and the turns a wrap-up ended (model, section 6, step 7).
-    private func stopped(on seat: Identity, now: Date) {
-        // With no reading with room on record, only the turn that set off the last read counts.
-        let since = roomReadAt[seat] ?? log.events.lastTurnEnd(on: seat) ?? now
-        for chat in log.events.stoppedForUsage(on: seat).union(log.events.turnsEnded(on: seat, since: since)) where waiting[chat] == nil {
-            waiting[chat] = now
-        }
+    /// The seat in use is done: the chats Claude stopped for a limit on it begin to wait
+    /// (model, section 6, step 7).
+    private func stopped(_ f: Facts, now: Date) {
+        for chat in AutoSwitch.stoppedByLimit(f) where waiting[chat] == nil { waiting[chat] = now }
     }
 
     /// Post a wait once (model, section 7): when chats wait and more than one seat could have
-    /// taken them. The wait lasts while the decision stays a wait, so a second stop inside it
-    /// posts nothing. A single seat that runs out stays quiet (13a.8).
-    private func postWait(_ f: Facts, seat: Identity?, resumesAt: Date?) {
-        guard f.waitingChats > 0, f.rows.compactMap(\.identity).count > 1, !waitPosted else { return }
-        waitPosted = true
+    /// taken them. The wait lasts until `told` ends, so a second stop inside it, or a stall of the
+    /// usage service, posts nothing. A single seat that runs out stays quiet (13a.8).
+    private func postWait(_ f: Facts, held: Identity, seat: Identity?, resumesAt: Date?) {
+        guard f.waitingChats > 0 else { return }
+        let first = told == nil
+        told = (held, seat, resumesAt)
+        guard first, f.rows.compactMap(\.identity).count > 1 else { return }
         let when = resumesAt.map { " at \(ClockText.time($0, now: World.now()))" } ?? ""
         let name = seat.flatMap { names[$0] } ?? "a seat"
         World.claude.notify(title: "Every seat is out", body: "Chats resume when \(name) resets\(when).")
@@ -2028,6 +2032,7 @@ final class Store: ObservableObject {
             return
         }
         guard !outcome.parked else { return }
+        lastAutoSwitch = nil
         failedTargets[to] = World.now()
         PairFile<Date>(name: "failed-targets.json").save(failedTargets)
         World.claude.notify(title: "Didn't switch to \(name(to))", body: failure ?? outcome.text)

@@ -35,7 +35,7 @@ echo "Notice is one line with its full text on hover: ok"
 section() { awk -v start="$1" '$0 ~ start {f=1; print; next} f && /^(enum|struct|final class|class|extension) / {exit} f' "$ROOT/app/$2"; }
 if ! grep -q 'Switch.run(request' <<<"$(section '^final class Store' ClaudeAccounts.swift)" \
    || ! grep -q 'case manual, auto, setUp' <<<"$(section '^struct SwitchJournal' ClaudeAccounts.swift)" \
-   || grep -qE 'meters|Usage\.|OutRule|isFresh' <<<"$(section '^enum Switch ' ClaudeAccounts.swift)"; then
+   || grep -qE 'meters|Usage\.|fullUntil|seatState|isFresh' <<<"$(section '^enum Switch ' ClaudeAccounts.swift)"; then
   echo "FAIL: every switch must run Switch.run, with Set Up as one of its kinds, and Switch must not read usage"; exit 1
 fi
 echo "One switch for every way in: ok"
