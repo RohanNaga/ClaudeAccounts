@@ -419,15 +419,19 @@ enum ClaudeApp {
                        offset: (attrs?[.size] as? NSNumber)?.uint64Value ?? 0)
     }
 
-    /// Whole lines from `offset` on, and the offset just past the last one read.
-    static func readLines(_ url: URL, from offset: UInt64) -> (text: String, end: UInt64) {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return ("", offset) }
+    /// Whole lines from `offset` on, and the place just past the last one read, in the file the
+    /// handle read: a rename between finding the file and reading it can't pair one file's end with
+    /// another's identity. A file that can't be opened gives nothing, at a place in no file.
+    static func readLines(_ url: URL, from offset: UInt64) -> (text: String, end: LogMark) {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return ("", LogMark(inode: 0, offset: 0)) }
         defer { try? handle.close() }
+        var info = stat()
+        let inode = fstat(handle.fileDescriptor, &info) == 0 ? UInt64(info.st_ino) : 0
         try? handle.seek(toOffset: offset)
         let data = handle.readDataToEndOfFile()
-        guard let last = data.lastIndex(of: UInt8(ascii: "\n")) else { return ("", offset) }
+        guard let last = data.lastIndex(of: UInt8(ascii: "\n")) else { return ("", LogMark(inode: inode, offset: offset)) }
         let whole = data[data.startIndex...last]
-        return (String(decoding: whole, as: UTF8.self), offset + UInt64(whole.count))
+        return (String(decoding: whole, as: UTF8.self), LogMark(inode: inode, offset: offset + UInt64(whole.count)))
     }
 
     /// Claude's log rotated `n` times: main1.log to main4.log.
@@ -447,24 +451,17 @@ enum ClaudeApp {
         return LogMark(inode: logMark().inode, offset: 0)
     }
 
-    /// The log files a whole read takes, oldest first: main1.log and main.log, and older rotations
-    /// back to the newest one with a Named or "Starting app" line, so a long run keeps its hold.
-    static func recentLogs() -> [URL] {
-        var files: [URL] = []
-        for url in logFiles {
-            files.insert(url, at: 0)
-            guard files.count >= 2, let data = try? Data(contentsOf: url) else { continue }
-            if [ClaudeLog.identity, ClaudeLog.appStart].contains(where: { data.range(of: Data($0.utf8)) != nil }) { break }
+    /// Claude's recent log read whole, oldest first: main.log, and while what is read names no seat
+    /// and starts no run, older rotations back to the newest one that does, so a long run keeps its
+    /// hold. With where main.log ended.
+    static func recentLogs() -> (texts: [String], end: LogMark) {
+        let main = readLines(log, from: 0)
+        var texts = [main.text]
+        for n in ClaudeFiles.rotations {
+            if [ClaudeLog.identity, ClaudeLog.appStart].contains(where: texts[0].contains) { break }
+            texts.insert(readLines(rotatedLog(n), from: 0).text, at: 0)
         }
-        return files
-    }
-
-    /// Claude's recent log files read whole, in order, for the seat it holds and the chats its
-    /// run stopped: none of it is timed, so no hold in it settles.
-    static func events() -> ClaudeEvents {
-        var events = ClaudeEvents()
-        for url in recentLogs() { events.read(readLines(url, from: 0).text) }
-        return events
+        return (texts, main.end)
     }
 
     // MARK: Sessions
@@ -580,12 +577,8 @@ enum SavedLogins {
         return nil
     }
 
-    /// The seat has a saved login that Claude has not refused since, and Claude's log, read before
-    /// or since the app launched, does not end its word on the pair with a refusal. A refusal only
-    /// holds a switch back.
-    static func usable(_ seat: Identity, log: ClaudeEvents) -> Bool {
-        !log.refusedLast.contains(seat) && (proven(seat).map { $0.meta.refusedAt == nil } ?? false)
-    }
+    /// The seat has a saved login that the app has not seen Claude refuse since.
+    static func usable(_ seat: Identity) -> Bool { proven(seat).map { $0.meta.refusedAt == nil } ?? false }
 
     /// The app saw Claude refuse `seat`'s sign-in arrive at `seen`: a copy saved before then is
     /// marked refused, so the seat reads Needs sign-in across relaunches until a newer copy.
@@ -595,10 +588,12 @@ enum SavedLogins {
         try? JSONEncoder().encode(copy.meta).write(to: copy.folder.appendingPathComponent("login.json"), options: .atomic)
     }
 
-    /// Save the login Claude holds as `seat`: with Claude quit, or `whileRunning` once Claude has
-    /// held the seat settled. Claude's settings must name the seat's account, and while Claude runs
-    /// its cookie file must sit still through the copy and Claude must still hold the seat.
-    static func save(_ seat: Identity, whileRunning: Bool = false) async throws {
+    /// Save the login Claude holds as `seat`: with Claude quit, or while it runs once it has held
+    /// the seat settled, with `log` reading its log as of then. Claude's settings must name the
+    /// seat's account, and while Claude runs its cookie file must sit still through the copy and
+    /// Claude must still hold the seat.
+    static func save(_ seat: Identity, whileRunning log: Switch.LogNow? = nil) async throws {
+        let whileRunning = log != nil
         if !whileRunning { guard ClaudeApp.pids().isEmpty else { throw SwitchError.quitFailed } }
         guard ClaudeApp.savedAccount() == seat.account else { throw SwitchError.inconsistent }
         let fm = FileManager.default
@@ -634,8 +629,8 @@ enum SavedLogins {
         let meta = Meta(account: seat.account, org: seat.org, savedAt: World.now(), config: keys)
         try JSONEncoder().encode(meta).write(to: new.appendingPathComponent("login.json"), options: .atomic)
         guard check(new, seat) == meta else { throw SwitchError.inconsistent }
-        if whileRunning {
-            guard ClaudeApp.events().hold?.seat == seat, ClaudeApp.savedAccount() == seat.account else { throw SwitchError.inconsistent }
+        if let log {
+            guard await log().hold?.seat == seat, ClaudeApp.savedAccount() == seat.account else { throw SwitchError.inconsistent }
         }
         // The proven copy moves aside, never away, until the new one reads back.
         if check(current, seat) != nil {
@@ -742,27 +737,6 @@ struct ResumeEnd: Equatable {
     var superseded = false
 }
 
-/// One resume in progress, kept on disk from its start until it ends, so the chats an app that
-/// was stopped mid-resume was getting running go through the resume step again at its next launch.
-struct ResumeOnDisk: Codable {
-    var folder: String
-    var reopenedAt: Date
-    var chats: [String]
-    var id = UUID().uuidString
-
-    static var dir: URL { Paths.stateDir.appendingPathComponent("resuming") }
-    static func all() -> [ResumeOnDisk] {
-        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-        return files.compactMap { (try? Data(contentsOf: $0)).flatMap { try? JSONDecoder().decode(Self.self, from: $0) } }
-    }
-    private var url: URL { Self.dir.appendingPathComponent(id + ".json") }
-    func save() {
-        try? FileManager.default.createDirectory(at: Self.dir, withIntermediateDirectories: true)
-        try? JSONEncoder().encode(self).write(to: url, options: .atomic)
-    }
-    func clear() { try? FileManager.default.removeItem(at: url) }
-}
-
 /// One switch at a time across the whole Mac.
 struct SwitchLock {
     let fd: Int32
@@ -850,6 +824,8 @@ struct SwitchJournal: Codable, Equatable {
 /// finishes the procedure from the journal after the app stopped mid-switch.
 enum Switch {
     typealias Progress = @Sendable (String) -> Void
+    /// Claude's log as the app has read it, with the lines Claude appended since.
+    typealias LogNow = @Sendable () async -> ClaudeEvents
 
     struct Request: Sendable {
         let kind: SwitchJournal.Kind
@@ -890,8 +866,9 @@ enum Switch {
         held = nil
     }
 
-    /// Run a switch to `r.to`. `switched` hears how the switch ended, before the chats resume.
-    static func run(_ r: Request, progress: @escaping Progress,
+    /// Run a switch to `r.to`, reading Claude's log through `log`. `switched` hears how the switch
+    /// ended, before the chats resume.
+    static func run(_ r: Request, log: @escaping LogNow, progress: @escaping Progress,
                     switched: @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome {
         guard lock() else { return SwitchOutcome(ok: false, text: "Another switch is running.") }
         if let open = SwitchJournal.load() {
@@ -899,7 +876,7 @@ enum Switch {
             return SwitchOutcome(ok: false, text: open.waitLine(r.name(open.to)) ?? "Finishing the switch to \(r.name(open.to)) first.")
         }
         let running = !ClaudeApp.pids().isEmpty
-        let events = ClaudeApp.events()
+        let events = await log()
         let hold = running ? events.hold : nil
         if r.kind != .setUp, hold?.seat == r.to {
             unlock()
@@ -933,7 +910,7 @@ enum Switch {
         }
         // The run that just ended names the chats that were working: cut by the quit, and for a
         // switch by hand, stopped for usage. An automatic switch takes only the chats it is for.
-        let ended = ClaudeApp.events().stoppedChats
+        let ended = await log().stoppedChats
         let byLimit = r.kind == .auto ? [] : ended.byLimit
         j.resume = Array(byLimit.union(ended.byQuit).union(carried).union(r.resume)).sorted()
         carried = []
@@ -986,14 +963,12 @@ enum Switch {
     /// can't work, a Claude shape missing (8 B) or no Accessibility (7), nothing is opened, typed or
     /// pressed in Claude, and every chat is named instead (12). Otherwise each chat the resume gives
     /// up on is named. A switch that starts during it, a new `generation`, takes over the chats not
-    /// yet settled and resumes them after its own confirm. Its chats stay on disk until it ends.
+    /// yet settled and resumes them after its own confirm. A resume the app was stopped in is not
+    /// taken up again: nothing stored types.
     static func resume(_ chats: [MovedChat], in folder: URL, reopenedAt: Date, progress: @escaping Progress,
                        generation: String = SwitchLock.generation()) async -> ResumeEnd {
         guard !chats.isEmpty else { return ResumeEnd() }
         guard ShapeMisses.load().isEmpty, World.claude.trusted else { return ResumeEnd(notResumed: chats.map(\.title)) }
-        let onDisk = ResumeOnDisk(folder: folder.path, reopenedAt: reopenedAt, chats: chats.map(\.id))
-        onDisk.save()
-        defer { onDisk.clear() }
         var resumer = ChatResume.resumer(in: folder, reopenedAt: reopenedAt.timeIntervalSince1970 * 1000, progress: progress)
         resumer.current = { SwitchLock.generation() == generation }
         let ids = Set(chats.map(\.id))
@@ -1470,14 +1445,13 @@ struct LogReader {
     init(from mark: ClaudeApp.LogMark? = nil) { self.mark = mark }
 
     mutating func poll(now: Date = World.now()) {
-        let current = ClaudeApp.logMark()
         guard let mark else {
-            for url in ClaudeApp.recentLogs().dropLast() { events.read(ClaudeApp.readLines(url, from: 0).text, readAt: now) }
-            let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: 0)
-            events.read(text, readAt: now)
-            self.mark = ClaudeApp.LogMark(inode: current.inode, offset: end)
+            let recent = ClaudeApp.recentLogs()
+            for text in recent.texts { events.read(text, readAt: now) }
+            self.mark = recent.end
             return
         }
+        let current = ClaudeApp.logMark()
         var from: UInt64 = 0
         if mark.inode == current.inode, mark.offset <= current.offset {
             from = mark.offset
@@ -1489,7 +1463,8 @@ struct LogReader {
         }
         let (text, end) = ClaudeApp.readLines(ClaudeApp.log, from: from)
         events.read(text, readAt: now, arrived: true)
-        self.mark = ClaudeApp.LogMark(inode: current.inode, offset: end)
+        // A main.log that can't be opened this time is looked for again from the same place.
+        if end.inode != 0 { self.mark = end }
     }
 }
 
@@ -1573,21 +1548,9 @@ final class Store: ObservableObject {
         // ask within a minute with a wait of several minutes, and the seat would read as not read.
         askedAt = meters.compactMapValues(\.readAt)
         publish()
-        resumeLeftOver()
-    }
-
-    /// A resume the app was stopped in runs again through the one resume step, from Claude's
-    /// reopening: a chat that ran since is left alone, and one it can't get running is named.
-    private func resumeLeftOver() {
-        for left in ResumeOnDisk.all() {
-            left.clear()
-            let folder = URL(fileURLWithPath: left.folder)
-            let chats = left.chats.compactMap { ChatResume.chat(folder.appendingPathComponent($0 + ".json")) }
-            Task {
-                resumeEnded(await Switch.resume(chats, in: folder, reopenedAt: left.reopenedAt, progress: { _ in }))
-                publish()
-            }
-        }
+        // An earlier build kept the resume it was stopped in here, to type at the next launch.
+        // Stored state never types, so it goes unread.
+        try? FileManager.default.removeItem(at: Paths.stateDir.appendingPathComponent("resuming"))
     }
 
     /// Start the app's own ticking. Tests never call this: they call `tick()` themselves.
@@ -1628,7 +1591,7 @@ final class Store: ObservableObject {
         let installed = World.claude.installed
         f.claude = ClaudeFacts(installed: installed, running: running, missing: installed ? Set(ShapeMisses.load().keys) : [])
         f.log = log.events
-        f.saved = Set(accounts.compactMap(\.identity).filter { SavedLogins.usable($0, log: f.log) })
+        f.saved = Set(accounts.compactMap(\.identity).filter(SavedLogins.usable))
         f.meters = meters
         f.failedTargets = failedTargets
         f.switching = switchingTo ?? SwitchJournal.load().map {
@@ -1695,6 +1658,9 @@ final class Store: ObservableObject {
         publish()
     }
 
+    /// Claude's log with its new lines read, for a switch or a save off the main actor.
+    private var logNow: Switch.LogNow { { await MainActor.run { self.observe(); return self.log.events } } }
+
     /// Read the facts that cost nothing: rows, Claude's process, its new log lines, Accessibility.
     private func observe() {
         accounts = AccountStore.load().labelled()
@@ -1725,7 +1691,7 @@ final class Store: ObservableObject {
               SwitchJournal.load() == nil, let lock = SwitchLock.acquire(newGeneration: false) else { return }
         defer { lock.release() }
         do {
-            try await SavedLogins.save(hold.seat, whileRunning: true)
+            try await SavedLogins.save(hold.seat, whileRunning: logNow)
             savedHold = hold
         } catch SwitchError.cookiesChanging {
             // Tried again on the next tick.
@@ -1831,9 +1797,14 @@ final class Store: ObservableObject {
             // already told. A single seat stays quiet (13a.8).
             guard let hold = f.hold else { return }
             let stops = AutoSwitch.stoppedNow(f, now: now)
-            if wait?.hold == hold.key { wait?.stops.merge(stops) { old, _ in old } } else { wait = AutoSwitch.Wait(hold: hold.key, stops: stops) }
-            // A switch decided for later replaces the last switch's line, as its start would.
-            if case .brake = decision { failure = nil }
+            if wait?.hold == hold.key {
+                wait?.stops.merge(stops) { old, _ in old }
+            } else {
+                wait = AutoSwitch.Wait(hold: hold.key, stops: stops)
+                // A switch decided for later replaces the last switch's line once, as its start
+                // would; a line told after it stays.
+                if case .brake = decision { failure = nil }
+            }
             if case .switchTo(let target) = decision, switchTask == nil {
                 memory.lastAutoSwitch = now
                 run(to: target, kind: .auto, resume: Set(stops.keys), trigger: "limitStop")
@@ -2053,7 +2024,10 @@ final class Store: ObservableObject {
                                             "to": rows.firstIndex(of: target) ?? -1, "trigger": trigger ?? NSNull()])
         let request = Switch.Request(kind: kind, to: target, names: names, resume: resume,
                                      fromSettled: running && log.events.holdSettledForSaving(at: World.now()))
-        return start(target, from: from, byHand: kind != .auto) { progress, switched in await Switch.run(request, progress: progress, switched: switched) } then: { outcome in
+        let logNow = self.logNow
+        return start(target, from: from, fromHold: fromHold, byHand: kind != .auto) { progress, switched in
+            await Switch.run(request, log: logNow, progress: progress, switched: switched)
+        } then: { outcome in
             if kind == .auto { self.autoFinished(outcome, from: from, fromHold: fromHold, to: target) }
         }
     }
@@ -2062,7 +2036,7 @@ final class Store: ObservableObject {
     private func recover() {
         guard switchTask == nil, let journal = SwitchJournal.load() else { return }
         let names = self.names
-        start(journal.to, from: journal.from, byHand: journal.kind != .auto) { progress, switched in
+        start(journal.to, from: journal.from, fromHold: nil, byHand: journal.kind != .auto) { progress, switched in
             await Switch.recover(names: names, progress: progress, switched: switched)
                 ?? SwitchOutcome(ok: false, text: "", parked: true)
         } then: { _ in }
@@ -2072,7 +2046,7 @@ final class Store: ObservableObject {
     /// becomes the notice as soon as the switch ends, before the chats resume. From then on a new
     /// switch may start; this one's resume goes on until that switch overtakes it.
     @discardableResult
-    private func start(_ target: Identity, from: Identity?, byHand: Bool,
+    private func start(_ target: Identity, from: Identity?, fromHold: String?, byHand: Bool,
                        _ body: @escaping (@escaping Switch.Progress, @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome,
                        then: @escaping (SwitchOutcome) -> Void) -> Task<Void, Never> {
         failure = nil
@@ -2092,13 +2066,13 @@ final class Store: ObservableObject {
         let switched: (SwitchOutcome) async -> Void = { outcome in
             await MainActor.run {
                 ended.set = true
-                self.switched(outcome, run: run, from: from, byHand: byHand)
+                self.switched(outcome, run: run, from: from, fromHold: fromHold, byHand: byHand)
             }
         }
         let task = Task {
             let outcome = await body(progress, switched)
             // A switch that ended before confirm (cancelled, refused, failed) reports here.
-            if !ended.set { self.switched(outcome, run: run, from: from, byHand: byHand) }
+            if !ended.set { self.switched(outcome, run: run, from: from, fromHold: fromHold, byHand: byHand) }
             self.resumeEnded(outcome.resumeEnd)
             then(outcome)
             if outcome.promptLeftOpen, self.failure != nil { self.failureHold = self.log.events.hold?.key }
@@ -2113,7 +2087,7 @@ final class Store: ObservableObject {
     private final class Flag: @unchecked Sendable { var set = false }
 
     /// The switch itself ended: its line goes in the notice.
-    private func switched(_ outcome: SwitchOutcome, run: Int, from: Identity?, byHand: Bool) {
+    private func switched(_ outcome: SwitchOutcome, run: Int, from: Identity?, fromHold: String?, byHand: Bool) {
         guard runs == run else { return }
         let target = switchingTo?.target
         resumeTask = switchTask
@@ -2125,9 +2099,14 @@ final class Store: ObservableObject {
         Diagnostics.record(.switchEnded, ["state": Diagnostics.outcomeName(outcome),
                                           "to": target.flatMap { t in accounts.firstIndex { $0.seat == t } } ?? -1])
         // The person's own switch lands on a new hold, so nothing Claude stopped before it counts
-        // and the automatic switch never undoes it.
+        // and the automatic switch never undoes it. One that ends with Claude still on its hold
+        // (cancelled, refused, failed) means stay: the automatic switch pauses on that hold, as
+        // after a failure of its own.
         let now = World.now()
-        if byHand { pausedHold = nil }
+        if byHand {
+            let stayed = !outcome.ok && !outcome.parked && fromHold != nil && log.events.hold?.key == fromHold
+            pausedHold = stayed ? fromHold : nil
+        }
         if outcome.parked {
             failure = nil
         } else if outcome.ok {
@@ -2549,7 +2528,7 @@ enum StatusReport {
         f.claude = ClaudeFacts(installed: installed, running: !ClaudeApp.pids().isEmpty,
                                missing: installed ? Set(ShapeMisses.load().keys) : [])
         f.log = log.events
-        f.saved = Set(f.rows.compactMap(\.identity).filter { SavedLogins.usable($0, log: f.log) })
+        f.saved = Set(f.rows.compactMap(\.identity).filter(SavedLogins.usable))
         f.meters = meters
         f.failedTargets = PairFile<Date>(name: "failed-targets.json").load()
         f.switching = SwitchJournal.load().map { SwitchFacts(target: $0.to, step: $0.parked ? "parked until Claude opens" : $0.undoWhenClosed ? "undo waits for Claude to quit" : "in progress") }
@@ -2633,7 +2612,9 @@ enum TestResume {
     static func run(_ key: String) -> Never {
         func say(_ line: String) { print(line); fflush(stdout) }
         guard !ClaudeApp.pids().isEmpty else { say("Claude isn't open."); exit(1) }
-        guard let identity = ClaudeApp.events().hold?.seat else { say("Claude's log doesn't name the account it has open."); exit(1) }
+        var log = LogReader()
+        log.poll()
+        guard let identity = log.events.hold?.seat else { say("Claude's log doesn't name the account it has open."); exit(1) }
         let folder = ClaudeApp.folder(identity)
         let matches = ((try? ClaudeApp.openSessionRecords(in: folder)) ?? []).compactMap(ChatResume.chat)
             .filter { $0.id == key || $0.title.lowercased() == key.lowercased() }

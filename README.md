@@ -87,7 +87,9 @@ any other stop.
 1. **Quit.** The app asks Claude to quit and watches its process and windows
    ("Quitting Claude…"). If a chat is mid-reply, Claude asks first. A switch you
    started waits for your answer. **Cancel** ends it with "Switch cancelled."
-   and nothing changed.
+   and nothing changed. When a switch you started ends with Claude still on its
+   seat, cancelled or failed, the automatic switch doesn't ask Claude to quit
+   again until Claude reopens or Auto-Switch is turned off and on.
 2. **Back up and save.** It backs up Claude's cookie database and settings
    file. If Claude stayed on the current seat for a minute, by the app's clock
    or by Claude's own log, it saves that seat's login ("Saving <seat>…"). A login is written to a new file, checked,
@@ -227,7 +229,8 @@ never presses Retry, Rewind, Stop or Keep working.
 A chat that doesn't start is tried again every minute for 30 minutes, and only
 after a minute with nobody using the Mac. After that the menu names the chats
 that need a message from you. Each step is written to `resume.log` in the app's
-folder.
+folder. If the app is quit mid-resume, the chats it hadn't reached stay as they
+are: the next launch types nothing.
 
 ## What it cannot guarantee
 
@@ -242,7 +245,8 @@ folder.
   old or a change on its side. The switch rolls back, and the row asks you to
   sign in once more, across relaunches, until you do. A refusal Claude logged
   while the app wasn't running marks no saved login, but while it is Claude's
-  last word on that seat, the row reads Needs sign-in and no switch goes there.
+  last word on that seat, the automatic switch never goes there. Its row still
+  shows Switch, and a switch you start runs at once.
 - **Typing "resume" depends on Claude's window and on Accessibility.** If
   either fails, the app names the chats that need a message.
 - **Usage credits.** A seat at 100 percent with credits still available reads
