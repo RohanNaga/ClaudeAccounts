@@ -108,7 +108,7 @@ let arrivalScenarios: [Scenario] = [
         h.check(h.quits == 0 && h.claude.sent.isEmpty && h.claude.notifications.isEmpty, "nothing quit, typed or posted: \(h.seen)")
     },
     Scenario(pair: "(Claude refuses Beta's saved login, the app relaunches, then Claude refuses Gamma while the app is quit)",
-             model: "a refusal the app saw arrive after the login was saved marks that login, and the mark outlives a relaunch; a refusal already in the log at launch marks no saved login, and only holds a switch back while it is the pair's last word in the log (review F1's guard)") { h in
+             model: "a refusal the app saw arrive after the login was saved marks that login, and the mark outlives a relaunch; a refusal already in the log at launch marks no saved login, and only keeps the automatic switch off that pair while it is the pair's last word in the log (review F1's guard, review six finding 5)") { h in
         await h.standard()
         await h.pass(ClaudeTiming.settle)
         h.claude.stale = [B, C]
@@ -123,7 +123,8 @@ let arrivalScenarios: [Scenario] = [
         h.make(); await h.tick(); await h.settle()
         let gamma = (try? Data(contentsOf: SavedLogins.dir(C.identity).appendingPathComponent("current/login.json"))).flatMap { try? JSONDecoder().decode(SavedLogins.Meta.self, from: $0) }
         h.check(gamma != nil && gamma?.refusedAt == nil, "a refusal logged while the app was quit marks no saved login: \(String(describing: gamma?.refusedAt))")
-        h.check(h.state("Gamma") == .needsSignIn && h.action("Gamma") == .setUp, "Gamma reads Needs sign-in while the refusal is its last word in the log: \(String(describing: h.state("Gamma")))")
+        h.check(h.action("Gamma") == .switchTo && h.store.seats.first { $0.name == "Gamma" }?.isNext == false,
+                "Gamma still shows Switch while the refusal is its last word in the log, and is never Next: \(String(describing: h.state("Gamma")))")
     },
     Scenario(pair: "(Every seat out and a chat waits, the Mac sleeps three hours, Alpha still reads 100, Beta reads with room)",
              model: "a run of full readings starts again after the Mac wakes: a stop from before the sleep never switches") { h in

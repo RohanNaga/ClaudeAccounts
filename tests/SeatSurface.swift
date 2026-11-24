@@ -83,9 +83,6 @@ enum ShownState: Equatable { case switching, inUse, needsSignIn, out, ready }
     func killApp() { clock.abandonSleepers(); Switch.abandonForTest(); store = nil }
     /// The app is quit or crashes, and a new app starts at once on the same files.
     func crashApp() { killApp(); make() }
-    /// A resume is still trying: its chats stay on disk until it ends, for the next launch to take
-    /// up if the app is stopped first (section 6, Recovery).
-    var resumeOnDisk: Bool { !ResumeOnDisk.all().isEmpty }
     func click(_ row: String) {
         guard let s = store.seats.first(where: { $0.name == row }) else { check(false, "no row named \(row)"); return }
         if s.action == .setUp { store.setUp(s) } else { store.switchTo(s) }

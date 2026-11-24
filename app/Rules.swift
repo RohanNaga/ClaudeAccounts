@@ -730,16 +730,19 @@ struct ClaudeEvents {
     /// by it (`StampedEvent.seen`), so nothing Claude logged before the app launched can count.
     /// Claude prints its local time with no zone. A printed time is only ever set against another
     /// line's, how long Claude held a seat before a line, so each is read as if in UTC: the Mac's
-    /// zone plays no part, and no printed time meets the app's clock.
+    /// zone plays no part, and no printed time meets the app's clock. Only the lines an event can
+    /// come from are looked at, and the last line for its time: a log holds tens of megabytes of
+    /// other lines.
     mutating func read(_ text: String, readAt: Date? = nil, arrived: Bool = false) {
         let format = DateFormatter()
         format.locale = Locale(identifier: "en_US_POSIX")
         format.timeZone = TimeZone(identifier: "UTC")
         format.dateFormat = ClaudeLog.timeFormat
-        for line in text.split(separator: "\n") {
-            guard let printed = format.date(from: String(line.prefix(19))) else { continue }
-            lastPrinted = printed
-            guard let event = Self.event(line, held: hold?.seat) else { continue }
+        let printedAt = { (line: String) in format.date(from: String(line.prefix(19))) }
+        let (lines, last) = Self.scan(text, printedAt)
+        if let last { lastPrinted = last }
+        for line in lines {
+            guard let event = Self.event(line, held: hold?.seat), let printed = printedAt(line) else { continue }
             let seen = arrived ? readAt : nil
             let settled = seen != nil && hold.map { printed.timeIntervalSince($0.printed) >= Limits.settle } ?? false
             events.append(StampedEvent(event: event, held: hold?.seat, seen: seen, settled: settled))
@@ -826,6 +829,35 @@ struct ClaudeEvents {
         }
     }
 
+    /// Every event's line holds one of these.
+    private static let markers = [ClaudeLog.identity, ClaudeLog.refusal, ClaudeLog.appStart, ClaudeLog.cycle] + ClaudeLog.signOut
+
+    /// The lines of `text` that hold a marker, in order, each marker found across the whole text at
+    /// once; and the time of its last line that has one.
+    private static func scan(_ text: String, _ printedAt: (String) -> Date?) -> (lines: [String], last: Date?) {
+        var text = text
+        return text.withUTF8 { buf in
+            guard let base = buf.baseAddress else { return ([], nil) }
+            let newline = UInt8(ascii: "\n")
+            func start(_ i: Int) -> Int { var s = i; while s > 0, buf[s - 1] != newline { s -= 1 }; return s }
+            func end(_ i: Int) -> Int { var e = i; while e < buf.count, buf[e] != newline { e += 1 }; return e }
+            func line(_ s: Int) -> String { String(decoding: UnsafeBufferPointer(rebasing: buf[s..<end(s)]), as: UTF8.self) }
+            var starts = Set<Int>()
+            for marker in markers {
+                let bytes = Array(marker.utf8)
+                var from = 0
+                while from < buf.count, let hit = memmem(base + from, buf.count - from, bytes, bytes.count) {
+                    let at = base.distance(to: hit.assumingMemoryBound(to: UInt8.self))
+                    starts.insert(start(at))
+                    from = end(at)
+                }
+            }
+            var last: Date?, s = buf.count
+            while last == nil, s > 0 { s = start(s - 1); last = printedAt(line(s)) }
+            return (starts.sorted().map(line), last)
+        }
+    }
+
     static func event<S: StringProtocol>(_ line: S, held: Identity?) -> LogEvent? {
         if line.contains(ClaudeLog.identity), let a = field(line, ClaudeLog.accountField), let o = field(line, ClaudeLog.orgField) {
             return .named(Identity(account: a, org: o))
@@ -907,8 +939,7 @@ struct Facts {
     var claude = ClaudeFacts()
     /// F3.
     var log = ClaudeEvents()
-    /// F4: the pairs with a saved login that Claude has not refused since the app saw it saved,
-    /// and whose last word in Claude's log is not a refusal.
+    /// F4: the pairs with a saved login that Claude has not refused since the app saw it saved.
     var saved: Set<Identity> = []
     /// F5, per seat: each seat reads usage through its own Claude Code sign-in.
     var meters: [Identity: SeatMeters] = [:]
@@ -1056,10 +1087,11 @@ enum AutoSwitch {
     }
 
     /// In that order, the first Ready seat with a current reading that has not failed as a target
-    /// within coolDown.
+    /// within coolDown, and whose last word in Claude's log is not a refusal. That guard only keeps
+    /// the automatic switch off the seat: a hand Switch to it runs at once.
     static func target(from: Identity, _ f: Facts, now: Date) -> Identity? {
         order(from: from, f).first { s in
-            seatState(s, f, now: now) == .ready && (f.meters[s]?.isCurrent(at: now) ?? false)
+            seatState(s, f, now: now) == .ready && (f.meters[s]?.isCurrent(at: now) ?? false) && !f.log.refusedLast.contains(s)
                 && !(f.failedTargets[s].map { now.timeIntervalSince($0) < Limits.coolDown } ?? false)
         }
     }

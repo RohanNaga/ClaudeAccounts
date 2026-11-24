@@ -111,7 +111,9 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var stateDir: URL { root.appendingPathComponent("state") }
     var bundleId: String { "test.stand-in.claude" }
     var dataDir: URL { root.appendingPathComponent("claude-data") }
-    var logDir: URL { root.appendingPathComponent("claude-logs") }
+    var logDir: URL { onLogDir?(); return root.appendingPathComponent("claude-logs") }
+    /// Runs each time anyone finds Claude's log folder: a scenario rotates the log mid-read here.
+    var onLogDir: (() -> Void)?
     func executable() -> String { root.appendingPathComponent("Claude.app/Contents/MacOS/Claude").path }
 
     // What the scenario sets.

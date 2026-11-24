@@ -7,7 +7,7 @@ import Foundation
 // Each fails on 2140a83.
 
 /// Claude rotates main.log the way it does: main.log becomes main1.log, main1 becomes main2 and so on.
-private func rotate(_ c: StandInClaude) {
+func rotate(_ c: StandInClaude) {
     let fm = FileManager.default, d = c.logDir
     for n in stride(from: 3, through: 1, by: -1) {
         let from = d.appendingPathComponent(ClaudeFiles.rotatedLog(n)), to = d.appendingPathComponent(ClaudeFiles.rotatedLog(n + 1))
@@ -54,7 +54,7 @@ let reviewFiveScenarios: [Scenario] = [
     },
 
     Scenario(pair: "(Claude refused Beta's login while the app was quit, then named Alpha; the app launches)",
-             model: "review F1's guard: a pair whose last word in Claude's log is a refusal reads Needs sign-in, and only holds a switch back: nothing quits, switches or types by itself, and a stop moves on to Gamma") { h in
+             model: "review F1's guard: a pair whose last word in Claude's log is a refusal is never the automatic target, and its row still shows Switch: nothing quits, switches or types by itself, and a stop moves on to Gamma") { h in
         try? h.rows([("Alpha", A), ("Beta", B), ("Gamma", C)])
         for (n, s) in [("Beta", B), ("Gamma", C), ("Alpha", A)] { try? await h.savedLogin(n, s) }
         for s in [A, B, C] { h.usage.set(s, fiveHour: 20, resetsAt: h.now.addingTimeInterval(3 * 3600)) }
@@ -69,7 +69,7 @@ let reviewFiveScenarios: [Scenario] = [
         h.claude.writeSignIn(A)
         h.claudeHoldsSettled()
         h.make(); await h.tick(); await h.settle()
-        h.check(h.state("Beta") == .needsSignIn && h.action("Beta") == .setUp, "Beta reads Needs sign-in with Set Up: \(String(describing: h.state("Beta")))")
+        h.check(h.action("Beta") == .switchTo && h.nextRow == "Gamma", "Beta still shows Switch, and Next is Gamma: \(String(describing: h.state("Beta"))), next \(String(describing: h.nextRow))")
         await h.pass(2 * 60)
         h.check(h.claude.actions.isEmpty && h.claude.sent.isEmpty && h.claude.notifications.isEmpty, "nothing quit, typed or posted by itself: \(h.seen)")
         h.claude.logLimitStop("local_one", seatReadsFull: true)
