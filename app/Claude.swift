@@ -41,8 +41,8 @@ protocol ClaudeWorld: Sendable {
     func open(link: String) async
     /// This app may use Accessibility.
     var trusted: Bool { get }
-    /// Claude shows its "a chat is still running" quit prompt.
-    func quitPromptOpen(in owners: [pid_t]) -> Bool
+    /// What Accessibility shows of Claude's windows: roles, and the buttons on alerts and sheets.
+    func quitPromptSurvey(in owners: [pid_t]) -> QuitSurvey
     /// Press the button with this title in Claude's quit prompt.
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool
     /// Ask Claude to build its web content's Accessibility tree.
@@ -201,7 +201,7 @@ struct RealClaudeWorld: ClaudeWorld {
     func open(link: String) async { _ = await runProcess("/usr/bin/open", [link]) }
 
     var trusted: Bool { QuitPrompt.trusted }
-    func quitPromptOpen(in owners: [pid_t]) -> Bool { QuitPrompt.isOpen(in: owners) }
+    func quitPromptSurvey(in owners: [pid_t]) -> QuitSurvey { QuitPrompt.survey(in: owners) }
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool { QuitPrompt.press(title, in: owners) }
     func exposeWebContent(of owners: [pid_t]) { ChatComposer.exposeWebContent(of: owners) }
     func chatScreen(session: String, in owners: [pid_t]) -> ChatScreen? { ChatComposer.screen(session: session, in: owners) }

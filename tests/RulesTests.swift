@@ -1,7 +1,7 @@
 // Tests for app/Rules.swift: the auto-switch rule, reading Claude's log, the quit watch,
 // organization matching, labels, meters, settings and the resume step. Run with ./test.sh; it needs only swiftc, like the app.
 
-import Foundation
+import AppKit
 
 @main
 struct RulesTests {
@@ -23,6 +23,7 @@ struct RulesTests {
         meters()
         settings()
         resume()
+        notices()
         print(failures == 0 ? "All \(count) checks passed." : "\(failures) of \(count) checks failed.")
         exit(failures == 0 ? 0 : 1)
     }
@@ -187,6 +188,119 @@ struct RulesTests {
     }
 
     // MARK: Meters
+
+    // MARK: Lines for holding still
+
+    /// The brake, the seat in use reading out with no stop, a told wait and a failed automatic
+    /// switch: each line is true as written, names a time on another day with its day, and fits the
+    /// notice's one line with the longest seat names in the fixtures (scripts/render-menu.swift's
+    /// README rows). A stop from before Claude's current hold never counts.
+    static func notices() {
+        let uuid = { (n: Int) in String(format: "%08x-0000-4000-8000-%012x", n, n) }
+        let rows = [("Northwind Labs", 1), ("Northwind Research", 2)].map { org, n in
+            AccountRecord(id: "r\(n)", name: "Work", color: "", configDir: "/nonexistent", keychainService: "none", email: nil,
+                          accountUuid: uuid(1), orgName: org, orgUuid: uuid(100 + n))
+        }.labelled()
+        let (labs, research) = (rows[0].seat, rows[1].seat)
+        // 11:55 PM, so the brake ends after midnight.
+        let now = Calendar.current.date(from: DateComponents(year: 2026, month: 11, day: 24, hour: 23, minute: 55))!
+        let stamp = { (d: Date) in
+            let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = ClaudeLog.timeFormat
+            return f.string(from: d)
+        }
+        let held = "\(stamp(now.addingTimeInterval(-7200))) [info] \(ClaudeLog.identity) accountId=\(labs.account) orgId=\(labs.org)"
+        let stop = "\(stamp(now.addingTimeInterval(-300))) [info] \(ClaudeLog.cycle)local_a\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit"
+        func facts(labsFull: Bool, stopped: Bool) -> Facts {
+            var f = Facts()
+            f.rows = rows
+            f.claude = ClaudeFacts(installed: true, running: true, missing: [])
+            f.trusted = true
+            f.log.read(held, readAt: now.addingTimeInterval(-7200))
+            if stopped { f.log.read(stop, readAt: now.addingTimeInterval(-300), arrived: true) }
+            f.saved = [labs, research]
+            let reset = now.addingTimeInterval(3 * 3600)
+            f.meters[labs] = SeatMeters(fiveHour: MeterReading(percent: labsFull ? 100 : 40, resetsAt: reset), readAt: now.addingTimeInterval(-60))
+            f.meters[research] = SeatMeters(fiveHour: MeterReading(percent: 10, resetsAt: reset), readAt: now.addingTimeInterval(-60))
+            return f
+        }
+
+        var braked = facts(labsFull: true, stopped: true)
+        braked.lastAutoSwitch = now.addingTimeInterval(-60)
+        let brake = AppState.notice(braked, now: now)
+        let ends = now.addingTimeInterval(Limits.autoSwitchSpacing - 60)
+        let day = ends.formatted(.dateTime.weekday(.abbreviated))
+        check(AutoSwitch.decide(braked, now: now) == .brake(to: research, at: ends), "a switch inside the spacing waits for its end")
+        check(brake?.text == "Switching to Work · Northwind Research at \(ClockText.time(ends, now: now)).", "the brake says where and when: \(brake?.text ?? "none")")
+        check(brake?.text.contains(day) == true, "a brake that ends after midnight names the day: \(brake?.text ?? "none")")
+        check(brake?.detail == "Work · Northwind Labs is out. Switching to Work · Northwind Research at \(ClockText.time(ends, now: now)): automatic switches are at least 15 minutes apart.",
+              "its full sentence: \(brake?.detail ?? "none")")
+        braked.lastAutoSwitch = now.addingTimeInterval(-Limits.autoSwitchSpacing)
+        check(AutoSwitch.decide(braked, now: now) == .switchTo(research), "once the spacing ends, the switch")
+
+        // Claude reopened on the seat (by hand, by a switch, or by the person): a stop from the hold
+        // before never counts.
+        var reopened = facts(labsFull: true, stopped: true)
+        check(AutoSwitch.decide(reopened, now: now) == .switchTo(research), "setup: a stop on the full seat in use switches")
+        let again = "\(stamp(now.addingTimeInterval(-120))) [info] \(ClaudeLog.appStart) }\n\(stamp(now.addingTimeInterval(-110))) [info] \(ClaudeLog.identity) accountId=\(labs.account) orgId=\(labs.org)"
+        reopened.log.read(again, readAt: now.addingTimeInterval(-110), arrived: true)
+        check(AutoSwitch.decide(reopened, now: now) == .none, "once Claude reopens on the seat, an earlier stop never moves it")
+        // A turn that ends normally after the stop, in any chat on the seat, shows Claude served past it.
+        var served = facts(labsFull: true, stopped: true)
+        served.log.read("\(stamp(now.addingTimeInterval(-290))) [info] \(ClaudeLog.healthyCycle)local_b (12s, hadFirstResponse=true)",
+                        readAt: now.addingTimeInterval(-290), arrived: true)
+        check(AutoSwitch.decide(served, now: now) == .none, "a normal turn on the seat after the stop vetoes it")
+        // A stop more than 15 minutes before the seat began reading 100 is not this seat running out.
+        var early = facts(labsFull: true, stopped: false)
+        early.log.read("\(stamp(now.addingTimeInterval(-3000))) [info] \(ClaudeLog.cycle)local_a\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit",
+                       readAt: now.addingTimeInterval(-3000), arrived: true)
+        early.meters[labs]?.since = now.addingTimeInterval(-3000 + Limits.stopBeforeFull + 60)
+        check(AutoSwitch.decide(early, now: now) == .none, "a stop more than 15 minutes before the seat began reading 100 does not count")
+        early.meters[labs]?.since = now.addingTimeInterval(-3000 + Limits.stopBeforeFull - 60)
+        check(AutoSwitch.decide(early, now: now) == .switchTo(research), "one up to 15 minutes before it does")
+        // A stop already in the log when the app first read it never counts, however its printed
+        // time reads: only a stop the app saw arrive, timed by the app's own clock.
+        var atLaunch = facts(labsFull: true, stopped: false)
+        atLaunch.log = ClaudeEvents()
+        atLaunch.log.read(held + "\n" + stop, readAt: now.addingTimeInterval(-7200))
+        check(AutoSwitch.decide(atLaunch, now: now) == .none && AutoSwitch.stoppedNow(atLaunch, now: now).isEmpty,
+              "a stop found in the first read of the log never counts")
+        atLaunch.log.read("\(stamp(now.addingTimeInterval(3 * 3600))) [info] \(ClaudeLog.cycle)local_b\(ClaudeLog.apiError)success): \(ClaudeLog.limitTexts[0]) usage limit",
+                          readAt: now.addingTimeInterval(-60), arrived: true)
+        check(AutoSwitch.decide(atLaunch, now: now) == .switchTo(research), "a stop seen arriving counts by when it arrived, whatever time it prints")
+
+        let full = AppState.notice(facts(labsFull: true, stopped: false), now: now)
+        check(full?.text == "In use reads 100%. It switches when Claude stops a chat.", "the seat in use reads out and no stop counts: \(full?.text ?? "none")")
+        check(full?.detail == "Work · Northwind Labs reads 100%. It switches when Claude next stops a chat there for its limit.", "its full sentence: \(full?.detail ?? "none")")
+        var off = facts(labsFull: true, stopped: false)
+        off.autoChosen = false
+        check(AppState.notice(off, now: now) == nil, "with Auto-Switch off, no line says it switches")
+
+        // A told wait: the line shows only for the hold and the run of full readings it was told in.
+        var waiting = facts(labsFull: true, stopped: true)
+        waiting.meters[research] = SeatMeters(fiveHour: MeterReading(percent: 100, resetsAt: now.addingTimeInterval(3600)), readAt: now.addingTimeInterval(-60))
+        check(AutoSwitch.decide(waiting, now: now) == .wait(seat: research, resumesAt: now.addingTimeInterval(3600)), "setup: every seat is out")
+        check(AppState.notice(waiting, now: now) == nil, "an untold wait shows no line yet")
+        waiting.wait = AutoSwitch.Wait(hold: waiting.hold!.key, stops: AutoSwitch.stoppedNow(waiting, now: now))
+        check(AppState.notice(waiting, now: now) == nil, "a wait acted on but not told shows no line")
+        waiting.wait?.told = true
+        let told = AppState.notice(waiting, now: now)
+        check(told?.text == "Every seat is out. Chats resume at \(ClockText.time(now.addingTimeInterval(3600), now: now)).", "the told wait: \(told?.text ?? "none")")
+        var served2 = waiting
+        served2.log.read("\(stamp(now.addingTimeInterval(-30))) [info] \(ClaudeLog.healthyCycle)local_a (12s, hadFirstResponse=true)", readAt: now.addingTimeInterval(-30), arrived: true)
+        check(AppState.notice(served2, now: now) == nil, "a told wait whose chat ran again says nothing")
+        waiting.wait?.hold = "another hold"
+        check(AppState.notice(waiting, now: now) == nil, "a wait told in another hold says nothing")
+
+        // A failed automatic switch that reopened Claude on its seat.
+        let failed = "Didn't switch to Work · Northwind Research. \(AutoSwitch.afterFailureShort)"
+
+        // The notice is the panel's width less its padding and the line's own: 330 - 2 x 6 - 2 x 10.
+        let font = NSFont.preferredFont(forTextStyle: .caption1)
+        for line in [brake?.text, full?.text, told?.text, failed, QuitWatch.answerPrompt].compactMap({ $0 }) {
+            let width = (line as NSString).size(withAttributes: [.font: font]).width
+            check(width <= 298, "\"\(line)\" fits one line: \(Int(width)) of 298 pt")
+        }
+    }
 
     static func meters() {
         func body(_ json: String) -> [String: Any] {

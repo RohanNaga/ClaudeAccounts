@@ -28,7 +28,7 @@ struct PathWorld: ClaudeWorld {
     func launch() async {}
     func open(link: String) async {}
     var trusted: Bool { false }
-    func quitPromptOpen(in owners: [pid_t]) -> Bool { false }
+    func quitPromptSurvey(in owners: [pid_t]) -> QuitSurvey { QuitSurvey() }
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool { false }
     func exposeWebContent(of owners: [pid_t]) {}
     func chatScreen(session: String, in owners: [pid_t]) -> ChatScreen? { nil }

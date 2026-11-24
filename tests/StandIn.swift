@@ -127,8 +127,18 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var refuseAfter: TimeInterval = 12
     /// Claude names the seat it holds in a line the app has not seen: the Named shape is missing.
     var namedLineChanged = false
-    /// Claude's quit prompt has no Quit anyway button: Accessibility finds no prompt, only a new window.
+    /// False: Claude's quit prompt shows only Wait for Claude and Cancel, as Accessibility reads it.
     var promptHasQuitButton = true
+    /// Accessibility lists the open prompt only this long after it opened; until then the app sees
+    /// only a new window. A prompt not yet listed, or an Accessibility call that timed out while
+    /// Claude was busy, looks like this. `.infinity`: never listed (a prompt on another Space).
+    var promptListedAfter: TimeInterval = 0
+    private var promptOpenedAt: Date?
+    /// For this long after the prompt opens, each look through Accessibility times out and returns
+    /// nothing, as while Claude is busy; the first such look takes 2.1 s of real time, past the 2 s
+    /// cap the app once had on each call.
+    var accessibilitySlowFor: TimeInterval = 0
+    private var slowLookTaken = false
     /// Set Up: who the person signs in as once Claude asks (nil: nobody signs in).
     var signsInAs: StandSeat?
     /// Every notification the app posted, as "<title>: <body>".
@@ -265,14 +275,18 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
 
     // MARK: Claude's log
 
-    private static let stamp: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = ClaudeLog.timeFormat; f.locale = Locale(identifier: "en_US_POSIX"); return f
-    }()
+    /// The zone Claude prints its log in: the Mac's, unless a scenario has Claude keep an older one.
+    var printZone: TimeZone?
 
+    /// Each line is printed in Claude's zone, and the file's last write is the clock's now, as on disk.
     func log(_ body: String) {
-        let line = "\(Self.stamp.string(from: clock.now())) [info] \(body)\n"
-        let h = try? FileHandle(forWritingTo: logDir.appendingPathComponent(ClaudeFiles.log))
+        let stamp = DateFormatter()
+        stamp.dateFormat = ClaudeLog.timeFormat; stamp.locale = Locale(identifier: "en_US_POSIX"); stamp.timeZone = printZone ?? .current
+        let line = "\(stamp.string(from: clock.now())) [info] \(body)\n"
+        let url = logDir.appendingPathComponent(ClaudeFiles.log)
+        let h = try? FileHandle(forWritingTo: url)
         _ = try? h?.seekToEnd(); try? h?.write(contentsOf: Data(line.utf8)); try? h?.close()
+        try? FileManager.default.setAttributes([.modificationDate: clock.now()], ofItemAtPath: url.path)
     }
 
     func logNamed(_ s: StandSeat) {
@@ -297,7 +311,8 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     /// Claude starts as it would from its own sign-in files, and names (or refuses) the seat.
     func start() {
         let seat = signInOnDisk()
-        let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; runsOn = seat; return nextPid }
+        // A newly started Claude prints the Mac's zone.
+        let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; runsOn = seat; printZone = nil; return nextPid }
         log("\(ClaudeLog.appStart) }")
         guard let seat else {
             if let who = signsInAs { clock.after(60) { [weak self] in self?.signIn(who, pid: p) } }
@@ -365,7 +380,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         case .quits: stop()
         case .ignores: break
         case .promptThenQuit, .promptCancelled, .promptUnanswered:
-            lock.withLock { promptOpen = true }
+            lock.withLock { promptOpen = true; promptOpenedAt = clock.now() }
             if quitBehaviour == .promptThenQuit { clock.after(5) { [weak self] in self?.stop() } }
             if quitBehaviour == .promptCancelled { clock.after(5) { [weak self] in self?.lock.withLock { self?.promptOpen = false } } }
         }
@@ -388,15 +403,40 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var opened: [Date] { lock.withLock { timeline.filter { $0.what.hasPrefix("open ") }.map(\.at) } }
 
     var trusted: Bool { trustedAX }
-    func quitPromptOpen(in owners: [pid_t]) -> Bool { lock.withLock { promptOpen && promptHasQuitButton } }
+    /// Claude's window, and its prompt once Accessibility lists it.
+    func quitPromptSurvey(in owners: [pid_t]) -> QuitSurvey {
+        guard trustedAX else { return QuitSurvey() }
+        let timesOut: (Bool, Bool) = lock.withLock {
+            guard promptOpen, let opened = promptOpenedAt, clock.now().timeIntervalSince(opened) < accessibilitySlowFor else { return (false, false) }
+            defer { slowLookTaken = true }
+            return (true, !slowLookTaken)
+        }
+        if timesOut.1 { usleep(2_100_000) }
+        if timesOut.0 { return QuitSurvey() }
+        return lock.withLock {
+            guard pid != nil else { return QuitSurvey() }
+            var seen = QuitSurvey(windows: ["AXWindow/AXStandardWindow"])
+            guard promptListed else { return seen }
+            seen.windows.append("AXWindow/AXDialog")
+            seen.prompts = [promptHasQuitButton ? ["Wait for Claude", ClaudeUI.quitAnyway, ClaudeUI.cancel] : ["Wait for Claude", ClaudeUI.cancel]]
+            return seen
+        }
+    }
+    private var promptListed: Bool { promptOpen && (promptOpenedAt.map { clock.now().timeIntervalSince($0) >= promptListedAfter } ?? false) }
     /// Quit anyway quits Claude (unless `quitAnywayLands` is off); Cancel closes the prompt and leaves Claude running.
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool {
-        guard trustedAX, lock.withLock({ promptOpen }) else { return false }
+        guard trustedAX, lock.withLock({ promptListed }) else { return false }
         if title == ClaudeUI.quitAnyway && !promptHasQuitButton { return false }
         did("pressed \(title)")
         if title == ClaudeUI.quitAnyway && !quitAnywayLands { return true }
         if title == ClaudeUI.cancel { lock.withLock { promptOpen = false } } else { stop() }
         return true
+    }
+    /// The person presses a button on Claude's open prompt themselves, whether Accessibility lists it or not.
+    func personAnswers(_ title: String) {
+        guard lock.withLock({ promptOpen }) else { return }
+        did("person pressed \(title)")
+        if title == ClaudeUI.cancel { lock.withLock { promptOpen = false } } else { stop() }
     }
     func exposeWebContent(of owners: [pid_t]) {}
     /// Without Accessibility, Claude's window cannot be read at all.

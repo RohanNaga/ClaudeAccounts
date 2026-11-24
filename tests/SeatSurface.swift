@@ -70,7 +70,12 @@ enum ShownState: Equatable { case switching, inUse, needsSignIn, out, ready }
     }
     func hasSavedLogin(_ seat: StandSeat) -> Bool { savedAt(seat) != nil }
     /// When the seat's login was last saved, so a scenario can tell it was left untouched.
-    func savedAt(_ seat: StandSeat) -> Date? { SavedLogins.savedAt(seat.identity) }
+    func savedAt(_ seat: StandSeat) -> Date? {
+        ["current", "prev"].lazy.compactMap { name in
+            (try? Data(contentsOf: SavedLogins.dir(seat.identity).appendingPathComponent("\(name)/login.json")))
+                .flatMap { try? JSONDecoder().decode(SavedLogins.Meta.self, from: $0) }?.savedAt
+        }.first
+    }
     /// The Mac wakes from sleep (the app's NSWorkspace.didWakeNotification).
     func wake() { store.woke() }
     /// The app is quit or crashes: its parked tasks never wake, and nothing of it runs until

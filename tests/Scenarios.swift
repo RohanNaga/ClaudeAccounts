@@ -69,6 +69,9 @@ struct Scenario {
         checks += 1
         if !ok { failures.append(what) }
     }
+    /// Why this scenario could not run here, such as a real window it needs while the screen is locked.
+    private(set) var skipped: String?
+    func skip(_ why: String) { skipped = why }
 
     /// Writes the person's rows (F9), one per seat, in menu order.
     /// Rows listed in `noOrg` are old rows saved before organizations were kept (13a.4).
@@ -249,7 +252,8 @@ let scenarios: [Scenario] = [
         h.claude.addChat("local_one", in: A, lastActivity: h.clock.now())
         h.claudeHoldsSettled()
         h.make()
-        await h.tick()
+        // The app has watched Claude hold Alpha for a minute: only then is Alpha's login saved at the quit.
+        await h.pass(ClaudeTiming.settle)
         h.check(h.state("Beta") == .ready && h.action("Beta") == .switchTo, "Beta is Ready with Switch: \(String(describing: h.state("Beta")))")
         h.click("Beta")
         await h.settle()
@@ -679,8 +683,13 @@ let scenarios: [Scenario] = [
         h.claude.promptHasQuitButton = false
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { h.quits > 0 && !h.switchInFlight }, limit: 1800)
-        // Spec 11: the automatic switch's failure holds the one notice over the pause, as a manual one's does.
-        h.check(h.notice == ["Claude didn't quit, so nothing changed."], "the failed quit holds the notice: \(h.notice)")
+        // Spec 11: the automatic switch's failure holds the one notice over the pause, as a manual one's does:
+        // what didn't happen and what still works, with the cause and the open prompt on hover.
+        h.check(h.notice == ["Didn't switch to Beta. Switch by hand.",
+                             "Didn't switch to Beta: Claude's quit prompt has no Quit anyway button, so nothing changed. Its prompt is still open: Cancel keeps Claude as it is. \(AutoSwitch.afterQuitFailure)"],
+                "the failed quit holds the notice: \(h.notice)")
+        h.check(h.quits == 1 && h.claude.notifications == ["Switching to Beta: \(QuitWatch.answerPrompt)", "Didn't switch to Beta: Claude's quit prompt has no Quit anyway button, so nothing changed. Its prompt is still open: Cancel keeps Claude as it is. \(AutoSwitch.afterQuitFailure)"],
+                "one quit request; one notification at 10 s unpressed and one at the failure: \(h.seen)")
         h.store.closeNotice()
         await h.tick()
         h.check(h.noticeHas(pausedLine), "a prompt without its button pauses automatic switching, in one line, once the failure is closed: \(h.notice)")
@@ -981,21 +990,22 @@ let scenarios: [Scenario] = [
 enum ScenarioRun {
     @MainActor static func main() async {
         setvbuf(stdout, nil, _IOLBF, 0)
-        var passed = 0, failed = 0, pending = 0
+        var passed = 0, failed = 0, pending = 0, skipped = 0
         // One pair by its exact name (each.sh), else every pair whose name contains the argument.
         let only = CommandLine.arguments.dropFirst().first
-        let all = scenarios + bugScenarios + faultScenarios + gapScenarios
+        let all = scenarios + bugScenarios + faultScenarios + gapScenarios + waitScenarios + holdScenarios + arrivalScenarios + quitScenarios + reviewFiveScenarios
         if only == "--list" { all.forEach { print($0.pair) }; exit(0) }
         let exact = all.contains { $0.pair == only }
         for s in all where only == nil || (exact ? s.pair == only : s.pair.contains(only!)) {
             guard let body = s.body else { print("PEND \(s.pair): \(s.model)"); pending += 1; continue }
             guard let h = try? Harness() else { print("FAIL \(s.pair): the stand-in could not be installed"); failed += 1; continue }
             await body(h)
-            if h.failures.isEmpty { print("ok   \(s.pair) (\(h.checks) checks)"); passed += 1 }
+            if h.failures.isEmpty, let why = h.skipped { print("SKIP \(s.pair): \(why)"); skipped += 1 }
+            else if h.failures.isEmpty { print("ok   \(s.pair) (\(h.checks) checks)"); passed += 1 }
             else { print("FAIL \(s.pair): model says \(s.model)"); h.failures.forEach { print("       - \($0)") }; failed += 1 }
             h.cleanUp()
         }
-        print("Scenarios: \(passed) passed, \(failed) failed, \(pending) pending")
+        print("Scenarios: \(passed) passed, \(failed) failed, \(pending) pending, \(skipped) skipped")
         exit(failed + pending == 0 ? 0 : 1)
     }
 }

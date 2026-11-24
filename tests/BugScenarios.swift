@@ -218,6 +218,7 @@ let bugScenarios: [Scenario] = [
     // Bug: the resume waited for a Send button that Claude shows only once the box holds text (fixed in cec0e4a).
     Scenario(pair: "(Resume, composer with no Send button)", model: "6.7: each moved chat stopped for usage and idle gets one \"resume\", typed through Accessibility") { h in
         guard AXIsProcessTrusted() else { h.check(false, "setup: this process needs Accessibility access to read the chat window"); return }
+        guard ProcessInfo.processInfo.environment["CHAT_FIXTURE"] != nil else { h.skip("no chat window fixture: test.sh gives none while the screen is locked"); return }
         guard let window = ChatWindow(h.claude) else { h.check(false, "setup: the chat window fixture did not start (CHAT_FIXTURE=<prompt-fixture binary>)"); return }
         defer { window.close() }
         do { try World.install(window, clock: h.clock) } catch { h.check(false, "setup: the world refused the chat window: \(error)"); return }
@@ -337,7 +338,7 @@ final class ChatWindow: ClaudeWorld, @unchecked Sendable {
     func windowIDs(_ owners: [pid_t]) -> Set<Int> { standIn.windowIDs(owners) }
     func requestQuit(_ pid: pid_t) async { await standIn.requestQuit(pid) }
     func launch() async { await standIn.launch() }
-    func quitPromptOpen(in owners: [pid_t]) -> Bool { standIn.quitPromptOpen(in: owners) }
+    func quitPromptSurvey(in owners: [pid_t]) -> QuitSurvey { standIn.quitPromptSurvey(in: owners) }
     func pressQuitPrompt(_ title: String, in owners: [pid_t]) -> Bool { standIn.pressQuitPrompt(title, in: owners) }
     func idleSeconds() -> TimeInterval { standIn.idleSeconds() }
     func notify(title: String, body: String) { standIn.notify(title: title, body: body) }
