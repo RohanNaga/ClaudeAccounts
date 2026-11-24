@@ -412,16 +412,17 @@ let autoFaultScenarios: [Scenario] = [
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
     Scenario(pair: "(Automatic switch at confirm, kill the app)",
-             model: "Recovery: from load on the switch is finished; 6.7: the stopped chat gets one resume; 8 A and B") { h in
+             model: "Recovery: Claude running on the target confirms the switch from its log; nothing stored types, so the stopped chat is named, not resumed (review seven, finding 1); 8 A and B") { h in
         let lines = await autoStart(h)
         let strike = autoStrike(h, at: "confirm", .killApp)
         await startAuto(h)
         await killAppAtStrike(h, strike, "at the automatic switch's confirm")
         await runToEnd(h, lines)
         checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
-        h.check(lines.has("Finished switching to Beta"), "the person sees \"Finished switching to Beta.\" (7); saw \(lines.seen)")
-        await h.run(until: { h.resumed("local_one") }, limit: 600)
-        h.check(h.resumed("local_one"), "the stopped chat gets one resume after the recovery (6.7); typed \(h.claude.sent)")
+        h.check(lines.has("Finished switching to Beta. Chats were not resumed."), "the person sees \"Finished switching to Beta. Chats were not resumed.\" (7); saw \(lines.seen)")
+        await h.pass(ClaudeTiming.resumeFor + 5 * 60)
+        h.check(h.claude.sent.isEmpty && h.quits == 1 && h.launches == 1, "the recovery types nothing and quits nothing: typed \(h.claude.sent), \(h.claude.actions)")
+        h.check(h.claude.notifications.filter { $0.contains("Chats were not resumed") }.count == 1, "one post says the chats were not resumed: \(h.claude.notifications)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
