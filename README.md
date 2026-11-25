@@ -367,8 +367,11 @@ login keychain; `build.sh` signs with it from then on.
 `test.sh` runs the rule checks in `tests/`, then drives the quit prompt code
 against a real native alert and the resume step against a stand-in chat window.
 Those flash small windows for a moment and need Accessibility for your
-terminal. `release.sh` builds and zips the app into `dist/` for a GitHub
-release and prints the checksum the Homebrew cask needs. The icon is drawn by
+terminal. `release.sh` builds a separate copy, always signed ad hoc and never
+with the local identity, zips it into `dist/` for a GitHub release, checks the
+app in the zip carries no certificate, and prints the version and the checksum
+the Homebrew cask needs. It never replaces, quits or opens this folder's copy.
+The icon is drawn by
 `app/make-icon.swift`; delete `app/AppIcon.icns` to regenerate it.
 `scripts/render-menu.sh` draws the menu in fixed states to PNGs without
 starting the app; its `menu-readme.png` is `docs/menu.png`.
