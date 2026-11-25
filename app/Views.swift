@@ -736,7 +736,8 @@ struct SeatRow: View {
         case .needsSignIn:
             quiet("Sign in once")
         case .out(let resetsAt):
-            Text(outLabel(resetsAt, now: now))
+            // Opened, its meter lines below say when each resets.
+            Text(outLabel(MenuLayout.showsMeters(seat, expanded: looks.expanded) ? nil : resetsAt, now: now))
                 .font(.caption).fontWeight(.semibold).lineLimit(1).fixedSize()
         case .ready:
             if let fuller = seat.meters.fuller, !stale {
