@@ -229,15 +229,24 @@ Once Claude confirms the new seat, each moved chat the switch is for gets one
 new message, "resume": after an automatic switch, the chats stopped for the
 limit that started it and those cut off by the quit; after a switch by hand,
 every chat Claude stopped for a limit since it last opened, and those cut off
-by the quit. The app opens the chat with a `claude://code/continue` link, checks
+by the quit. Either way, a chat whose own turn had ended but whose background
+subagents were still working counts as cut off too: Claude records those
+subagents in the chat's record as it quits, and the quit stops them. Only a
+quit the switch itself made counts, and a chat that was idle with nothing
+running gets nothing. The app opens the chat with a `claude://code/continue` link, checks
 through Accessibility that Claude's window shows that chat, puts "resume" in
 its message box and presses Send, once. It skips a chat that is running, a
 chat whose message box holds a draft, and a chat it has already resumed. It
 never presses Retry, Rewind, Stop or Keep working.
 
-A chat that doesn't start is tried again every minute for 30 minutes, and only
-after a minute with nobody using the Mac. After that the menu names the chats
-that need a message from you. Each step is written to `resume.log` in the app's
+A chat counts as resumed once its Stop button shows, after "resume" or on its
+own, or once Claude clears the mark it set on a chat the quit cut off. A record
+that merely shows newer activity doesn't count: Claude updates it without
+running the chat. A chat that doesn't start is tried again every minute for 30
+minutes, and only after a minute with nobody using the Mac. After that the menu
+says how many chats need a message from you, its line on hover and the
+notification name them, as in "Couldn't resume “Fix the importer”: send it a
+message." Each step is written to `resume.log` in the app's
 folder. If the app is quit mid-resume, the chats it hadn't reached stay as they
 are: the next launch types nothing.
 

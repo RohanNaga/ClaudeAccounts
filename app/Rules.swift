@@ -465,8 +465,9 @@ enum ResumeRule {
     static let retryFor = Limits.resumeFor
 
     enum Result: Equatable {
-        /// Running without a message from the app: Claude resumed it, someone sent it a message,
-        /// or it was already running.
+        /// Running without a message from the app, as its Stop control shows, or resumed by Claude
+        /// itself, as the quit's mark Claude cleared shows. A record's last-activity time is never
+        /// taken for either: Claude moves it without running a turn.
         case running
         /// The app sent the message and Claude showed the turn start.
         case sent
@@ -490,22 +491,26 @@ enum ResumeRule {
         case done(Result)
     }
 
-    /// The chats to get running again: every moved chat that was working when the switch began,
-    /// which is each one Claude stopped for usage (`stoppedByLimit`) and each one whose turn the
-    /// quit cut off (Claude's mark, or `cutByQuit` from its log). Each once, most recently active
-    /// first. A chat that was idle is left alone. A chat's subagents run inside it and stop with
-    /// it, so the chat is the unit: its next turn starts them again.
-    static func toResume(_ chats: [MovedChat], stoppedByLimit: Set<String>, cutByQuit: Set<String>) -> [MovedChat] {
+    /// The chats to get running again: every moved chat that had work in flight when the switch
+    /// quit Claude, by Claude's own record. That is each one Claude marked as cut off by the quit,
+    /// and each one in `working`: stopped for usage, cut off by the quit as its log says, or with
+    /// background tasks still running as Claude quit (`workingAtQuit`), whose own turn may have
+    /// ended long before. Each once, most recently active first. A chat that was idle with no work
+    /// in flight is left alone.
+    static func toResume(_ chats: [MovedChat], working: Set<String>) -> [MovedChat] {
         var seen = Set<String>()
         return chats.filter { chat in
-            (chat.interrupted || cutByQuit.contains(chat.id) || stoppedByLimit.contains(chat.id)) && seen.insert(chat.id).inserted
+            (chat.interrupted || working.contains(chat.id)) && seen.insert(chat.id).inserted
         }
         .sorted { $0.lastActivity > $1.lastActivity }
     }
 
-    /// A chat a quit cut off has resumed once Claude cleared its mark or it ran after Claude reopened.
-    static func resumed(markStillSet: Bool, lastActivity: Double, reopenedAt: Double) -> Bool {
-        !markStillSet || lastActivity > reopenedAt
+    /// A chat's record, as Claude wrote it at its last quit, says background tasks such as
+    /// subagents were still running then: the quit stopped them, and only a new turn, which
+    /// "resume" starts, picks their work up. Claude records this at every quit and clears it when
+    /// it next starts.
+    static func workingAtQuit(_ record: [String: Any]) -> Bool {
+        ((record[ClaudeFiles.armedWorkAtQuit] as? [String: Any])?[ClaudeFiles.backgroundTaskCount] as? Int ?? 0) > 0
     }
 
     /// What to do with one opened chat. `waited` counts from the open, `shownFor` from the moment
@@ -538,9 +543,14 @@ enum ResumeRule {
         secondsSinceInput >= retryEvery
     }
 
-    /// How many stopped chats run again, as the switch's message and notification say it.
-    static func summary(running: Int, of total: Int) -> String {
-        "Running again: \(running) of \(total) stopped chat\(total == 1 ? "" : "s")."
+    /// The line for the chats a resume couldn't get running, by title: counted, as the menu's one
+    /// line shows it, or `named`, as its hover and the notification do.
+    static func couldNotResume(_ titles: [String], named: Bool) -> String {
+        let n = titles.count
+        let quoted = titles.map { "\u{201C}\($0)\u{201D}" }
+        let which = !named ? "\(n) chat\(n == 1 ? "" : "s")"
+            : n == 1 ? quoted[0] : quoted.dropLast().joined(separator: ", ") + " and " + quoted[n - 1]
+        return "Couldn't resume \(which): send \(n == 1 ? "it" : "them") a message."
     }
 }
 

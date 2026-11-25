@@ -721,7 +721,8 @@ let scenarios: [Scenario] = [
         await h.run(until: { h.claude.held == B && !h.switchInFlight }, limit: 600)
         h.check(h.claude.held == B, "manual Switch still works: \(String(describing: h.claude.held)), \(h.notice)")
         // Spec 11: a failure the person must act on outranks the pause for the one notice slot.
-        h.check(h.notice == ["Couldn't resume 1 chat: send it a message."], "the chat the switch could not resume holds the notice: \(h.notice)")
+        h.check(h.notice == ["Couldn't resume 1 chat: send it a message.", "Couldn't resume \u{201C}chat\u{201D}: send it a message."],
+                "the chat the switch could not resume holds the notice, named on hover: \(h.notice)")
         await h.pass(ClaudeTiming.settle + 5)
         h.usage.set(B, fiveHour: 100, resetsAt: h.clock.now().addingTimeInterval(3600))
         let quitsOnBeta = h.quits
@@ -1024,7 +1025,7 @@ enum ScenarioRun {
         var passed = 0, failed = 0, pending = 0, skipped = 0
         // One pair by its exact name (each.sh), else every pair whose name contains the argument.
         let only = CommandLine.arguments.dropFirst().first
-        let all = scenarios + bugScenarios + faultScenarios + gapScenarios + waitScenarios + holdScenarios + arrivalScenarios + quitScenarios + reviewFiveScenarios + reviewSixScenarios + reviewSevenScenarios
+        let all = scenarios + bugScenarios + faultScenarios + gapScenarios + waitScenarios + holdScenarios + arrivalScenarios + quitScenarios + reviewFiveScenarios + reviewSixScenarios + reviewSevenScenarios + workScenarios
         if only == "--list" { all.forEach { print($0.pair) }; exit(0) }
         let exact = all.contains { $0.pair == only }
         for s in all where only == nil || (exact ? s.pair == only : s.pair.contains(only!)) {

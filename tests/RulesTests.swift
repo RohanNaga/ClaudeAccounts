@@ -355,10 +355,10 @@ struct RulesTests {
             MovedChat(id: "new", title: "new", interrupted: true, lastActivity: 5),
             MovedChat(id: "limit", title: "limit", interrupted: false, lastActivity: 7),
         ]
-        let wanted = ResumeRule.toResume(chats, stoppedByLimit: ["limit", "gone"], cutByQuit: [])
+        let wanted = ResumeRule.toResume(chats, working: ["limit", "gone"])
         check(wanted.map(\.id) == ["limit", "new", "old"],
               "chats a quit cut off or a limit stopped, each once, most recent first; an idle chat is left alone")
-        check(ResumeRule.toResume(chats, stoppedByLimit: [], cutByQuit: []).map(\.id) == ["new", "old"],
+        check(ResumeRule.toResume(chats, working: []).map(\.id) == ["new", "old"],
               "with no stop in the log, only the chats Claude marked")
         let working = [
             MovedChat(id: "limit", title: "limit", interrupted: false, lastActivity: 4),
@@ -366,12 +366,16 @@ struct RulesTests {
             MovedChat(id: "marked", title: "marked", interrupted: true, lastActivity: 2),
             MovedChat(id: "idle", title: "idle", interrupted: false, lastActivity: 9),
         ]
-        check(ResumeRule.toResume(working, stoppedByLimit: ["limit"], cutByQuit: ["running"]).map(\.id) == ["limit", "running", "marked"],
-              "the chats that were working are exactly the ones stopped for usage plus the ones the quit cut off")
+        check(ResumeRule.toResume(working, working: ["limit", "running"]).map(\.id) == ["limit", "running", "marked"],
+              "the chats that were working are exactly the ones named working plus the ones Claude marked")
         check(ResumeRule.message == "resume", "the message is \"resume\"")
-        check(ResumeRule.resumed(markStillSet: false, lastActivity: 0, reopenedAt: 100), "a cleared mark means it resumed")
-        check(!ResumeRule.resumed(markStillSet: true, lastActivity: 50, reopenedAt: 100), "a mark and no activity means it waits")
-        check(ResumeRule.resumed(markStillSet: true, lastActivity: 150, reopenedAt: 100), "activity after the reopen means it resumed")
+        // Claude's armedWorkAtQuit as it writes it at a quit: background tasks, a loop wakeup, crons.
+        func armed(tasks: Int, crons: Int = 0) -> [String: Any] {
+            [ClaudeFiles.armedWorkAtQuit: ["at": 1, "exitKind": "quit", "cronCount": crons, "durableCronCount": 0, ClaudeFiles.backgroundTaskCount: tasks]]
+        }
+        check(ResumeRule.workingAtQuit(armed(tasks: 7)), "a chat with subagents running as Claude quit was working")
+        check(!ResumeRule.workingAtQuit(armed(tasks: 0, crons: 1)) && !ResumeRule.workingAtQuit([:]) && !ResumeRule.workingAtQuit(["lostWorkUntold": true]),
+              "a chat with no background task at the quit, or only the mark of an earlier quit's lost work, was not")
 
         // One opened chat, step by step.
         let idle = ChatScreen(busy: false, composer: true, draft: false)
@@ -408,8 +412,10 @@ struct RulesTests {
               "a retry opens a chat only after a minute with nobody using the Mac")
         check(ResumeRule.Result.draft.settled && ResumeRule.Result.running.settled && ResumeRule.Result.sent.settled
               && !ResumeRule.Result.notResumed("x").settled, "running, sent and someone's draft end the tries; anything else is tried again")
-        check(ResumeRule.summary(running: 0, of: 1) == "Running again: 0 of 1 stopped chat."
-              && ResumeRule.summary(running: 2, of: 3) == "Running again: 2 of 3 stopped chats.", "the summary says how many run again")
+        check(ResumeRule.couldNotResume(["Fix the importer"], named: false) == "Couldn't resume 1 chat: send it a message."
+              && ResumeRule.couldNotResume(["Fix the importer"], named: true) == "Couldn't resume \u{201C}Fix the importer\u{201D}: send it a message."
+              && ResumeRule.couldNotResume(["A", "B", "C"], named: true) == "Couldn't resume \u{201C}A\u{201D}, \u{201C}B\u{201D} and \u{201C}C\u{201D}: send them a message.",
+              "the chats a resume gave up on are counted on the menu's line and named in full")
 
         // Telling the message box apart.
         typealias Box = ComposerRule.Box
