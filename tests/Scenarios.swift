@@ -417,8 +417,9 @@ let scenarios: [Scenario] = [
         await h.pass(3 * ClaudeTiming.meterEvery)
         let posted = h.claude.notifications.filter { $0.hasPrefix("Every seat is out") }
         h.check(posted.count == 1, "one notification for the whole wait: \(h.claude.notifications)")
-        let at = DateFormatter.localizedString(from: reset, dateStyle: .none, timeStyle: .short)
-        h.check(posted.first.map { $0.hasPrefix("Every seat is out: Chats resume when ") && $0.hasSuffix(" resets at \(at).") } == true,
+        // The reset reads as the menu says it when the line was posted, which may be either side of midnight.
+        let at = Set([ClockText.time(reset, now: h.started), ClockText.time(reset, now: h.clock.now())])
+        h.check(posted.first.map { p in p.hasPrefix("Every seat is out: Chats resume when ") && at.contains { p.hasSuffix(" resets at \($0).") } } == true,
                 "it reads \"Every seat is out: Chats resume when <seat> resets at <time>.\", the title once: \(posted)")
         h.check(h.claude.actions.isEmpty, "no switch: \(h.claude.actions)")
     },
@@ -432,8 +433,8 @@ let scenarios: [Scenario] = [
         await h.pass(ClaudeTiming.meterEvery + 5)
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.pass(300)
-        let at = DateFormatter.localizedString(from: reset, dateStyle: .none, timeStyle: .short)
-        h.check(h.noticeHas("Alpha is out. Chats resume when it resets at \(at)."), "the one-seat waiting line: \(h.notice)")
+        let at = ClockText.time(reset, now: h.clock.now())
+        h.check(h.noticeHas("Alpha is out. Chats resume when it resets at \(at)."), "the one-seat waiting line, as the menu says the reset now: \(h.notice)")
         h.check(h.claude.notifications.isEmpty, "no notification with one seat: \(h.claude.notifications)")
         h.check(h.claude.actions.isEmpty, "no switch attempt: \(h.claude.actions)")
     },
