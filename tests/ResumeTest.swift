@@ -68,7 +68,7 @@ struct ResumeTest {
                             if firstOpened[id] == nil { firstOpened[id] = clock.now }
                             tell("open \(id)", answer: "shown: \(id)")
                         },
-                        pids: { [pid] }, running: { _ in false }, trace: { traced.append($0) },
+                        pids: { [pid] }, trace: { traced.append($0) },
                         idleSeconds: { 3600 }, clock: clock.resumeClock)
         }
 

@@ -155,6 +155,11 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     private var quitOn: StandSeat?
     /// Chats Claude is running when it quits: it logs each as cut off by the quit (F3 CutByQuit).
     var cutOnQuit: Set<String> = []
+    /// Chats with background tasks, such as subagents, still running when Claude quits, with how
+    /// many, whatever their own turn is doing. As Claude does, a quit writes `armedWorkAtQuit` into
+    /// each one's record, and the next start replaces it with `lostWorkUntold` and logs how many
+    /// restored chats lost work. The quit stops the tasks, so the set empties.
+    var backgroundTasksOnQuit: [String: Int] = [:]
     /// The next launch opens on this pair, whatever sign-in was loaded.
     var opensAsOnce: StandSeat?
     /// False: a Quit anyway press lands, but the prompt stays and Claude keeps running.
@@ -262,12 +267,36 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     }
 
     /// A chat record in a seat's folder.
-    func addChat(_ id: String, in seat: StandSeat, lastActivity: Date) {
-        let dir = dataDir.appendingPathComponent(ClaudeFiles.sessions).appendingPathComponent(seat.account).appendingPathComponent(seat.org)
+    func addChat(_ id: String, in seat: StandSeat, lastActivity: Date, title: String = "chat") {
+        let dir = folder(seat)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let rec: [String: Any] = [ClaudeFiles.sessionId: id, ClaudeFiles.title: "chat", ClaudeFiles.isArchived: false,
+        let rec: [String: Any] = [ClaudeFiles.sessionId: id, ClaudeFiles.title: title, ClaudeFiles.isArchived: false,
                                   ClaudeFiles.lastActivityAt: lastActivity.timeIntervalSince1970 * 1000]
         try? JSONSerialization.data(withJSONObject: rec).write(to: dir.appendingPathComponent("\(id).json"))
+    }
+
+    private func folder(_ seat: StandSeat) -> URL {
+        dataDir.appendingPathComponent(ClaudeFiles.sessions).appendingPathComponent(seat.account).appendingPathComponent(seat.org)
+    }
+
+    /// Changes one chat's record in a seat's folder, as Claude rewrites it; a chat not there is left alone.
+    func editChat(_ id: String, in seat: StandSeat, _ change: (inout [String: Any]) -> Void) {
+        let url = folder(seat).appendingPathComponent("\(id).json")
+        guard let data = try? Data(contentsOf: url), var rec = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        change(&rec)
+        try? JSONSerialization.data(withJSONObject: rec).write(to: url)
+    }
+
+    /// Claude moves a chat's last-activity time without running a turn in it, as it does when it
+    /// writes to the chat's record after a relaunch.
+    func touchActivity(_ id: String, in seat: StandSeat) {
+        editChat(id, in: seat) { $0[ClaudeFiles.lastActivityAt] = clock.now().timeIntervalSince1970 * 1000 }
+    }
+
+    /// The line Claude logs at a start that found chats whose work the last quit stopped, as its
+    /// main.log has it (LocalSessionManager, 2026-11-24 22:36:42: one chat).
+    static func lostWorkLine(_ n: Int) -> String {
+        "[LocalSessionManager] \(n) restored session(s) lost /loop or background work to the previous quit"
     }
 
     /// The chat ids in a seat's folder.
@@ -318,6 +347,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         // A newly started Claude prints the Mac's zone.
         let p: pid_t = lock.withLock { nextPid += 1; pid = nextPid; held = nil; runsOn = seat; printZone = nil; return nextPid }
         log("\(ClaudeLog.appStart) }")
+        if let seat { restoreLostWork(in: seat) }
         guard let seat else {
             if let who = signsInAs { clock.after(60) { [weak self] in self?.signIn(who, pid: p) } }
             return
@@ -355,6 +385,16 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         guard was.pid != nil else { return }
         if !crashed {
             for chat in cutOnQuit.sorted() { log("\(ClaudeLog.unhealthyCycle)\(chat) (40s, \(ClaudeLog.quitReason))") }
+            if let seat = was.seat ?? lock.withLock({ runsOn }) {
+                let at = clock.now().timeIntervalSince1970 * 1000
+                for (chat, tasks) in lock.withLock({ backgroundTasksOnQuit }) {
+                    editChat(chat, in: seat) {
+                        $0[ClaudeFiles.armedWorkAtQuit] = ["at": at, "exitKind": "quit", "cronCount": 0, "durableCronCount": 0,
+                                                           ClaudeFiles.backgroundTaskCount: tasks]
+                    }
+                }
+            }
+            lock.withLock { backgroundTasksOnQuit = [:] }
         }
         if !crashed, writeMark(in: cookies) != nil {
             let mark = nextMark("quit")
@@ -362,6 +402,20 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
             if let seat = was.seat { lock.withLock { quitMarks[seat] = mark } }
         }
         lock.withLock { quitOn = held ?? runsOn; pid = nil; held = nil; runsOn = nil; promptOpen = false }
+    }
+
+    /// At start, Claude turns each restored chat's `armedWorkAtQuit` into `lostWorkUntold` and
+    /// logs how many there were.
+    private func restoreLostWork(in seat: StandSeat) {
+        var n = 0
+        for id in chats(in: seat).sorted() {
+            editChat(id, in: seat) { rec in
+                guard rec.removeValue(forKey: ClaudeFiles.armedWorkAtQuit) != nil else { return }
+                rec["lostWorkUntold"] = true
+                n += 1
+            }
+        }
+        if n > 0 { log(Self.lostWorkLine(n)) }
     }
 
     func pids() -> [pid_t] {

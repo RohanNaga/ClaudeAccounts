@@ -265,9 +265,10 @@ struct ResumeClock {
     var sleep: (TimeInterval) async -> Void = { await World.sleep($0) }
 }
 
-/// Gets every chat a quit cut off or a usage limit stopped running again after a switch: lets
-/// Claude resume the ones it marked, then opens each chat still idle, one at a time, waits for it
-/// to load, and sends it the message once, waiting for the turn to start before the next. A chat
+/// Gets every chat a quit or a usage limit stopped running again after a switch: opens each one,
+/// one at a time, waits for it to load, gives a chat Claude marked as cut off a moment to resume
+/// by itself, and sends a chat still idle the message once, waiting for the turn to start before
+/// the next. A chat counts as running only once Stop shows in it. A chat
 /// that isn't running after a pass is tried again on ResumeRule's schedule while nobody is using
 /// the Mac, until it runs or someone types in it. What it touches in Claude is passed in, so the
 /// fixture test drives the same loop.
@@ -276,8 +277,6 @@ struct ChatResumer {
     var open: (String) async -> Void
     /// Claude's process ids, whose windows are searched.
     var pids: () -> [pid_t]
-    /// Claude's own record shows the chat ran after the switch.
-    var running: (MovedChat) -> Bool
     var progress: (String) -> Void = { _ in }
     /// Each step it takes, for the app's resume log and `--test-resume`.
     var trace: (String) -> Void = { _ in }
@@ -339,9 +338,11 @@ struct ChatResumer {
     /// One try at one chat, or nil when this pass leaves it alone because someone is using the Mac
     /// and Claude shows another chat.
     private func attempt(_ chat: MovedChat, pass: Int, sentBefore: Bool) async -> (result: ResumeRule.Result, sent: Bool)? {
-        if running(chat) { return (sentBefore ? .sent : .running, false) }
-        // One message per chat per run: once it was sent, only its turn starting is looked for.
-        if sentBefore { return (.notResumed(Self.noReply), false) }
+        // One message per chat per run: once it was sent, only Stop showing in it is looked for.
+        if sentBefore {
+            let started = World.claude.chatScreen(session: chat.id, in: pids())?.busy == true
+            return (started ? .sent : .notResumed(Self.noReply), false)
+        }
         guard trusted() else { return (.notResumed("Claude Accounts has no Accessibility access"), false) }
         guard !pids().isEmpty else { return (.notResumed("Claude isn't open"), false) }
         World.claude.exposeWebContent(of: pids())
@@ -379,13 +380,10 @@ struct ChatResumer {
                 case .draft: return (.draft, false)
                 case .refused(let why): return (.notResumed(why), false)
                 case .pressed:
-                    var how = ""
                     let started = await poll(ResumeRule.startWait, every: 0.25) {
-                        if World.claude.chatScreen(session: chat.id, in: pids())?.busy == true { how = "Stop appeared"; return true }
-                        if running(chat) { how = "Claude recorded new activity in the chat"; return true }
-                        return false
+                        World.claude.chatScreen(session: chat.id, in: pids())?.busy == true
                     }
-                    trace(started ? "its turn started: \(how)" : "no turn started within \(Int(ResumeRule.startWait)) s")
+                    trace(started ? "its turn started: Stop appeared" : "no turn started within \(Int(ResumeRule.startWait)) s")
                     return (started ? .sent : .notResumed(Self.noReply), true)
                 }
             }

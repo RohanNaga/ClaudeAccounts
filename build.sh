@@ -5,16 +5,28 @@
 #
 # The new app is built, signed and checked beside the installed one before anything is replaced,
 # so a build that fails leaves the installed app, and a running copy of it, as they were.
+#
+# build.sh --release DIR builds a copy for a public download into DIR instead (release.sh uses it).
+# That copy is always signed ad hoc, since the local identity is this Mac's own, and the installed
+# app and a running copy of it are never touched.
 set -euo pipefail
 
-VERSION="0.3.0"
-BUILD="12"
+VERSION="0.4.1"
+BUILD="14"
 ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 APP="$ROOT/Claude Accounts.app"
 BIN="$APP/Contents/MacOS/ClaudeAccounts"
 # The new build and the set-aside old one stay on the same volume as $APP, so each swap is a rename.
 NEW="$ROOT/.build-cache/new.app"
 OLD="$ROOT/.build-cache/old.app"
+RELEASE=false
+if [ "${1:-}" = "--release" ]; then
+  [ -n "${2:-}" ] || { echo "build.sh --release needs a folder to build into." >&2; exit 1; }
+  RELEASE=true
+  mkdir -p "$2"
+  NEW="$(cd "$2" && pwd -P)/Claude Accounts.app"
+  [ "$NEW" != "$APP" ] || { echo "build.sh --release builds beside this folder's app, never over it." >&2; exit 1; }
+fi
 
 # Stop with one line saying why.
 fail() {
@@ -124,8 +136,12 @@ PLIST
 
 # Sign with the fixed local identity from scripts/make-signing-identity.sh when it exists, so the
 # Accessibility permission survives rebuilds; otherwise ad hoc, which macOS also runs locally.
+# A release copy is always ad hoc: the local identity must never reach a public download.
 IDENTITY="Claude Accounts Local Signing"
-if security find-identity -p codesigning | grep -qF "\"$IDENTITY\""; then
+if [ "$RELEASE" = true ]; then
+  echo "Signing ad hoc (a release copy never uses the local identity)"
+  codesign --force --sign - "$NEW" || fail "The release copy could not be signed."
+elif security find-identity -p codesigning | grep -qF "\"$IDENTITY\""; then
   echo "Signing with: $IDENTITY"
   codesign --force --sign "$IDENTITY" "$NEW" || fail "The new build could not be signed, so the installed app was left as it was."
 else
@@ -133,6 +149,12 @@ else
   codesign --force --sign - "$NEW" || fail "The new build could not be signed, so the installed app was left as it was."
 fi
 codesign --verify --strict "$NEW" || fail "The new build's signature does not verify, so the installed app was left as it was."
+
+# A release copy stops here: it never replaces this folder's app or touches a running copy.
+if [ "$RELEASE" = true ]; then
+  echo "Built: $NEW"
+  exit 0
+fi
 
 # An ad hoc requirement is a hash that changes with every build, so it has no permission to keep.
 # Any other must stay the same, or the installed app's Accessibility permission would be lost.
