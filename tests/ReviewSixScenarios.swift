@@ -45,7 +45,9 @@ let reviewSixScenarios: [Scenario] = [
         h.click("Alpha")
         await h.run(until: { !h.switchInFlight }, limit: 5 * 60)
         let failed = h.notice
-        h.check(failed.first == "Claude didn't quit, so nothing changed. It won't try again until Claude reopens or Auto-Switch is turned off and on.", "the hand Switch says why it failed, and that it won't try again by itself: \(h.seen)")
+        h.check(failed == ["Claude didn't quit. Auto-Switch waits until Claude reopens.",
+                           "Claude didn't quit, so nothing changed. It won't try again until Claude reopens or Auto-Switch is turned off and on."],
+                "the hand Switch says it failed and that Auto-Switch waits, the full sentence on hover: \(h.seen)")
         await h.pass(10)
         h.check(h.notice == failed, "the failure line stays: was \(failed), now \(h.notice)")
         await h.pass(20 * 60)
@@ -59,7 +61,9 @@ let reviewSixScenarios: [Scenario] = [
         let quits = h.quits
         h.click("Alpha")
         await h.run(until: { !h.switchInFlight }, limit: 5 * 60)
-        h.check(h.notice.first == "Switch cancelled. It won't try again until Claude reopens or Auto-Switch is turned off and on.", "the line says the switch was cancelled and won't try again by itself: \(h.seen)")
+        h.check(h.notice == ["Switch cancelled. Auto-Switch waits until Claude reopens.",
+                             "Switch cancelled. It won't try again until Claude reopens or Auto-Switch is turned off and on."],
+                "the line says the switch was cancelled and Auto-Switch waits, the full sentence on hover: \(h.seen)")
         await h.pass(20 * 60)
         h.check(h.quits == quits + 1 && h.claude.held == B, "after the person cancels, nothing asks Claude to quit again by itself: \(h.seen)")
         h.check(!h.claude.actions.contains("pressed \(ClaudeUI.quitAnyway)"), "and nothing presses Quit anyway: \(h.claude.actions)")

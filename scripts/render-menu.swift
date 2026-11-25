@@ -175,6 +175,22 @@ func readmeFacts() -> Facts {
     return f
 }
 
+/// The README's seats with the longest seat name in the fixtures, Work · Northwind Research, as the
+/// only other way on: Work · Northwind Labs is in use and out with a chat stopped, every other seat
+/// reads out, and Claude's last word on Northwind Research is a refusal.
+func refusedOnlyOtherFacts() -> Facts {
+    var f = readmeFacts()
+    let labs = f.rows[0].seat, research = f.rows[2].seat
+    f.saved.insert(research)
+    f.log = ClaudeEvents()
+    f.log.read([logLine(at(12, 0), research), logAt(at(12, 1), "\(ClaudeLog.refusal) \(ClaudeLog.orgField)\(research.org)"),
+                logLine(at(13, 0), labs)].joined(separator: "\n"), readAt: at(13, 0))
+    f.log.read(limitStop(now.addingTimeInterval(-3 * 60), "local_build"), readAt: now.addingTimeInterval(-3 * 60), arrived: true)
+    let fresh = now.addingTimeInterval(-2 * 60)
+    for r in f.rows { f.meters[r.seat] = m(r.seat == research ? 20 : 100, at(16, 10), 40, thursday9, read: fresh) }
+    return f
+}
+
 // MARK: - Drawing
 
 struct Shot: View {
@@ -317,6 +333,17 @@ enum RenderMenu {
                  failure: "Didn't switch to Alpha · Research. \(AutoSwitch.afterFailureShort)",
                  failureDetail: "Didn't switch to Alpha · Research: Claude didn't quit, so nothing changed. Its prompt is still open: Cancel keeps Claude as it is. \(AutoSwitch.afterQuitFailure)")
         })
+        // The lines a switch by hand stopped at its quit leaves while Auto-Switch is on, as the Store
+        // sets them, and the line for a refused seat that is the only other way on.
+        both("notice-hand-cancelled", Screen(visible: nil) {
+            Shot(refusedOnlyOtherFacts(), visible: 900, failure: "\(SwitchOutcome.QuitStop.cancelled.rawValue) \(AutoSwitch.waitsUntilReopen)",
+                 failureDetail: "Switch cancelled. \(AutoSwitch.pausedUntil)")
+        })
+        both("notice-hand-quit-failed", Screen(visible: nil) {
+            Shot(refusedOnlyOtherFacts(), visible: 900, failure: "\(SwitchOutcome.QuitStop.failed.rawValue) \(AutoSwitch.waitsUntilReopen)",
+                 failureDetail: "Claude didn't quit, so nothing changed. \(AutoSwitch.pausedUntil)")
+        })
+        both("notice-refused-only-other", Screen(visible: nil) { Shot(refusedOnlyOtherFacts(), visible: 900) })
         render(Screen(visible: nil) { Shot(facts(.noAccessibility, order: .topToBottom), visible: 900) }, dark: false,
                to: "\(out)/notice-accessibility-light.png")
         both("overflow-24-seats-900pt", Screen(visible: 900) { Shot(overflowFacts(), visible: 900, header: MenuHeader(updatedAt: now)) })
