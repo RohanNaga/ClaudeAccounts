@@ -1645,6 +1645,9 @@ final class Store: ObservableObject {
         if let s = success, s.until <= now { success = nil }
         if let until = noteUntil, until <= now { noteUntil = nil; switchingTo?.note = nil }
         seats = Seats.build(f, now: now)
+        var kept = settings
+        kept.keepMenuState(for: seats.map(\.id))
+        if kept != settings { settings = kept }
         let snap = Diagnostics.snapshot(f, seats: seats, decision: AutoSwitch.decide(f, now: now), now: now)
         for (kind, fields) in Diagnostics.changes(from: logged, to: snap) { Diagnostics.record(kind, fields) }
         logged = snap
@@ -1970,6 +1973,12 @@ final class Store: ObservableObject {
     /// (model, section 10).
     func setShowsOrganizations(of account: String, _ shown: Bool) {
         settings.setShowsOrganizations(of: account, shown)
+    }
+
+    /// Open a seat's row to both meters, or close it to one line; settings.json keeps it through
+    /// every refresh, every closing of the menu and every launch.
+    func setShowsMeters(of seat: Seat, _ shown: Bool) {
+        settings.setShowsMeters(of: seat.id, shown)
     }
 
     /// Move a seat one place up (-1) or down (1): an organization among its account's, any other

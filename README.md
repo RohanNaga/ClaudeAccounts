@@ -145,8 +145,9 @@ on the seat after a stop shows Claude still serves it, so that stop no longer
 counts. The app reads the seat a minute after a stop, then every 5 minutes,
 so in practice a stop counts when the seat first reads 100 within 10 to 15
 minutes of it. When the seat in use reads 100 percent and no chat is stopped,
-or the stop came before the app started, nothing is quit: the row shows the full meter, the notice says "In use reads 100%. It
-switches when Claude stops a chat.", and the switch comes when Claude stops a
+or the stop came before the app started, nothing is quit: the row says "Out"
+with that meter's reset beside **In use**, the notice says "In use reads 100%.
+It switches when Claude stops a chat.", and the switch comes when Claude stops a
 chat. A stop on a seat that reads with room never starts a switch either:
 Claude can stop a chat for a limit the seat's meters don't show, and the seat
 then stays as it reads. After an automatic switch, whether it worked or not,
@@ -308,10 +309,11 @@ uninstall, remove your rows, quit the app, and delete it and the
 The title bar and one notice line stay in place, and the rows scroll. The menu
 is never taller than the screen, and it opens on the seat in use.
 
-- A ready or out seat is one line: its name, the fuller meter with its percent,
-  "Out" with its reset time when out, and **Switch**. Click the name to see both
-  meters.
-- The seat in use shows both meters with their resets.
+- A ready seat is one line: its name, the fuller meter with its percent, and
+  **Switch**. An out seat says "Out" with its reset time in place of the meter.
+  Click the name to see both meters.
+- The seat in use shows both meters with their resets. When it is out, it also
+  says "Out" with its reset time beside **In use**.
 - **Next** marks the seat the automatic switch would go to.
 - An account in several organizations, like a personal plan and a team, is one
   card with a row per organization. Its own personal organization shows as

@@ -175,6 +175,68 @@ func readmeFacts() -> Facts {
     return f
 }
 
+/// The menu in Rohan's build-11 screenshot: 9 seats on 6 accounts. Personal 2 is in use, Sam
+/// Work's Individual is out, and its RapidEye seat was never signed in.
+let ninePeople = [
+    row(1, account: 1, name: "Personal", orgName: "personal@example.com's Organization"),
+    row(2, account: 2, name: "Work", orgName: "work@example.com's Organization"),
+    row(3, account: 2, name: "Work", orgName: "RapidEye"),
+    row(4, account: 3, name: "Support", orgName: "support@example.com's Organization"),
+    row(5, account: 3, name: "Support", orgName: "RapidEye"),
+    row(6, account: 4, name: "School", orgName: "school@example.edu's Organization"),
+    row(7, account: 5, name: "Personal 2", orgName: "personal2@example.com's Organization"),
+    row(8, account: 6, name: "Sam Work", orgName: "sam@example.com's Organization"),
+    row(9, account: 6, name: "Sam Work", orgName: "RapidEye"),
+].labelled()
+
+func nineFacts(extra: Bool = false) -> Facts {
+    var f = Facts()
+    f.rows = ninePeople
+    f.claude = ClaudeFacts(installed: true, running: true, missing: [])
+    f.log.read(logLine(at(13, 0), ninePeople[6].seat), readAt: at(13, 0))
+    f.trusted = true
+    let fresh = now.addingTimeInterval(-2 * 60)
+    f.saved = Set(ninePeople.filter { $0.id != "r9" }.map(\.seat))
+    let readings: [(Double, Double)] = [(18, 33), (42, 51), (9, 12), (27, 40), (63, 22), (5, 71), (58, 46), (100, 64)]
+    for (r, p) in zip(ninePeople.prefix(8), readings) {
+        f.meters[r.seat] = m(p.0, at(16, 10 + Int(p.0) % 40), p.1, thursday9, read: fresh)
+    }
+    if extra {
+        let before = ["Gamma", "Delta", "Echo", "Fern", "Grove", "Harbor", "Iris", "Juniper"]
+        let after = ["Kestrel", "Lumen", "Maple", "Nova", "Orbit", "Pine", "Quartz", "Reed"]
+        let more = { (names: [String], start: Int) in
+            names.enumerated().map { i, n in row(start + i, account: start + i, name: n, orgName: "\(n.lowercased())@example.com's Organization") }
+        }
+        f.rows = (more(before, 20) + ninePeople + more(after, 40)).labelled()
+        for (i, r) in f.rows.enumerated() where f.meters[r.seat] == nil && r.id != "r9" {
+            f.saved.insert(r.seat)
+            let p = Double((i * 37) % 90)
+            f.meters[r.seat] = m(p, at(17, 0), p / 2, thursday9, read: fresh)
+        }
+    }
+    return f
+}
+
+/// `f` with `seat` reading 100 on its 5-hour meter (resetting 4:10 PM) or its weekly one (Thursday)
+/// on a fresh reading, and no chat stopped.
+func readsFull(_ f: Facts, _ seat: Identity, weekly: Bool = false) -> Facts {
+    var f = f
+    let old = f.meters[seat]
+    f.meters[seat] = weekly ? m(old?.fiveHour?.percent ?? 40, at(16, 10), 100, thursday9, read: now.addingTimeInterval(-2 * 60))
+                            : m(100, at(16, 10), old?.weekly?.percent ?? 40, thursday9, read: now.addingTimeInterval(-2 * 60))
+    return f
+}
+
+/// The README's seats with the longest seat name in the fixtures, Work · Northwind Research, set up,
+/// in use from 1:30 PM, and reading full.
+func longestNameFacts() -> Facts {
+    var f = readmeFacts()
+    let seat = f.rows[2].seat
+    f.saved.insert(seat)
+    f.log.read(logLine(at(13, 30), seat), readAt: at(13, 30))
+    return readsFull(f, seat)
+}
+
 /// The README's seats with the longest seat name in the fixtures, Work · Northwind Research, as the
 /// only other way on: Work · Northwind Labs is in use and out with a chat stopped, every other seat
 /// reads out, and Claude's last word on Northwind Research is a refusal.
@@ -200,13 +262,16 @@ struct Shot: View {
     let header: MenuHeader
     let looks: MenuLooks
 
+    /// `expanded` names the rows opened to both meters; `folded`, the accounts whose organizations are hidden.
     init(_ f: Facts, visible: CGFloat, header: MenuHeader = MenuHeader(updatedAt: now.addingTimeInterval(-120)),
-         failure: String? = nil, failureDetail: String? = nil) {
+         expanded: [String] = [], folded: [String] = [], failure: String? = nil, failureDetail: String? = nil) {
         seats = Seats.build(f, now: now)
         notice = AppState.notice(f, now: now, failure: failure, failureDetail: failureDetail)
         self.visible = visible
         self.header = header
-        looks = MenuLooks(colors: resolvedColors(f.rows.map { ($0.seat.account, $0.color) }))
+        looks = MenuLooks(colors: resolvedColors(f.rows.map { ($0.seat.account, $0.color) }),
+                          folded: Set(seats.filter { folded.contains($0.accountName) }.map(\.id.account)),
+                          expanded: Set(seats.filter { expanded.contains($0.name) }.map(\.id)))
     }
 
     var body: some View {
@@ -347,6 +412,35 @@ enum RenderMenu {
         render(Screen(visible: nil) { Shot(facts(.noAccessibility, order: .topToBottom), visible: 900) }, dark: false,
                to: "\(out)/notice-accessibility-light.png")
         both("overflow-24-seats-900pt", Screen(visible: 900) { Shot(overflowFacts(), visible: 900, header: MenuHeader(updatedAt: now)) })
+
+        // Rohan's nine seats with rows opened to both meters: none, one, and several (a seat alone,
+        // an organization, and the out seat), then a list taller than the screen with rows opened.
+        let opened: [(String, [String])] = [("collapsed", []), ("one-expanded", ["Personal"]),
+                                            ("several-expanded", ["Personal", "Work · RapidEye", "Sam Work · Individual"])]
+        for v: CGFloat in [900, 1400] {
+            for (state, rows) in opened {
+                both("nine-\(Int(v))pt-\(state)", Screen(visible: v) { Shot(nineFacts(), visible: v, expanded: rows) })
+            }
+        }
+        // The seat in use reads full with no chat stopped: its row says Out beside In use.
+        let personal2 = ninePeople[6].seat
+        for v: CGFloat in [900, 1400] {
+            both("nine-\(Int(v))pt-in-use-out", Screen(visible: v) { Shot(readsFull(nineFacts(), personal2), visible: v) })
+        }
+        both("nine-900pt-in-use-out-weekly", Screen(visible: 900) {
+            Shot(readsFull(nineFacts(), personal2, weekly: true), visible: 900, expanded: ["Personal", "Sam Work · Individual"])
+        })
+        both("in-use-out-longest-name", Screen(visible: nil) { Shot(longestNameFacts(), visible: 900) })
+        both("in-use-out-folded", Screen(visible: nil) { Shot(longestNameFacts(), visible: 900, folded: ["Work"]) })
+        // Two seats, the smallest menu, where an out row's name has the least room.
+        func twoFacts(_ f0: Facts) -> Facts { var f = f0; let keep = [ninePeople[0], ninePeople[6]]; f.rows = keep; f.saved = Set(keep.map(\.seat)); return f }
+        both("two-collapsed", Screen(visible: nil) { Shot(twoFacts(nineFacts()), visible: 900) })
+        both("two-expanded", Screen(visible: nil) { Shot(twoFacts(nineFacts()), visible: 900, expanded: ["Personal"]) })
+        both("two-both-out-expanded", Screen(visible: nil) { Shot(twoFacts(readsFull(readsFull(nineFacts(), personal2), ninePeople[0].seat)), visible: 900, expanded: ["Personal"]) })
+        both("nine-overflow-900pt-expanded", Screen(visible: 900) {
+            Shot(nineFacts(extra: true), visible: 900, header: MenuHeader(updatedAt: now),
+                 expanded: ["Personal", "Work · RapidEye", "Support · Individual", "School", "Sam Work · Individual"])
+        })
 
         // The title's ··· menu open on Switch Order. SwiftUI fills a Menu's NSMenu only when it opens
         // on screen, so the title bar's own items are built into an NSHostingMenu to read their real

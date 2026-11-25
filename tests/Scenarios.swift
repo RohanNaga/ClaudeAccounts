@@ -1,4 +1,5 @@
-import Foundation
+import AppKit
+import SwiftUI
 import Darwin
 
 /// Live child processes of this test (the app runs sqlite3 as one). Called with no buffer,
@@ -47,6 +48,11 @@ struct Scenario {
     let claude: StandInClaude
     let usage = StandInUsage()
     var store: Store!
+    /// The menu's window and its drawing, kept between openings as the menu bar keeps them. Made
+    /// only by a scenario that opens the menu, so no other scenario starts AppKit.
+    lazy var menuWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: MenuLayout.width, height: 400),
+                              styleMask: [.borderless], backing: .buffered, defer: true)
+    var menuHost: NSHostingView<MenuContent>?
     private(set) var failures: [String] = []
     var checks = 0
 
@@ -835,6 +841,88 @@ let scenarios: [Scenario] = [
         let top = h.cardTop("Row 25")
         h.check(top.map { $0 > m.height - m.pinned } == true, "Row 25's card starts below the unscrolled cards: at \(String(describing: top)) of a \(m.height - m.pinned) pt viewport")
         h.check(h.openScrollCard?.contains("Row 25") == true, "the menu opens scrolled to Row 25's card: it scrolls to \(String(describing: h.openScrollCard))")
+    },
+    Scenario(pair: "(Menu, a row opened to both meters)", model: "10: a row's name or chevron opens it to both meters; it stays open through refreshes, closing the menu and a relaunch, until the person closes it") { h in
+        let delta1 = StandSeat(4, org: 1), delta2 = StandSeat(4, org: 2)
+        let all = [("Alpha", A), ("Beta", B), ("Gamma", C), ("Delta", delta1), ("Delta", delta2)]
+        try? h.rows(all, orgNames: ["Team", "Team", "Team", "Studio", "Labs"])
+        // Alpha's login is saved last, so Claude opens on it.
+        for (n, seat) in all.dropFirst() + all.prefix(1) { try? await h.savedLogin(n, seat) }
+        let reset = h.clock.now().addingTimeInterval(3 * 3600)
+        for seat in [A, B, delta1, delta2] { h.usage.set(seat, fiveHour: 20, resetsAt: reset) }
+        h.usage.set(C, fiveHour: 100, resetsAt: reset)
+        h.claudeHoldsSettled(); h.make(); await h.tick(); await h.settle()
+        h.check(h.state("Alpha") == .inUse && h.state("Gamma") == .out, "setup: Alpha in use, Gamma out: \(String(describing: h.state("Alpha"))), \(String(describing: h.state("Gamma")))")
+        h.check(!h.hasChevron("Alpha"), "the row in use, which always shows its meters, has no chevron")
+        h.check(["Beta", "Gamma", "Delta · Studio", "Delta · Labs"].allSatisfy(h.hasChevron), "every other read row has one: a seat alone, an out seat, and organizations in an account")
+
+        await h.openMenu()
+        h.menuShowsOpened([], "a new seat starts closed")
+        h.pressName("Beta")
+        h.menuShowsOpened(["Beta"], "clicking Beta's name opens it")
+        await h.pass(3 * h.tickEvery)
+        h.menuShowsOpened(["Beta"], "it stays open through three refresh ticks")
+        h.closeMenu(); await h.openMenu()
+        h.menuShowsOpened(["Beta"], "and through closing and reopening the menu")
+        h.pressName("Gamma"); h.pressName("Delta · Labs")
+        h.menuShowsOpened(["Beta", "Gamma", "Delta · Labs"], "several rows stay open at once, the out seat and an organization among them")
+        h.pressAccount("Delta · Labs")
+        h.menuShowsOpened(["Beta", "Gamma"], "folding Delta's organizations hides its opened one")
+
+        h.closeMenu(); h.crashApp(); await h.tick(); await h.settle(); await h.openMenu()
+        h.menuShowsOpened(["Beta", "Gamma"], "a relaunch keeps the opened rows and the folded account")
+        h.pressAccount("Delta · Labs")
+        h.menuShowsOpened(["Beta", "Gamma", "Delta · Labs"], "showing Delta again shows Labs still open")
+        h.pressName("Beta")
+        h.menuShowsOpened(["Gamma", "Delta · Labs"], "clicking Beta's name again closes it")
+
+        // A seat that goes is forgotten, so the same seat added again starts closed.
+        h.remove("Gamma")
+        await h.run(until: { !h.rowNames.contains("Gamma") }, limit: 60)
+        try? h.rows(all, orgNames: ["Team", "Team", "Team", "Studio", "Labs"])
+        await h.run(until: { h.hasChevron("Gamma") }, limit: 600)
+        h.menuShowsOpened(["Delta · Labs"], "Gamma, added again and read, starts closed")
+    },
+    Scenario(pair: "(Menu, the seat in use reads full with no chat stopped)", model: "3 and 10: the row in use says Out with its full meter's reset beside In use, from a fresh reading only; folded, its account says the same") { h in
+        let labs = StandSeat(1, org: 0)
+        let all = [("Alpha", A), ("Alpha", labs), ("Beta", B)]
+        try? h.rows(all, orgNames: ["Team", "Labs", "Team"])
+        // Alpha · Team's login is saved last, so Claude opens on it.
+        for (n, seat) in [("Alpha", labs), ("Beta", B), ("Alpha", A)] { try? await h.savedLogin(n, seat) }
+        for seat in [A, labs, B] { h.usage.set(seat, fiveHour: 20, resetsAt: h.now.addingTimeInterval(3 * 3600)) }
+        h.claude.addChat("local_one", in: A, lastActivity: h.now)
+        h.claudeHoldsSettled(); h.make(); await h.tick(); await h.settle()
+        await h.openMenu()
+        h.check(h.state("Alpha · Team") == .inUse && !h.drawnTexts.contains { $0.hasPrefix("Out") },
+                "setup: Alpha · Team in use with room, nothing out: \(String(describing: h.state("Alpha · Team"))), \(h.drawnTexts)")
+
+        let reset = h.now.addingTimeInterval(2 * 3600)
+        h.usage.set(A, fiveHour: 100, resetsAt: reset)
+        await h.pass(2 * ClaudeTiming.meterEvery)
+        let today = "Out · \(shortReset(reset, now: h.now, dayOnly: true) ?? "?")"
+        h.check(h.state("Alpha · Team") == .inUse && h.claude.actions.isEmpty, "Alpha · Team stays in use, Claude untouched: \(String(describing: h.state("Alpha · Team"))), \(h.claude.actions)")
+        h.check(h.drawnBeforeInUse(today), "the row says \(today) beside In use: \(h.drawnTexts)")
+        h.check(h.drawnTexts.contains { $0.hasPrefix("In use, out, resets ") }, "VoiceOver reads the row as in use and out: \(h.drawnTexts)")
+
+        h.pressAccount("Alpha · Team")
+        h.check(h.drawnBeforeInUse(today) && !h.drawnTexts.contains { $0.hasPrefix("In use, out") },
+                "folded, the account says \(today) beside In use: \(h.drawnTexts)")
+        h.pressAccount("Alpha · Team")
+
+        // A full weekly meter says its own reset, on another day, not the 5-hour meter's.
+        h.usage.set(A, fiveHour: 40, weekly: 100, resetsAt: reset)
+        await h.pass(2 * ClaudeTiming.meterEvery)
+        let weekly = h.seat("Alpha · Team")?.meters.weekly?.resetsAt
+        let later = "Out · \(weekly.flatMap { shortReset($0, now: h.now, dayOnly: true) } ?? "?")"
+        h.check(weekly.map { !Calendar.current.isDate($0, inSameDayAs: h.now) } == true && h.drawnBeforeInUse(later) && !h.drawnTexts.contains(today),
+                "the weekly meter's reset, a later day, shows as \(later): \(h.drawnTexts)")
+
+        // The usage service stalls past freshness: a stale reading says its age and nothing out.
+        h.usage.busy(A, until: h.now.addingTimeInterval(2 * Limits.freshness))
+        await h.pass(Limits.freshness + ClaudeTiming.meterEvery)
+        h.check(h.meterText("Alpha · Team") != nil, "setup: Alpha · Team's reading is stale: \(String(describing: h.meterText("Alpha · Team")))")
+        h.check(!h.drawnTexts.contains { $0.hasPrefix("Out") } && h.drawnTexts.contains { $0.hasPrefix("Read ") } && h.drawnTexts.contains("In use"),
+                "a stale reading shows its age and In use, nothing out: \(h.drawnTexts)")
     },
     // Section 6 steps, section 8 invariants and section 9 cases.
     Scenario(pair: "(Switch step 2, quit prompt cancelled)", model: "\"Switch cancelled\", nothing changed") { h in
