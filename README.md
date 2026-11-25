@@ -174,12 +174,12 @@ seat, until Claude reopens, you switch by hand, or Auto-Switch is turned off
 and on. The notice reads the same line, and its full sentence on hover and the
 notification say why and that it won't try again.
 
-It goes down the menu from the seat in use, wrapping round to the top, and
-picks the first seat that is ready, has a reading from the last 15 minutes, and
+It goes down the menu from the top, past the seat in use, and picks the first
+seat that is ready, has a reading from the last 15 minutes, and
 hasn't failed a switch in the last 10 minutes. **Move Up** and **Move Down** in
 a row's `···` menu set that order. **Switch Order** in the menu's `···` can
 instead try every **Individual** seat first (**Personal First**) or every
-organization seat first (**Organizations First**), each in menu order. The menu
+organization seat first (**Organizations First**), each from the top. The menu
 marks the seat it would go to with **Next**; when that seat's account is folded
 away, the mark is on the account's name. Because nobody is there to answer Claude's
 quit prompt, the automatic switch presses **Quit anyway** itself. It looks for

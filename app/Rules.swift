@@ -1074,18 +1074,17 @@ enum AutoSwitch {
         return Set(wait.stops.filter { f.log.stillStopped($0.key, at: $0.value) }.keys)
     }
 
-    /// The order the automatic switch tries the other seats in: down the menu from `from`,
-    /// wrapping round, with the personal seats or the organization seats first when the person
-    /// chose so. This is the only place that order is decided.
+    /// The order the automatic switch tries the other seats in: down the menu from the top, the
+    /// seat in use `from` left out, with the personal seats or the organization seats first when
+    /// the person chose so. This is the only place that order is decided.
     static func order(from: Identity, _ f: Facts) -> [Identity] {
-        let rows = f.rows.filter { $0.identity != nil }
-        guard let i = rows.firstIndex(where: { $0.identity == from }) else { return [] }
-        let round = rows[(i + 1)...] + rows[..<i]
+        guard f.rows.contains(where: { $0.identity == from }) else { return [] }
+        let others = f.rows.filter { $0.identity != nil && $0.identity != from }
         let ordered: [AccountRecord]
         switch f.order {
-        case .topToBottom: ordered = Array(round)
-        case .personalFirst: ordered = round.filter(\.isPersonal) + round.filter { !$0.isPersonal }
-        case .organizationsFirst: ordered = round.filter { !$0.isPersonal } + round.filter(\.isPersonal)
+        case .topToBottom: ordered = others
+        case .personalFirst: ordered = others.filter(\.isPersonal) + others.filter { !$0.isPersonal }
+        case .organizationsFirst: ordered = others.filter { !$0.isPersonal } + others.filter(\.isPersonal)
         }
         return ordered.compactMap(\.identity)
     }

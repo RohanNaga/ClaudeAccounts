@@ -205,6 +205,22 @@ struct Scenario {
         await tick(); await settle()
     }
 
+    /// Five rows, "Row 1" to "Row 5", one account each, every login saved and every meter fresh
+    /// with room except the rows in `out`, which read full. Claude holds Row 3 settled with one chat.
+    func fiveSeatsHoldingThird(out: Set<Int> = []) async {
+        let seats = (1...5).map { StandSeat($0, org: 1) }
+        try? rows(seats.enumerated().map { ("Row \($0.offset + 1)", $0.element) })
+        // Row 3's login is saved last, so its sign-in is the one left in Claude's files.
+        for i in [1, 2, 4, 5, 3] { try? await savedLogin("Row \(i)", seats[i - 1]) }
+        for (i, seat) in seats.enumerated() {
+            usage.set(seat, fiveHour: out.contains(i + 1) ? 100 : 20, resetsAt: clock.now().addingTimeInterval(3 * 3600))
+        }
+        claude.addChat("local_one", in: seats[2], lastActivity: clock.now())
+        claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
+        claudeHoldsSettled(); make()
+        await tick(); await settle()
+    }
+
     /// The row the menu marks Next.
     var nextRow: String? { store.seats.first(where: \.isNext)?.name }
 }
@@ -766,7 +782,7 @@ let scenarios: [Scenario] = [
     },
     // Switch order: the automatic target and the menu's Next mark follow the person's choice.
     // Down the menu from Work, Home is not set up, Lab is out, then Side (personal), Studio and Den.
-    Scenario(pair: "(Switch order never set, seat in use out)", model: "4: the first Ready seat down the menu, wrapping round, as before the setting") { h in
+    Scenario(pair: "(Switch order never set, seat in use out)", model: "4: the first Ready seat from the top of the menu, as before the setting") { h in
         await h.mixedSeats(holding: "Work", order: nil)
         h.check(h.store.settings.switchOrder == .topToBottom, "an untouched setting is Top to Bottom")
         h.check(h.nextRow == "Side", "Next marks the first Ready seat down the menu, past Home and Lab: \(String(describing: h.nextRow))")
@@ -774,7 +790,7 @@ let scenarios: [Scenario] = [
         await h.run(until: { h.claude.held != nil && h.claude.held != mixed[0].1 }, limit: 600)
         h.check(h.claude.held == mixed[3].1, "the automatic switch goes to Side: \(String(describing: h.claude.held))")
     },
-    Scenario(pair: "(Switch order personal first, seat in use out)", model: "4: personal seats first, in menu order, wrapping round; out and not set up skipped") { h in
+    Scenario(pair: "(Switch order personal first, seat in use out)", model: "4: personal seats first, each group in menu order from the top; out and not set up skipped") { h in
         await h.mixedSeats(holding: "Den", order: .personalFirst)
         h.check(h.nextRow == "Side", "Next passes Work, the first Ready seat down the menu, and Home, not set up, for Side: \(String(describing: h.nextRow))")
         h.claude.logLimitStop("local_one", seatReadsFull: true)
@@ -787,6 +803,21 @@ let scenarios: [Scenario] = [
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.run(until: { h.claude.held != nil && h.claude.held != mixed[0].1 }, limit: 600)
         h.check(h.claude.held == mixed[4].1, "the automatic switch goes where Next pointed, Studio: \(String(describing: h.claude.held))")
+    },
+    // Top to Bottom starts at the top of the menu, not below the seat in use.
+    Scenario(pair: "(Top to Bottom, seat in use third and out)", model: "4: the first Ready seat from the top of the menu, the seat in use left out") { h in
+        await h.fiveSeatsHoldingThird()
+        h.check(h.nextRow == "Row 1", "Next marks Row 1, the top of the menu, not Row 4 below the seat in use: \(String(describing: h.nextRow))")
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        await h.run(until: { h.claude.held != nil && h.claude.held != StandSeat(3, org: 1) }, limit: 600)
+        h.check(h.claude.held == StandSeat(1, org: 1), "the automatic switch goes to Row 1: \(String(describing: h.claude.held))")
+    },
+    Scenario(pair: "(Top to Bottom, top seat out, seat in use third and out)", model: "4: the first Ready seat from the top; an out seat is passed") { h in
+        await h.fiveSeatsHoldingThird(out: [1])
+        h.check(h.nextRow == "Row 2", "Next passes Row 1, out, for Row 2: \(String(describing: h.nextRow))")
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        await h.run(until: { h.claude.held != nil && h.claude.held != StandSeat(3, org: 1) }, limit: 600)
+        h.check(h.claude.held == StandSeat(2, org: 1), "the automatic switch goes to Row 2: \(String(describing: h.claude.held))")
     },
     Scenario(pair: "(Not in use, row removed)", model: "saved login and row deleted; chats stay") { h in
         h.claude.addChat("beta_chat", in: B, lastActivity: h.clock.now())
