@@ -168,10 +168,11 @@ let holdScenarios: [Scenario] = [
         h.check(h.claude.held == B && h.quits == quits && h.state("Beta") == .inUse, "Claude stays on the chosen Beta: \(h.seen)")
         h.claude.screens["local_one"]?.busy = false
         h.claude.logLimitStop("local_one", seatReadsFull: true)
-        await h.run(until: { h.claude.held == C && !h.switchInFlight && h.resumed("local_one") }, limit: 10 * 60)
-        h.check(h.claude.held == C && h.quits == quits + 1, "Claude's stop on Beta moves it to Gamma: \(h.seen)")
+        // The target is the first Ready seat from the top of the menu: Alpha, the seat left by hand.
+        await h.run(until: { h.claude.held == A && !h.switchInFlight && h.resumed("local_one") }, limit: 10 * 60)
+        h.check(h.claude.held == A && h.quits == quits + 1, "Claude's stop on Beta moves it to Alpha, the top of the menu: \(h.seen)")
         h.check(h.resumes("local_one") == 1, "\"resume\" typed once: \(h.seen)")
-        h.check(h.claude.notifications.last == "Switched to Gamma: Beta is out. 1 chat resumed.", "the person is told: \(h.seen)")
+        h.check(h.claude.notifications.last == "Switched to Alpha: Beta is out. 1 chat resumed.", "the person is told: \(h.seen)")
     },
 
     Scenario(pair: "(Click Switch back to Alpha, the Mac moves from Eastern to Pacific while Claude keeps Eastern time, the app restarts, Alpha reads 100, then Claude stops a chat)",
