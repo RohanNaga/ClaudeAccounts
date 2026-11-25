@@ -719,8 +719,10 @@ struct SwitchOutcome: Equatable {
     var detail: String? = nil
     /// Claude didn't quit and its prompt was left open: the line holds only until Claude quits or reopens.
     var promptLeftOpen = false
-    /// The switch stopped at its quit: the person cancelled it, or Claude didn't quit.
-    var quitStopped = false
+    /// The switch stopped at its quit: the person cancelled it, or Claude didn't quit. Its value is
+    /// the short line a switch by hand leaves; `text` is the full one, on hover.
+    enum QuitStop: String { case cancelled = "Switch cancelled.", failed = "Claude didn't quit." }
+    var quitStopped: QuitStop?
     /// The journal stays and waits on Claude: to open, to confirm the switch, or to close, to undo it.
     var parked = false
     /// The chats this switch set out to resume. One that did not confirm hands them back, so they
@@ -903,14 +905,14 @@ enum Switch {
         case .declined:
             SwitchJournal.clear()
             unlock()
-            return SwitchOutcome(ok: false, text: "Switch cancelled.", quitStopped: true, resume: r.resume)
+            return SwitchOutcome(ok: false, text: "Switch cancelled.", quitStopped: .cancelled, resume: r.resume)
         case .failed:
             SwitchJournal.clear()
             if ClaudeApp.pids().isEmpty { await ClaudeApp.launch() }
             unlock()
             let why = quit.promptWithoutButton ? "\(ClaudeShape.quitButton.why), so nothing changed." : "Claude didn't quit, so nothing changed."
             return SwitchOutcome(ok: false, text: why, detail: quit.promptLeftOpen ? "Its prompt is still open: Cancel keeps Claude as it is." : nil,
-                                 promptLeftOpen: quit.promptLeftOpen, quitStopped: true, resume: r.resume)
+                                 promptLeftOpen: quit.promptLeftOpen, quitStopped: .failed, resume: r.resume)
         }
         // The run that just ended names the chats that were working: cut by the quit, and for a
         // switch by hand, stopped for usage. An automatic switch takes only the chats it is for.
@@ -1023,7 +1025,7 @@ enum Switch {
         }
         do {
             if j.step == .load {
-                guard await closed(&j, r, progress: progress) else { return await rolledBack(&j, r, "Claude was opened during the switch.", progress: progress) }
+                guard await closed(&j, r, progress: progress) else { return await opened(&j, r, progress: progress) }
                 await World.claude.willStep("load")
                 progress(j.kind == .setUp ? "Opening Claude's sign-in…" : "Loading \(r.name(j.to))…")
                 try await SavedLogins.load(j.kind == .setUp ? nil : j.to)
@@ -1031,7 +1033,7 @@ enum Switch {
             }
             if j.step == .launch {
                 // A person who opened Claude since the load gets it quit once more (section 7).
-                guard await closed(&j, r, progress: progress) else { return await rolledBack(&j, r, "Claude was opened during the switch.", progress: progress) }
+                guard await closed(&j, r, progress: progress) else { return await opened(&j, r, progress: progress) }
                 j.launchedAt = World.now()
                 j.logMark = ClaudeApp.logMark()
                 try await step(&j, .confirm)
@@ -1058,6 +1060,14 @@ enum Switch {
             }
             try? await j.save()
         }
+        return await confirm(&j, r, progress: progress)
+    }
+
+    /// Claude is running from the load on. A switch is undone. A recovery reads what Claude holds,
+    /// as when it finds Claude running there at its start (`recover`): the target confirms it.
+    private static func opened(_ j: inout SwitchJournal, _ r: Request, progress: @escaping Progress) async -> SwitchOutcome {
+        guard r.recovered else { return await rolledBack(&j, r, "Claude was opened during the switch.", progress: progress) }
+        j.step = .confirm
         return await confirm(&j, r, progress: progress)
     }
 
@@ -2142,14 +2152,22 @@ final class Store: ObservableObject {
         // hold (cancelled, or Claude didn't quit) means stay: the automatic switch pauses on that
         // hold, as after a failure of its own, and the line says so. A refusal before any quit doesn't.
         let now = World.now()
-        let paused = byHand && outcome.quitStopped && fromHold != nil && log.events.hold?.key == fromHold
+        let paused = byHand && outcome.quitStopped != nil && fromHold != nil && log.events.hold?.key == fromHold
         if paused { pausedHold = fromHold }
         if outcome.parked {
             failure = nil
         } else if outcome.ok {
             if !outcome.text.isEmpty { success = (outcome.text, now + Self.successFor) }
         } else if !outcome.text.isEmpty {
-            failure = [outcome.text, outcome.detail, paused && settings.autoSwitch ? AutoSwitch.pausedUntil : nil].compactMap { $0 }.joined(separator: " ")
+            let waits = paused && settings.autoSwitch
+            let full = [outcome.text, outcome.detail, waits ? AutoSwitch.pausedUntil : nil].compactMap { $0 }.joined(separator: " ")
+            // A switch by hand stopped at its quit gets a line that fits the menu, its full sentence on hover.
+            if byHand, let stop = outcome.quitStopped {
+                failure = [stop.rawValue, waits ? AutoSwitch.waitsUntilReopen : nil].compactMap { $0 }.joined(separator: " ")
+                if full != failure { failureDetail = full }
+            } else {
+                failure = full
+            }
         }
         publish()
     }
