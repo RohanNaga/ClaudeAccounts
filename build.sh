@@ -11,8 +11,8 @@
 # app and a running copy of it are never touched.
 set -euo pipefail
 
-VERSION="0.3.0"
-BUILD="12"
+VERSION="0.4.0"
+BUILD="13"
 ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 APP="$ROOT/Claude Accounts.app"
 BIN="$APP/Contents/MacOS/ClaudeAccounts"
