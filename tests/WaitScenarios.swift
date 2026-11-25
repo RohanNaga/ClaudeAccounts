@@ -134,10 +134,12 @@ let waitScenarios: [Scenario] = [
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.pass(3 * 60)
         // The spacing runs from the decision, a few seconds before the quit.
-        let times = (0...10).map { ClockText.time(first.addingTimeInterval(Limits.autoSwitchSpacing - TimeInterval($0)), now: h.now) }
-        let lines = times.map { "Switching to Gamma at \($0)." }
-        h.check(h.notice.first.map(lines.contains) ?? false, "the notice says when the next switch comes: \(h.notice), wanted \(lines[0])")
-        h.check(times.contains { h.notice.last == "Beta is out. Switching to Gamma at \($0): automatic switches are at least 15 minutes apart." },
+        // The expected times are formatted at each check, with the clock as it is then: ClockText drops the
+        // weekday once the switch falls on a later day, so a line built before midnight is wrong after it.
+        let switchTimes: @MainActor () -> [String] = { (0...10).map { ClockText.time(first.addingTimeInterval(Limits.autoSwitchSpacing - TimeInterval($0)), now: h.now) } }
+        let switchLines: @MainActor () -> [String] = { switchTimes().map { "Switching to Gamma at \($0)." } }
+        h.check(h.notice.first.map(switchLines().contains) ?? false, "the notice says when the next switch comes: \(h.notice), wanted \(switchLines()[0])")
+        h.check(switchTimes().contains { h.notice.last == "Beta is out. Switching to Gamma at \($0): automatic switches are at least 15 minutes apart." },
                 "its full sentence names Beta and the spacing: \(h.notice)")
         h.check(h.state("Beta") == .inUse && h.nextRow == "Gamma" && h.quits == 1, "Beta In use, Gamma Next, one quit so far: \(h.claude.actions)")
         h.make(); await h.tick(); await h.settle()
@@ -145,7 +147,7 @@ let waitScenarios: [Scenario] = [
         h.check(!h.noticeHas("Switching to Gamma") && h.quits == 1, "after a relaunch the stop from before never counts: \(h.seen)")
         h.claude.logLimitStop("local_one", seatReadsFull: true)
         await h.pass(2 * 60)
-        h.check(h.notice.first.map(lines.contains) ?? false, "Claude's stop after the relaunch waits out the same spacing: \(h.seen)")
+        h.check(h.notice.first.map(switchLines().contains) ?? false, "Claude's stop after the relaunch waits out the same spacing: \(h.seen)")
         await h.run(until: { h.quits > 1 }, limit: 20 * 60)
         let second = h.claude.at("quit").dropFirst().first
         h.check(second.map { $0 >= first.addingTimeInterval(Limits.autoSwitchSpacing - 10) } ?? false,

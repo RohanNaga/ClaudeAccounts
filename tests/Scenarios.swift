@@ -56,8 +56,18 @@ struct Scenario {
     private(set) var failures: [String] = []
     var checks = 0
 
+    /// The virtual clock's start: the real time, unless the test runner sets
+    /// CLAUDE_ACCOUNTS_TEST_START to a local "HH:mm" (test.sh passes it through; used to test across midnight).
+    static func clockStart() -> Date {
+        let now = Date()
+        guard let text = ProcessInfo.processInfo.environment["CLAUDE_ACCOUNTS_TEST_START"] else { return now }
+        let parts = text.split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 2, let start = Calendar.current.date(bySettingHour: parts[0], minute: parts[1], second: 0, of: now) else { return now }
+        return start
+    }
+
     init() throws {
-        clock = VirtualClock(start: Date())
+        clock = VirtualClock(start: Harness.clockStart())
         claude = try StandInClaude(clock: clock)
         try World.install(claude, clock: clock)
         usage.clock = clock
@@ -417,9 +427,10 @@ let scenarios: [Scenario] = [
         await h.pass(3 * ClaudeTiming.meterEvery)
         let posted = h.claude.notifications.filter { $0.hasPrefix("Every seat is out") }
         h.check(posted.count == 1, "one notification for the whole wait: \(h.claude.notifications)")
-        // The reset reads as the menu says it when the line was posted, which may be either side of midnight.
-        let at = Set([ClockText.time(reset, now: h.started), ClockText.time(reset, now: h.clock.now())])
-        h.check(posted.first.map { p in p.hasPrefix("Every seat is out: Chats resume when ") && at.contains { p.hasSuffix(" resets at \($0).") } } == true,
+        // The reset is formatted as the app formats it, with the clock when it posted: a reset on a later day gets its weekday.
+        let postedAt = zip(h.claude.notifications, h.claude.notifiedAt).first { $0.0.hasPrefix("Every seat is out") }?.1 ?? h.clock.now()
+        let at = ClockText.time(reset, now: postedAt)
+        h.check(posted.first.map { $0.hasPrefix("Every seat is out: Chats resume when ") && $0.hasSuffix(" resets at \(at).") } == true,
                 "it reads \"Every seat is out: Chats resume when <seat> resets at <time>.\", the title once: \(posted)")
         h.check(h.claude.actions.isEmpty, "no switch: \(h.claude.actions)")
     },
