@@ -56,8 +56,18 @@ struct Scenario {
     private(set) var failures: [String] = []
     var checks = 0
 
+    /// The virtual clock's start: the real time, unless the test runner sets
+    /// CLAUDE_ACCOUNTS_TEST_START to a local "HH:mm" (test.sh passes it through; used to test across midnight).
+    static func clockStart() -> Date {
+        let now = Date()
+        guard let text = ProcessInfo.processInfo.environment["CLAUDE_ACCOUNTS_TEST_START"] else { return now }
+        let parts = text.split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 2, let start = Calendar.current.date(bySettingHour: parts[0], minute: parts[1], second: 0, of: now) else { return now }
+        return start
+    }
+
     init() throws {
-        clock = VirtualClock(start: Date())
+        clock = VirtualClock(start: Harness.clockStart())
         claude = try StandInClaude(clock: clock)
         try World.install(claude, clock: clock)
         usage.clock = clock
