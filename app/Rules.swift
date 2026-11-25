@@ -465,9 +465,9 @@ enum ResumeRule {
     static let retryFor = Limits.resumeFor
 
     enum Result: Equatable {
-        /// Running without a message from the app, as its Stop control shows, or resumed by Claude
-        /// itself, as the quit's mark Claude cleared shows. A record's last-activity time is never
-        /// taken for either: Claude moves it without running a turn.
+        /// Running without a message from the app, as its Stop control shows in the opened chat.
+        /// Nothing in Claude's record is taken for it: Claude moves a chat's last-activity time
+        /// without a turn, and clears its quit mark on a chat it leaves waiting for the person.
         case running
         /// The app sent the message and Claude showed the turn start.
         case sent
@@ -494,9 +494,9 @@ enum ResumeRule {
     /// The chats to get running again: every moved chat that had work in flight when the switch
     /// quit Claude, by Claude's own record. That is each one Claude marked as cut off by the quit,
     /// and each one in `working`: stopped for usage, cut off by the quit as its log says, or with
-    /// background tasks still running as Claude quit (`workingAtQuit`), whose own turn may have
-    /// ended long before. Each once, most recently active first. A chat that was idle with no work
-    /// in flight is left alone.
+    /// background tasks still running as this switch quit Claude (`workingAtQuit`), whose own turn
+    /// may have ended long before. Each once, most recently active first. A chat that was idle with
+    /// no work in flight is left alone.
     static func toResume(_ chats: [MovedChat], working: Set<String>) -> [MovedChat] {
         var seen = Set<String>()
         return chats.filter { chat in
@@ -505,12 +505,25 @@ enum ResumeRule {
         .sorted { $0.lastActivity > $1.lastActivity }
     }
 
-    /// A chat's record, as Claude wrote it at its last quit, says background tasks such as
-    /// subagents were still running then: the quit stopped them, and only a new turn, which
-    /// "resume" starts, picks their work up. Claude records this at every quit and clears it when
-    /// it next starts.
-    static func workingAtQuit(_ record: [String: Any]) -> Bool {
-        ((record[ClaudeFiles.armedWorkAtQuit] as? [String: Any])?[ClaudeFiles.backgroundTaskCount] as? Int ?? 0) > 0
+    /// A chat's record says background tasks were still running when Claude quit for this switch:
+    /// Claude wrote `armedWorkAtQuit` at a plain quit (`exitKind` "quit", not an update restart),
+    /// at or after `quitFrom`, the moment the switch began its quit (both epoch ms on this Mac's
+    /// clock). The quit stopped those tasks, and only a new turn, which "resume" starts, picks their
+    /// work up. A mark from any earlier quit is refused here, however Claude handles its own marks.
+    static func workingAtQuit(_ record: [String: Any], since quitFrom: Double) -> Bool {
+        guard let armed = record[ClaudeFiles.armedWorkAtQuit] as? [String: Any],
+              armed[ClaudeFiles.exitKind] as? String == ClaudeFiles.exitKindQuit,
+              let at = armed[ClaudeFiles.armedAt] as? Double, at >= quitFrom else { return false }
+        return (armed[ClaudeFiles.backgroundTaskCount] as? Int ?? 0) > 0
+    }
+
+    /// A record whose background-task mark this switch refuses: work was armed at a quit, but not
+    /// at the quit this switch made. Counted in the diagnostics file, so a chat left off the list
+    /// can be explained.
+    static func workingBefore(_ record: [String: Any], since quitFrom: Double) -> Bool {
+        guard let armed = record[ClaudeFiles.armedWorkAtQuit] as? [String: Any],
+              (armed[ClaudeFiles.backgroundTaskCount] as? Int ?? 0) > 0 else { return false }
+        return !workingAtQuit(record, since: quitFrom)
     }
 
     /// What to do with one opened chat. `waited` counts from the open, `shownFor` from the moment
@@ -543,14 +556,16 @@ enum ResumeRule {
         secondsSinceInput >= retryEvery
     }
 
-    /// The line for the chats a resume couldn't get running, by title: counted, as the menu's one
-    /// line shows it, or `named`, as its hover and the notification do.
+    /// The line for the chats a resume couldn't get running: counted, as the menu's one line shows
+    /// it, or `named`, as its hover and the notification do. The instruction comes before the
+    /// titles, so a notification cut after two lines still says what to do.
     static func couldNotResume(_ titles: [String], named: Bool) -> String {
         let n = titles.count
+        let count = "\(n) chat\(n == 1 ? "" : "s")", them = n == 1 ? "it" : "them"
+        guard named else { return "Couldn't resume \(count): send \(them) a message." }
         let quoted = titles.map { "\u{201C}\($0)\u{201D}" }
-        let which = !named ? "\(n) chat\(n == 1 ? "" : "s")"
-            : n == 1 ? quoted[0] : quoted.dropLast().joined(separator: ", ") + " and " + quoted[n - 1]
-        return "Couldn't resume \(which): send \(n == 1 ? "it" : "them") a message."
+        let list = n == 1 ? quoted[0] : quoted.dropLast().joined(separator: ", ") + " and " + quoted[n - 1]
+        return "Couldn't resume \(count), send \(them) a message: \(list)."
     }
 }
 

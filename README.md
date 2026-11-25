@@ -230,24 +230,28 @@ new message, "resume": after an automatic switch, the chats stopped for the
 limit that started it and those cut off by the quit; after a switch by hand,
 every chat Claude stopped for a limit since it last opened, and those cut off
 by the quit. Either way, a chat whose own turn had ended but whose background
-subagents were still working counts as cut off too: Claude records those
-subagents in the chat's record as it quits, and the quit stops them. Only a
-quit the switch itself made counts, and a chat that was idle with nothing
-running gets nothing. The app opens the chat with a `claude://code/continue` link, checks
+tasks were still working counts as cut off too: Claude records how many in the
+chat's record as it quits, and the quit stops them. Claude counts background
+shells, such as a dev server, among those tasks and its record doesn't tell
+them apart from subagents, so a chat with only a dev server running also gets
+one "resume". Only the quit the switch itself made counts: the record must say
+a plain quit, written after the switch began quitting Claude. A chat that was
+idle with nothing running gets nothing. The app opens the chat with a `claude://code/continue` link, checks
 through Accessibility that Claude's window shows that chat, puts "resume" in
 its message box and presses Send, once. It skips a chat that is running, a
 chat whose message box holds a draft, and a chat it has already resumed. It
 never presses Retry, Rewind, Stop or Keep working.
 
-A chat counts as resumed once its Stop button shows, after "resume" or on its
-own, or once Claude clears the mark it set on a chat the quit cut off. A record
-that merely shows newer activity doesn't count: Claude updates it without
-running the chat. A chat that doesn't start is tried again every minute for 30
-minutes, and only after a minute with nobody using the Mac. After that the menu
-says how many chats need a message from you, its line on hover and the
-notification name them, as in "Couldn't resume “Fix the importer”: send it a
-message." Each step is written to `resume.log` in the app's
-folder. If the app is quit mid-resume, the chats it hadn't reached stay as they
+A chat counts as resumed only once the app has opened it and its Stop button
+shows, after "resume" or on its own. Nothing in Claude's record counts: Claude
+moves a chat's last activity without running it, and clears its quit mark on a
+chat it leaves waiting for you. A chat that doesn't start is tried again every
+minute for 30 minutes, and only after a minute with nobody using the Mac. After
+that the menu says how many chats need a message from you, and its line on
+hover and the notification name them after saying what to do, as in "Couldn't
+resume 1 chat, send it a message: “Fix the importer”." Each step is written to
+`resume.log` in the app's folder, and each resume to `diagnostics.jsonl` as
+counts only. If the app is quit mid-resume, the chats it hadn't reached stay as they
 are: the next launch types nothing.
 
 ## What it cannot guarantee
@@ -302,7 +306,7 @@ connections as usual.
 | Where | What | When |
 |---|---|---|
 | `~/Library/Application Support/ClaudeAccounts` | Everything the app keeps: `accounts.json`, settings, each seat's Claude Code login folder, saved Claude logins, meter readings, the switch journal, backups, `resume.log`, and `diagnostics.jsonl` | Always |
-| `diagnostics.jsonl` | One line per change of Claude's state, a seat's state or the automatic decision, each switch's start and end, each limit stop as it arrives (whether Claude had held the seat a minute), and each new run of the seat in use's readings (full or not, and since when), with times, state names and row numbers only; and while a switch waits for Claude to quit, each look at Claude's windows that differs from the last or takes a second or more, with its time in milliseconds, window roles and button titles. No names, emails, ids, tokens, window titles or chat content. It rotates at 4 MB | Always |
+| `diagnostics.jsonl` | One line per change of Claude's state, a seat's state or the automatic decision, each switch's start and end, each limit stop as it arrives (whether Claude had held the seat a minute), and each new run of the seat in use's readings (full or not, and since when), with times, state names and row numbers only; and while a switch waits for Claude to quit, each look at Claude's windows that differs from the last or takes a second or more, with its time in milliseconds, window roles and button titles; at each switch's quit, how many chats are on its resume list for each reason (stopped for the limit, cut off by the quit, background tasks working, carried from an overtaken resume) and how many marks from an earlier quit it refused, then one line per chat with that reason and how its resume ended. No names, emails, ids, tokens, window titles or chat content. It rotates at 4 MB | Always |
 | Login keychain | One `Claude Code-credentials-<hash>` item per seat, written by Claude Code. The app reads its token for the usage service | Always |
 | `~/Library/Application Support/Claude` | The claude.ai cookie rows, three keys in `config.json`, and chat records in `claude-code-sessions` | Written only during a switch, with Claude quit. Read to save the seat in use's login once Claude has stayed on it for a minute |
 | `~/Library/Logs/Claude/main.log` | Read only: which seat Claude is on and since when, refused sign-ins, chats stopped at a limit, and turns that ended | Always |

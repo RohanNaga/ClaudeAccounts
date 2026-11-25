@@ -722,7 +722,7 @@ let scenarios: [Scenario] = [
         await h.run(until: { h.claude.held == B && !h.switchInFlight }, limit: 600)
         h.check(h.claude.held == B, "manual Switch still works: \(String(describing: h.claude.held)), \(h.notice)")
         // Spec 11: a failure the person must act on outranks the pause for the one notice slot.
-        h.check(h.notice == ["Couldn't resume 1 chat: send it a message.", "Couldn't resume \u{201C}chat\u{201D}: send it a message."],
+        h.check(h.notice == ["Couldn't resume 1 chat: send it a message.", "Couldn't resume 1 chat, send it a message: \u{201C}chat\u{201D}."],
                 "the chat the switch could not resume holds the notice, named on hover: \(h.notice)")
         await h.pass(ClaudeTiming.settle + 5)
         h.usage.set(B, fiveHour: 100, resetsAt: h.clock.now().addingTimeInterval(3600))

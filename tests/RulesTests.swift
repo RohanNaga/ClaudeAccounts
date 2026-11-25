@@ -370,12 +370,24 @@ struct RulesTests {
               "the chats that were working are exactly the ones named working plus the ones Claude marked")
         check(ResumeRule.message == "resume", "the message is \"resume\"")
         // Claude's armedWorkAtQuit as it writes it at a quit: background tasks, a loop wakeup, crons.
-        func armed(tasks: Int, crons: Int = 0) -> [String: Any] {
-            [ClaudeFiles.armedWorkAtQuit: ["at": 1, "exitKind": "quit", "cronCount": crons, "durableCronCount": 0, ClaudeFiles.backgroundTaskCount: tasks]]
+        // The switch began its quit at 1000 ms.
+        func armed(tasks: Int, crons: Int = 0, at: Double = 1500, exit: String = "quit") -> [String: Any] {
+            [ClaudeFiles.armedWorkAtQuit: ["at": at, "exitKind": exit, "cronCount": crons, "durableCronCount": 0, ClaudeFiles.backgroundTaskCount: tasks]]
         }
-        check(ResumeRule.workingAtQuit(armed(tasks: 7)), "a chat with subagents running as Claude quit was working")
-        check(!ResumeRule.workingAtQuit(armed(tasks: 0, crons: 1)) && !ResumeRule.workingAtQuit([:]) && !ResumeRule.workingAtQuit(["lostWorkUntold": true]),
+        let quitFrom: Double = 1000
+        check(ResumeRule.workingAtQuit(armed(tasks: 7), since: quitFrom) && ResumeRule.workingAtQuit(armed(tasks: 1, at: quitFrom), since: quitFrom),
+              "a chat with background tasks running as the switch's quit happened was working")
+        check(!ResumeRule.workingAtQuit(armed(tasks: 0, crons: 1), since: quitFrom) && !ResumeRule.workingAtQuit([:], since: quitFrom)
+              && !ResumeRule.workingAtQuit(["lostWorkUntold": true], since: quitFrom),
               "a chat with no background task at the quit, or only the mark of an earlier quit's lost work, was not")
+        check(!ResumeRule.workingAtQuit(armed(tasks: 3, at: quitFrom - 1), since: quitFrom)
+              && ResumeRule.workingBefore(armed(tasks: 3, at: quitFrom - 1), since: quitFrom),
+              "a mark Claude wrote before the switch began its quit is refused, and counted as an earlier one")
+        check(!ResumeRule.workingAtQuit(armed(tasks: 3, exit: "update_restart"), since: quitFrom)
+              && !ResumeRule.workingAtQuit([ClaudeFiles.armedWorkAtQuit: [ClaudeFiles.backgroundTaskCount: 3]], since: quitFrom),
+              "a mark from an update restart, or one with no time or kind, is refused")
+        check(!ResumeRule.workingBefore(armed(tasks: 7), since: quitFrom) && !ResumeRule.workingBefore(armed(tasks: 0, at: 1), since: quitFrom),
+              "a mark of this quit, or one with no background task, is not counted as an earlier one")
 
         // One opened chat, step by step.
         let idle = ChatScreen(busy: false, composer: true, draft: false)
@@ -413,9 +425,11 @@ struct RulesTests {
         check(ResumeRule.Result.draft.settled && ResumeRule.Result.running.settled && ResumeRule.Result.sent.settled
               && !ResumeRule.Result.notResumed("x").settled, "running, sent and someone's draft end the tries; anything else is tried again")
         check(ResumeRule.couldNotResume(["Fix the importer"], named: false) == "Couldn't resume 1 chat: send it a message."
-              && ResumeRule.couldNotResume(["Fix the importer"], named: true) == "Couldn't resume \u{201C}Fix the importer\u{201D}: send it a message."
-              && ResumeRule.couldNotResume(["A", "B", "C"], named: true) == "Couldn't resume \u{201C}A\u{201D}, \u{201C}B\u{201D} and \u{201C}C\u{201D}: send them a message.",
-              "the chats a resume gave up on are counted on the menu's line and named in full")
+              && ResumeRule.couldNotResume(["A", "B", "C"], named: false) == "Couldn't resume 3 chats: send them a message.",
+              "the menu's line counts the chats a resume gave up on")
+        check(ResumeRule.couldNotResume(["Fix the importer"], named: true) == "Couldn't resume 1 chat, send it a message: \u{201C}Fix the importer\u{201D}."
+              && ResumeRule.couldNotResume(["A", "B", "C"], named: true) == "Couldn't resume 3 chats, send them a message: \u{201C}A\u{201D}, \u{201C}B\u{201D} and \u{201C}C\u{201D}.",
+              "the named line says what to do before the titles, so a cut-off notification still says it")
 
         // Telling the message box apart.
         typealias Box = ComposerRule.Box
