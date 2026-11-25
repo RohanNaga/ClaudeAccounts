@@ -501,6 +501,16 @@ enum ClaudeApp {
     }
 
     static func lastActivity(_ url: URL) -> Double { (record(url)?[ClaudeFiles.lastActivityAt] as? Double) ?? 0 }
+
+    /// The open chats in `orgFolder` whose record says background tasks were still running when
+    /// Claude quit at or after `quitFrom` (epoch ms), the moment a switch began its quit
+    /// (`ResumeRule.workingAtQuit`), and how many records carry such a mark from an earlier quit,
+    /// which are left alone.
+    static func workingAtQuit(in orgFolder: URL, since quitFrom: Double) -> (ids: Set<String>, before: Int) {
+        let records = ((try? openSessionRecords(in: orgFolder)) ?? []).compactMap(record)
+        return (Set(records.compactMap { ResumeRule.workingAtQuit($0, since: quitFrom) ? $0[ClaudeFiles.sessionId] as? String : nil }),
+                records.filter { ResumeRule.workingBefore($0, since: quitFrom) }.count)
+    }
 }
 
 /// One account's saved Claude app login: its claude.ai cookie rows (still encrypted with
@@ -786,7 +796,8 @@ struct SwitchJournal: Codable, Equatable {
     /// Claude's sign-in files as they were after the quit; a rollback puts them back (13a.3).
     var backup: String? = nil
     var moves: [Move] = []
-    /// The chats to resume once Claude holds the target: stopped for usage or cut off by the quit.
+    /// The chats to resume once Claude holds the target: stopped for usage, cut off by the quit, or
+    /// running background tasks as Claude quit.
     var resume: [String] = []
     /// Times the person opened Claude again between the quit and the launch.
     var reopened = 0
@@ -898,6 +909,7 @@ enum Switch {
         }
         await World.claude.willStep("quit")
         progress("Quitting Claude…")
+        let quitFrom = World.now().timeIntervalSince1970 * 1000
         let quit = await ClaudeApp.quit(unattended: r.kind == .auto, notify: r.kind == .auto ? "Switching to \(r.name(r.to))" : nil,
                                         progress: progress)
         switch quit.outcome {
@@ -914,14 +926,23 @@ enum Switch {
             return SwitchOutcome(ok: false, text: why, detail: quit.promptLeftOpen ? "Its prompt is still open: Cancel keeps Claude as it is." : nil,
                                  promptLeftOpen: quit.promptLeftOpen, quitStopped: .failed, resume: r.resume)
         }
-        // The run that just ended names the chats that were working: cut by the quit, and for a
-        // switch by hand, stopped for usage. An automatic switch takes only the chats it is for.
+        // The run that just ended names the chats that were working: cut by the quit, still
+        // running background tasks as this switch quit it, and for a switch by hand, stopped for
+        // usage. An automatic switch takes only the stopped chats it is for.
         let ended = await log().stoppedChats
-        let byLimit = r.kind == .auto ? [] : ended.byLimit
-        j.resume = Array(byLimit.union(ended.byQuit).union(carried).union(r.resume)).sorted()
+        let byLimit = (r.kind == .auto ? [] : ended.byLimit).union(r.resume)
+        let working = j.from.map { ClaudeApp.workingAtQuit(in: ClaudeApp.folder($0), since: quitFrom) } ?? ([], 0)
+        // A chat on the list for more than one reason keeps the last of these.
+        var why: [String: ResumeWhy] = [:]
+        for (ids, reason) in [(carried, ResumeWhy.carried), (working.ids, .working), (ended.byQuit, .quit), (byLimit, .limit)] {
+            for id in ids { why[id] = reason }
+        }
+        Diagnostics.record(.resumeList, ["byLimit": byLimit.count, "byQuit": ended.byQuit.count, "working": working.ids.count,
+                                         "workingBefore": working.before, "carried": carried.count])
+        j.resume = why.keys.sorted()
         carried = []
         let outcome = await forward(&j, r, progress: progress)
-        return await finish(outcome, j, r, progress: progress, switched: switched)
+        return await finish(outcome, j, r, why: why, progress: progress, switched: switched)
     }
 
     /// Finish or undo a switch the app was stopped in, from its journal (section 6, Recovery).
@@ -952,7 +973,9 @@ enum Switch {
     }
 
     /// Release the lock, tell the Store, then resume the chats a confirmed switch brought over.
-    private static func finish(_ outcome: SwitchOutcome, _ j: SwitchJournal, _ r: Request, progress: @escaping Progress,
+    /// `why` says why each chat of the journal's list is on it, for the diagnostics file.
+    private static func finish(_ outcome: SwitchOutcome, _ j: SwitchJournal, _ r: Request, why: [String: ResumeWhy] = [:],
+                               progress: @escaping Progress,
                                switched: @escaping (SwitchOutcome) async -> Void) async -> SwitchOutcome {
         var outcome = outcome
         outcome.resume = Set(j.resume)
@@ -960,31 +983,36 @@ enum Switch {
         let folder = ClaudeApp.folder(j.to)
         let chats = outcome.ok && !outcome.parked && !r.recovered
             ? ResumeRule.toResume(((try? ClaudeApp.openSessionRecords(in: folder)) ?? []).compactMap(ChatResume.chat),
-                                  stoppedByLimit: Set(j.resume), cutByQuit: [])
+                                  working: Set(j.resume))
             : []
         unlock()
         await switched(outcome)
-        outcome.resumeEnd = await resume(chats, in: folder, reopenedAt: j.launchedAt ?? World.now(), progress: progress, generation: generation)
+        outcome.resumeEnd = await resume(chats, why: { why[$0.id] ?? ($0.interrupted ? .quit : .carried) },
+                                         progress: progress, generation: generation)
         return outcome
     }
 
-    /// The one resume step (section 6, step 7), after a switch and when a wait ends in place:
-    /// `chats`, whose records are in `folder`, Claude having reopened at `reopenedAt`. When typing
-    /// can't work, a Claude shape missing (8 B) or no Accessibility (7), nothing is opened, typed or
-    /// pressed in Claude, and every chat is named instead (12). Otherwise each chat the resume gives
-    /// up on is named. A switch that starts during it, a new `generation`, takes over the chats not
-    /// yet settled and resumes them after its own confirm. A resume the app was stopped in is not
-    /// taken up again: nothing stored types.
-    static func resume(_ chats: [MovedChat], in folder: URL, reopenedAt: Date, progress: @escaping Progress,
-                       generation: String = SwitchLock.generation()) async -> ResumeEnd {
+    /// The one resume step (section 6, step 7), after a switch and when a wait ends in place.
+    /// When typing can't work, a Claude shape missing (8 B) or no Accessibility (7), nothing is
+    /// opened, typed or pressed in Claude, and every chat is named instead (12). Otherwise each
+    /// chat the resume gives up on is named. A switch that starts during it, a new `generation`,
+    /// takes over the chats not yet settled and resumes them after its own confirm. A resume the
+    /// app was stopped in is not taken up again: nothing stored types. Each chat's line in the
+    /// diagnostics file says `why` it was resumed and how that ended, with no title or id.
+    static func resume(_ chats: [MovedChat], why: @escaping (MovedChat) -> ResumeWhy = { _ in .limit },
+                       progress: @escaping Progress, generation: String = SwitchLock.generation()) async -> ResumeEnd {
         guard !chats.isEmpty else { return ResumeEnd() }
-        guard ShapeMisses.load().isEmpty, World.claude.trusted else { return ResumeEnd(notResumed: chats.map(\.title)) }
-        var resumer = ChatResume.resumer(in: folder, reopenedAt: reopenedAt.timeIntervalSince1970 * 1000, progress: progress)
+        guard ShapeMisses.load().isEmpty, World.claude.trusted else {
+            for chat in chats { Diagnostics.record(.resumeChat, Diagnostics.resumeLine(.notResumed("typing can't work"), why: why(chat))) }
+            return ResumeEnd(notResumed: chats.map(\.title))
+        }
+        var resumer = ChatResume.resumer(progress: progress)
         resumer.current = { SwitchLock.generation() == generation }
         let ids = Set(chats.map(\.id))
         carried.formUnion(ids)
         resumer.settled = { carried.remove($0) }
         let reports = await resumer.run(chats)
+        for report in reports { Diagnostics.record(.resumeChat, Diagnostics.resumeLine(report.result, why: why(report.chat))) }
         // A resume no switch overtook leaves nothing to carry: what it gave up on is named instead.
         if resumer.current() { carried.subtract(ids) }
         let superseded = ResumeRule.Result.notResumed(ChatResumer.superseded)
@@ -1274,10 +1302,16 @@ enum Switch {
 
 // MARK: - After a switch
 
-/// Gets the chats that were working, which a usage limit or the quit stopped, running again after
-/// a switch, through ChatResumer: Claude resumes the ones it marked as cut off by the quit by
-/// itself, and each chat still idle gets a new message, "resume", typed into its own message
-/// box; a chat that isn't running yet is tried again every minute for half an hour. Never Retry:
+/// Why a chat is on a switch's resume list, for the diagnostics file: Claude stopped it for a
+/// usage limit, the quit cut its turn off, its background tasks were running as the switch quit
+/// Claude, or an earlier resume this switch overtook had it.
+enum ResumeWhy: String { case limit, quit, working, carried }
+
+/// Gets the chats that were working, which a usage limit or the quit stopped (their turn, or the
+/// background tasks they still ran), running again after a switch, through ChatResumer: each is
+/// opened, Claude may resume one it marked as cut off by the quit by itself, and each chat still
+/// idle gets a new message, "resume", typed into its own message box; a chat that isn't running
+/// yet is tried again every minute for half an hour. Never Retry:
 /// retrying the failed message rewinds the chat and starts its transcript over without its
 /// subagents. Each step goes to resume.log in the app's state folder.
 enum ChatResume {
@@ -1291,9 +1325,8 @@ enum ChatResume {
                          lastActivity: (obj[ClaudeFiles.lastActivityAt] as? Double) ?? 0)
     }
 
-    /// The resume step for chats whose records are in `folder`, Claude having reopened at
-    /// `reopenedAt` (ms). `retrying` keeps trying on ResumeRule's schedule; `echo` also hears each step.
-    static func resumer(in folder: URL, reopenedAt: Double, retrying: Bool = true,
+    /// The resume step. `retrying` keeps trying on ResumeRule's schedule; `echo` also hears each step.
+    static func resumer(retrying: Bool = true,
                         progress: @escaping Switch.Progress, echo: @escaping (String) -> Void = { _ in }) -> ChatResumer {
         try? Data().write(to: logURL, options: .atomic)
         let log = try? FileHandle(forWritingTo: logURL)
@@ -1301,14 +1334,6 @@ enum ChatResume {
         return ChatResumer(
             open: { id in await World.claude.open(link: ClaudeFiles.continueLink(id)) },
             pids: ClaudeApp.pids,
-            running: { chat in
-                let obj = ClaudeApp.record(folder.appendingPathComponent(chat.id + ".json"))
-                let lastActivity = (obj?[ClaudeFiles.lastActivityAt] as? Double) ?? 0
-                // A chat without Claude's mark has nothing to clear; only new activity shows it ran.
-                return chat.interrupted
-                    ? ResumeRule.resumed(markStillSet: obj?[ClaudeFiles.interruptedByQuitAt] is NSNumber, lastActivity: lastActivity, reopenedAt: reopenedAt)
-                    : lastActivity > reopenedAt
-            },
             progress: progress,
             trace: { step in
                 log?.write(Data("\(stamp.string(from: World.now())) \(step)\n".utf8))
@@ -1851,7 +1876,7 @@ final class Store: ObservableObject {
             let when = at.map { " at \(ClockText.time($0, now: now))" } ?? ""
             World.claude.notify(title: "Every seat is out", body: "Chats resume when \(seat.flatMap { names[$0] } ?? "a seat") resets\(when).")
         case .resumeInPlace:
-            if let seat = f.hold?.seat { resumeInPlace(AutoSwitch.resumable(f, now: now), on: seat, now: now) }
+            if let seat = f.hold?.seat { resumeInPlace(AutoSwitch.resumable(f, now: now), on: seat) }
         }
         // A wait ends when Claude leaves its hold, or at the first current reading of its seat with
         // room, whether or not anything was resumed.
@@ -1860,12 +1885,12 @@ final class Store: ObservableObject {
 
     /// The chats of a told wait get the resume step, now that the seat in use has room again; the
     /// ones it can't get running are named, as after a switch.
-    private func resumeInPlace(_ chats: Set<String>, on seat: Identity, now: Date) {
+    private func resumeInPlace(_ chats: Set<String>, on seat: Identity) {
         guard !chats.isEmpty else { return }
         let folder = ClaudeApp.folder(seat)
         let moved = chats.sorted().compactMap { ChatResume.chat(folder.appendingPathComponent($0 + ".json")) }
         Task {
-            resumeEnded(await Switch.resume(moved, in: folder, reopenedAt: now, progress: { _ in }))
+            resumeEnded(await Switch.resume(moved, progress: { _ in }))
             publish()
         }
     }
@@ -2172,13 +2197,14 @@ final class Store: ObservableObject {
         publish()
     }
 
-    /// A resume ended, after a switch or in place: one line names the stopped chats the app could
-    /// not get running, so the person sends them a message (sections 7 and 12). A resume another
-    /// switch overtook names nothing: that switch carries its chats on.
+    /// A resume ended, after a switch or in place: one line counts the stopped chats the app could
+    /// not get running, and its full sentence on hover names them, so the person sends them a
+    /// message (sections 7 and 12). A resume another switch overtook names nothing: that switch
+    /// carries its chats on.
     private func resumeEnded(_ end: ResumeEnd) {
-        let n = end.notResumed.count
-        guard !end.superseded, n > 0 else { return }
-        failure = "Couldn't resume \(n) chat\(n == 1 ? "" : "s"): send \(n == 1 ? "it" : "them") a message."
+        guard !end.superseded, !end.notResumed.isEmpty else { return }
+        failure = ResumeRule.couldNotResume(end.notResumed, named: false)
+        failureDetail = ResumeRule.couldNotResume(end.notResumed, named: true)
     }
 
     /// An automatic switch ended, and is posted, since nobody may be looking. A failed target is
@@ -2191,9 +2217,9 @@ final class Store: ObservableObject {
     private func autoFinished(_ outcome: SwitchOutcome, from: Identity?, fromHold: String?, to: Identity) {
         let name = { (s: Identity?) in s.flatMap { self.names[$0] } ?? "The seat in use" }
         if outcome.ok {
-            let end = outcome.resumeEnd, chats = { (n: Int) in "\(n) chat\(n == 1 ? "" : "s")" }
-            let resumed = end.resumed > 0 ? " \(chats(end.resumed)) resumed." : ""
-            let named = end.notResumed.isEmpty ? "" : " Couldn't resume \(chats(end.notResumed.count)): send \(end.notResumed.count == 1 ? "it" : "them") a message."
+            let end = outcome.resumeEnd
+            let resumed = end.resumed > 0 ? " \(end.resumed) chat\(end.resumed == 1 ? "" : "s") resumed." : ""
+            let named = end.notResumed.isEmpty ? "" : " " + ResumeRule.couldNotResume(end.notResumed, named: true)
             World.claude.notify(title: "Switched to \(name(to))", body: "\(name(from)) is out.\(resumed)\(named)")
             return
         }
@@ -2218,7 +2244,7 @@ final class Store: ObservableObject {
 /// when) explain a switch that didn't come. It never holds names, emails, ids or tokens, and it
 /// never leaves the Mac. Only the values typed here can be written, so nothing else can slip in.
 enum Diagnostics {
-    enum Kind: String { case claude, hold, seat, decision, switchStarted, switchEnded, woke, shape, quitLook, stop, meters }
+    enum Kind: String { case claude, hold, seat, decision, switchStarted, switchEnded, woke, shape, quitLook, stop, meters, resumeList, resumeChat }
 
     /// What the app showed at one publish: the parts whose changes are logged.
     struct Snapshot: Equatable {
@@ -2278,6 +2304,19 @@ enum Diagnostics {
         case .out: return "out"
         case .ready: return "ready"
         }
+    }
+
+    /// One resumed chat's line: why it was on the list and how its resume ended, with the app's
+    /// own reason when it isn't running. No title, id or text of the chat.
+    static func resumeLine(_ result: ResumeRule.Result, why: ResumeWhy) -> [String: Any] {
+        var line: [String: Any] = ["why": why.rawValue]
+        switch result {
+        case .running: line["result"] = "running"
+        case .sent: line["result"] = "sent"
+        case .draft: line["result"] = "draft"
+        case .notResumed(let reason): line["result"] = "notResumed"; line["reason"] = reason
+        }
+        return line
     }
 
     /// The outcome of a switch as one state name.
@@ -2686,7 +2725,7 @@ enum TestResume {
             exit(1)
         }
         say("Chat: \(chat.title) (\(chat.id))")
-        let resumer = ChatResume.resumer(in: folder, reopenedAt: Date().timeIntervalSince1970 * 1000, retrying: false,
+        let resumer = ChatResume.resumer(retrying: false,
                                          progress: { _ in }, echo: { say("  " + $0) })
         final class Box: @unchecked Sendable { var reports: [ChatResumer.Report] = [] }
         let box = Box(), done = DispatchSemaphore(value: 0)

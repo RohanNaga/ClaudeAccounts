@@ -293,6 +293,17 @@ enum ClaudeFiles {
     static let scheduledTaskId = "scheduledTaskId"
     static let interruptedByQuitAt = "interruptedByQuitAt"
     static let lastActivityAt = "lastActivityAt"
+    /// What a chat still had running as Claude quit, written into its record at a quit that found
+    /// work armed and cleared at Claude's next start: `{at, exitKind, cronCount, durableCronCount,
+    /// wakeupScheduledFor, backgroundTaskCount}`. `at` is the quit's time in epoch ms, `exitKind`
+    /// "quit" or "update_restart". `backgroundTaskCount` counts the background tasks the quit
+    /// stopped, every kind but a remote agent: subagents, workflows, and background shells such
+    /// as a dev server alike, which the record doesn't tell apart.
+    static let armedWorkAtQuit = "armedWorkAtQuit"
+    static let armedAt = "at"
+    static let exitKind = "exitKind"
+    static let exitKindQuit = "quit"
+    static let backgroundTaskCount = "backgroundTaskCount"
     /// The Claude Code CLI's profile file in a login folder, and its account key.
     static let cliProfile = ".claude.json"
     static let cliAccount = "oauthAccount"
