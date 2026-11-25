@@ -145,6 +145,8 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
     var signsInAs: StandSeat?
     /// Every notification the app posted, as "<title>: <body>".
     private(set) var notifications: [String] = []
+    /// The virtual time each notification was posted, index for index with `notifications`.
+    private(set) var notifiedAt: [Date] = []
     /// Runs as each switch step begins, on the switch's own task: a fault scenario strikes here.
     var onStep: (@Sendable (String) async -> Void)?
     /// Times the person opens Claude again after a switch quit it, between the quit and the launch:
@@ -453,7 +455,7 @@ final class StandInClaude: ClaudeWorld, @unchecked Sendable {
         return .pressed("Send")
     }
     func idleSeconds() -> TimeInterval { 600 }
-    func notify(title: String, body: String) { lock.withLock { notifications.append("\(title): \(body)") } }
+    func notify(title: String, body: String) { lock.withLock { notifications.append("\(title): \(body)"); notifiedAt.append(clock.now()) } }
     func willStep(_ step: String) async { await onStep?(step) }
 }
 

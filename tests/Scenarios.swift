@@ -427,7 +427,9 @@ let scenarios: [Scenario] = [
         await h.pass(3 * ClaudeTiming.meterEvery)
         let posted = h.claude.notifications.filter { $0.hasPrefix("Every seat is out") }
         h.check(posted.count == 1, "one notification for the whole wait: \(h.claude.notifications)")
-        let at = DateFormatter.localizedString(from: reset, dateStyle: .none, timeStyle: .short)
+        // The reset is formatted as the app formats it, with the clock when it posted: a reset on a later day gets its weekday.
+        let postedAt = zip(h.claude.notifications, h.claude.notifiedAt).first { $0.0.hasPrefix("Every seat is out") }?.1 ?? h.clock.now()
+        let at = ClockText.time(reset, now: postedAt)
         h.check(posted.first.map { $0.hasPrefix("Every seat is out: Chats resume when ") && $0.hasSuffix(" resets at \(at).") } == true,
                 "it reads \"Every seat is out: Chats resume when <seat> resets at <time>.\", the title once: \(posted)")
         h.check(h.claude.actions.isEmpty, "no switch: \(h.claude.actions)")
