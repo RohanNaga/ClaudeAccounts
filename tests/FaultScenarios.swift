@@ -110,6 +110,8 @@ final class Strike: @unchecked Sendable {
     } else {
         await h.standard()
     }
+    // The app has watched Claude hold Alpha for a minute, so the switch saves Alpha's login at its save step.
+    await h.pass(ClaudeTiming.settle)
     let saved = step.setUp ? [("Alpha", A), ("Beta", B)] : [("Alpha", A), ("Beta", B), ("Gamma", C)]
     let gammaAt = h.savedAt(C)
     let strike = Strike()
@@ -295,6 +297,7 @@ let midStepFaultScenarios: [Scenario] = [
                         when: @escaping @Sendable () -> Bool = { true }) async {
     await h.standard()
     secondChat(h)
+    await h.pass(ClaudeTiming.settle)
     let strike = Strike()
     defer { strike.restore() }
     let clock = h.clock, claude = h.claude
@@ -409,83 +412,55 @@ let autoFaultScenarios: [Scenario] = [
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
     Scenario(pair: "(Automatic switch at confirm, kill the app)",
-             model: "Recovery: from load on the switch is finished; 6.7: the stopped chat gets one resume; 8 A and B") { h in
+             model: "Recovery: Claude running on the target confirms the switch from its log; nothing stored types, so the stopped chat is named, not resumed (review seven, finding 1); 8 A and B") { h in
         let lines = await autoStart(h)
         let strike = autoStrike(h, at: "confirm", .killApp)
         await startAuto(h)
         await killAppAtStrike(h, strike, "at the automatic switch's confirm")
         await runToEnd(h, lines)
         checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
-        h.check(lines.has("Finished switching to Beta"), "the person sees \"Finished switching to Beta.\" (7); saw \(lines.seen)")
-        await h.run(until: { h.resumed("local_one") }, limit: 600)
-        h.check(h.resumed("local_one"), "the stopped chat gets one resume after the recovery (6.7); typed \(h.claude.sent)")
+        h.check(lines.has("Finished switching to Beta. Chats were not resumed."), "the person sees \"Finished switching to Beta. Chats were not resumed.\" (7); saw \(lines.seen)")
+        await h.pass(ClaudeTiming.resumeFor + 5 * 60)
+        h.check(h.claude.sent.isEmpty && h.quits == 1 && h.launches == 1, "the recovery types nothing and quits nothing: typed \(h.claude.sent), \(h.claude.actions)")
+        h.check(h.claude.notifications.filter { $0.contains("Chats were not resumed") }.count == 1, "one post says the chats were not resumed: \(h.claude.notifications)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
     Scenario(pair: "(Automatic switch at confirm, a failed read)",
-             model: "6.6: the rollback marks Beta failedTarget and the decision runs again at once with the next target; 8 B: confirm that can't read the log rolls back") { h in
+             model: "6.6: the rollback marks Beta failedTarget; 8 B: confirm that can't read the log rolls back; Claude reopened on Alpha is a new hold, so nothing retries until Claude stops a chat again, and that waits out the spacing") { h in
         let lines = await autoStart(h)
         let strike = autoStrike(h, at: "confirm", .failedRead)
         await startAuto(h)
         defer { strike.restore() }
-        await h.run(until: { lines.note(h); return h.claude.held == C && !h.switchInFlight && SwitchJournal.load() == nil }, limit: 1800)
+        await h.run(until: { lines.note(h); return h.claude.held == A && h.launches == 2 && !h.switchInFlight && SwitchJournal.load() == nil }, limit: 1800)
         strike.restore()
         h.check(strike.fired, "the log was unreadable at the confirm")
-        checkEnds(h, [("Gamma", C)], chats: ["local_one"], lines: lines.seen)
+        checkEnds(h, [("Alpha", A)], chats: ["local_one"], lines: lines.seen)
         h.check(h.claude.chats(in: B).isEmpty, "nothing is left in Beta's folder")
-        await h.run(until: { h.resumed("local_one") }, limit: 600)
-        h.check(h.resumed("local_one"), "the stopped chat gets one resume on Gamma (6.7); typed \(h.claude.sent)")
+        let quits = h.quits
+        await h.pass(5 * 60)
+        h.check(h.quits == quits && h.claude.sent.isEmpty && h.notice.first == "Didn't switch to Beta. Switch by hand.",
+                "back on Alpha, nothing retries or is typed by itself, and the line says what works: \(h.claude.actions), typed \(h.claude.sent), \(h.notice)")
+        h.claude.logLimitStop("local_one", seatReadsFull: true)
+        await h.pass(60)
+        h.check(h.quits == quits && h.noticeHas("Switching to Gamma at"), "Claude's next stop waits out the 15 minutes from the failed switch (review F1): \(h.seen)")
+        await h.run(until: { h.claude.held != A && !h.switchInFlight && h.resumed("local_one") }, limit: 1200)
+        h.check(h.claude.held != A && h.claude.sent == ["local_one resume"], "then switches, resumed once (6.7); typed \(h.claude.sent)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
     Scenario(pair: "(Automatic switch at resume, kill the app)",
-             model: "8 A: the switch is done and its journal cleared before the resume; 6.7 and 8 B: the next launch gives the chat its one resume") { h in
+             model: "8 A: the switch is done and its journal cleared before the resume; nothing stored types, so the next launch leaves the chat the kill cut short as it is (review six, finding 7)") { h in
         let lines = await autoStart(h, onScreen: false)
         await startAuto(h)
         await h.run(until: { lines.note(h); return h.claude.actions.contains { $0.hasPrefix("open ") } }, limit: 900)
         h.check(h.claude.held == B && SwitchJournal.load() == nil, "the resume runs after the confirm: holds \(String(describing: h.claude.held))")
         h.crashApp(); await h.tick(); await h.settle()
         h.claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
-        await h.pass(10 * 60)
+        await h.pass(ClaudeTiming.resumeFor + 5 * 60)
         lines.note(h)
         checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
-        h.check(h.claude.sent == ["local_one resume"], "the next launch gives the chat the resume the kill cut short, once (6.7, 8 B); typed \(h.claude.sent), saw \(lines.seen)")
-        checkActs(h)
-        await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
-    },
-    Scenario(pair: "(Automatic switch at resume, kill the app, the chat not on screen)",
-             model: "6.7 and 12: the next launch tries the chat again for resumeFor, then names it") { h in
-        let lines = await autoStart(h, onScreen: false)
-        await startAuto(h)
-        await h.run(until: { lines.note(h); return h.claude.actions.contains { $0.hasPrefix("open ") } }, limit: 900)
-        h.crashApp()
-        let launched = h.now
-        await h.tick(); await h.settle()
-        await h.run(until: { lines.note(h); return lines.has("Couldn't resume") }, limit: ClaudeTiming.resumeFor + 5 * 60)
-        let tried = h.now.timeIntervalSince(launched)
-        h.check(lines.has("Couldn't resume 1 chat: send it a message."), "the chat the killed resume left is named after the next launch (12): \(lines.seen)")
-        h.check(tried >= ClaudeTiming.resumeFor - ClaudeTiming.resumeEvery, "it is tried again for resumeFor first: named after \(Int(tried / 60)) min")
-        h.check(h.claude.sent.isEmpty, "nothing typed into a chat not on screen: \(h.claude.sent)")
-        checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
-        checkActs(h)
-    },
-    Scenario(pair: "(Automatic switch at resume, kill the app, the person resumes the chat before the app is back)",
-             model: "6.7: a chat already resumed is skipped; Recovery: the next launch's resume counts from Claude's reopening, so a chat that ran since is left alone") { h in
-        let lines = await autoStart(h, onScreen: false)
-        await startAuto(h)
-        await h.run(until: { lines.note(h); return h.claude.actions.contains { $0.hasPrefix("open ") } }, limit: 900)
-        h.killApp()
-        h.check(h.resumeOnDisk, "setup: the killed resume leaves its chat on disk for the next launch")
-        // While the app is down, the person sends the chat a message: it runs, then goes idle.
-        h.claude.addChat("local_one", in: B, lastActivity: h.now)
-        h.claude.screens["local_one"] = ChatScreen(busy: false, composer: true, draft: false)
-        await h.pass(60)
-        h.make(); await h.tick(); await h.settle()
-        await h.run(until: { lines.note(h); return !h.resumeOnDisk }, limit: ClaudeTiming.resumeFor + 5 * 60)
-        lines.note(h)
-        checkEnds(h, [("Beta", B)], chats: ["local_one"], lines: lines.seen)
-        h.check(h.claude.sent.isEmpty, "the next launch types nothing into a chat the person resumed since Claude reopened (6.7); typed \(h.claude.sent)")
-        h.check(!lines.has("Couldn't resume"), "and does not name it: \(lines.seen)")
+        h.check(h.claude.sent.isEmpty, "the next launch types nothing into the chat the kill cut short; typed \(h.claude.sent), saw \(lines.seen)")
         checkActs(h)
         await checkSavedLogins(h, [("Alpha", A), ("Beta", B), ("Gamma", C)])
     },
@@ -519,7 +494,7 @@ let autoFaultScenarios: [Scenario] = [
 
 /// Claude stops Alpha's chat for usage after the hold settled, and the automatic switch starts.
 @MainActor func startAuto(_ h: Harness) async {
-    h.claude.logLimitStop("local_one")
+    h.claude.logLimitStop("local_one", seatReadsFull: true)
     await h.run(until: { h.switchInFlight }, limit: 600)
     h.check(h.switchInFlight, "the limit stop starts the automatic switch (4): \(h.claude.actions), \(h.notice)")
 }
